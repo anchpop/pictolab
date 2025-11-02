@@ -1,0 +1,162 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest]
+        style: [default]
+        rust:
+          - "1.88.0"
+        exclude:
+          - platform: windows-latest
+            style: default
+          - platform: macos-latest
+            style: default
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.style }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.style }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Rustfmt
+        uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+
+      - name: Clippy
+        uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --workspace -- -D warnings
+
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: "1.88.0"
+          override: true
+          components: rustfmt, clippy
+          target: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-wasm
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+            ${{ runner.os }}-cargo-
+
+      - name: Build WASM module
+        run: cargo clippy --target wasm32-unknown-unknown
+        working-directory: frontend-rs
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest]
+        style: [no_default, default]
+        rust:
+          - "1.88.0"
+        include:
+          - style: no_default
+            flags: "--no-default-features"
+          - style: default
+            flags: ""
+        exclude:
+          - platform: windows-latest
+            style: default
+          - platform: macos-latest
+            style: default
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ matrix.style }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-${{ matrix.style }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Generate data
+        run: cargo run --bin generate-data
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Tests
+        uses: actions-rs/cargo@v1
+        with:
+          command: nextest
+          args: run --all ${{ matrix.flags }}
