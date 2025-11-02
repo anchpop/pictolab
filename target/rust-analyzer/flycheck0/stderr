@@ -1,0 +1,911 @@
+    Updating crates.io index
+     Locking 27 packages to latest compatible versions
+   0.319442375s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="frontend_rs"}: cargo::core::compiler::fingerprint: fingerprint error for frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("frontend_rs", ["cdylib", "rlib"], "/Users/andrepopovitch/coding/test/pictolab/frontend-rs/src/lib.rs", Edition2018) }
+   0.319667917s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="frontend_rs"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/frontend-rs-2957322338aad9a6/lib-frontend_rs`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.335714542s  INFO prepare_target{force=false package_id=console_error_panic_hook v0.1.7 target="console_error_panic_hook"}: cargo::core::compiler::fingerprint: fingerprint error for console_error_panic_hook v0.1.7/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("console_error_panic_hook", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/console_error_panic_hook-0.1.7/src/lib.rs", Edition2015) }
+   0.335726875s  INFO prepare_target{force=false package_id=console_error_panic_hook v0.1.7 target="console_error_panic_hook"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/console_error_panic_hook-1bca69d38f8b3694/lib-console_error_panic_hook`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.335912250s  INFO prepare_target{force=false package_id=cfg-if v1.0.4 target="cfg_if"}: cargo::core::compiler::fingerprint: fingerprint error for cfg-if v1.0.4/Check { test: false }/TargetInner { ..: lib_target("cfg_if", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs", Edition2018) }
+   0.335916167s  INFO prepare_target{force=false package_id=cfg-if v1.0.4 target="cfg_if"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/cfg-if-9377bebac931926b/lib-cfg_if`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.336028917s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="wasm_bindgen"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen v0.2.105/Check { test: false }/TargetInner { tested: false, ..: lib_target("wasm_bindgen", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-0.2.105/src/lib.rs", Edition2021) }
+   0.336033000s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="wasm_bindgen"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-707b015414bf64d3/lib-wasm_bindgen`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.336223833s  INFO prepare_target{force=false package_id=once_cell v1.21.3 target="once_cell"}: cargo::core::compiler::fingerprint: fingerprint error for once_cell v1.21.3/Check { test: false }/TargetInner { ..: lib_target("once_cell", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.3/src/lib.rs", Edition2021) }
+   0.336230167s  INFO prepare_target{force=false package_id=once_cell v1.21.3 target="once_cell"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/once_cell-5decdb76a3704a65/lib-once_cell`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  10: cargo::ops::cargo_compile::compile_ws
+  11: cargo::ops::cargo_compile::compile_with_exec
+  12: cargo::ops::cargo_compile::compile
+  13: cargo::commands::check::exec
+  14: <cargo::cli::Exec>::exec
+  15: cargo::main
+  16: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  17: std::rt::lang_start::<()>::{closure#0}
+  18: std::rt::lang_start_internal
+  19: _main
+   0.336525667s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen v0.2.105/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-0.2.105/build.rs", Edition2021) }
+   0.336529000s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-4a5e3f9e751b3b0f/run-build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::custom_build::build_work
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  11: cargo::ops::cargo_compile::compile_ws
+  12: cargo::ops::cargo_compile::compile_with_exec
+  13: cargo::ops::cargo_compile::compile
+  14: cargo::commands::check::exec
+  15: <cargo::cli::Exec>::exec
+  16: cargo::main
+  17: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  18: std::rt::lang_start::<()>::{closure#0}
+  19: std::rt::lang_start_internal
+  20: _main
+   0.336619625s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen v0.2.105/Build/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-0.2.105/build.rs", Edition2021) }
+   0.336623125s  INFO prepare_target{force=false package_id=wasm-bindgen v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-93fa28521246d5db/build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  11: cargo::ops::cargo_compile::compile_ws
+  12: cargo::ops::cargo_compile::compile_with_exec
+  13: cargo::ops::cargo_compile::compile
+  14: cargo::commands::check::exec
+  15: <cargo::cli::Exec>::exec
+  16: cargo::main
+  17: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  18: std::rt::lang_start::<()>::{closure#0}
+  19: std::rt::lang_start_internal
+  20: _main
+   0.336759042s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="rustversion"}: cargo::core::compiler::fingerprint: fingerprint error for rustversion v1.0.22/Build/TargetInner { for_host: true, proc_macro: true, ..: lib_target("rustversion", ["proc-macro"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.22/src/lib.rs", Edition2018) }
+   0.336763417s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="rustversion"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/rustversion-7387b992f8417369/lib-rustversion`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.337037167s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for rustversion v1.0.22/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.22/build/build.rs", Edition2018) }
+   0.337040375s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/rustversion-bdf51f5c9187b371/run-build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::custom_build::build_work
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: cargo::core::compiler::compile
+  13: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  14: cargo::ops::cargo_compile::compile_ws
+  15: cargo::ops::cargo_compile::compile_with_exec
+  16: cargo::ops::cargo_compile::compile
+  17: cargo::commands::check::exec
+  18: <cargo::cli::Exec>::exec
+  19: cargo::main
+  20: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  21: std::rt::lang_start::<()>::{closure#0}
+  22: std::rt::lang_start_internal
+  23: _main
+   0.337139875s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for rustversion v1.0.22/Build/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.22/build/build.rs", Edition2018) }
+   0.337142667s  INFO prepare_target{force=false package_id=rustversion v1.0.22 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/rustversion-31f05c62855dea0d/build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: cargo::core::compiler::compile
+  13: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  14: cargo::ops::cargo_compile::compile_ws
+  15: cargo::ops::cargo_compile::compile_with_exec
+  16: cargo::ops::cargo_compile::compile
+  17: cargo::commands::check::exec
+  18: <cargo::cli::Exec>::exec
+  19: cargo::main
+  20: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  21: std::rt::lang_start::<()>::{closure#0}
+  22: std::rt::lang_start_internal
+  23: _main
+   0.337407250s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-shared v0.2.105/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.105/build.rs", Edition2021) }
+   0.337410125s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-shared-2213e52200b84b89/run-build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::custom_build::build_work
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.337498208s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-shared v0.2.105/Build/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.105/build.rs", Edition2021) }
+   0.337501000s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-shared-23d41d70f5879fac/build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.337611667s  INFO prepare_target{force=false package_id=wasm-bindgen-macro v0.2.105 target="wasm_bindgen_macro"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-macro v0.2.105/Build/TargetInner { for_host: true, proc_macro: true, ..: lib_target("wasm_bindgen_macro", ["proc-macro"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-0.2.105/src/lib.rs", Edition2021) }
+   0.337615500s  INFO prepare_target{force=false package_id=wasm-bindgen-macro v0.2.105 target="wasm_bindgen_macro"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-macro-7e1481bdab1feffe/lib-wasm_bindgen_macro`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  10: cargo::ops::cargo_compile::compile_ws
+  11: cargo::ops::cargo_compile::compile_with_exec
+  12: cargo::ops::cargo_compile::compile
+  13: cargo::commands::check::exec
+  14: <cargo::cli::Exec>::exec
+  15: cargo::main
+  16: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  17: std::rt::lang_start::<()>::{closure#0}
+  18: std::rt::lang_start_internal
+  19: _main
+   0.337770917s  INFO prepare_target{force=false package_id=quote v1.0.41 target="quote"}: cargo::core::compiler::fingerprint: fingerprint error for quote v1.0.41/Build/TargetInner { ..: lib_target("quote", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.41/src/lib.rs", Edition2018) }
+   0.337773958s  INFO prepare_target{force=false package_id=quote v1.0.41 target="quote"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/quote-6646125992670618/lib-quote`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  11: cargo::ops::cargo_compile::compile_ws
+  12: cargo::ops::cargo_compile::compile_with_exec
+  13: cargo::ops::cargo_compile::compile
+  14: cargo::commands::check::exec
+  15: <cargo::cli::Exec>::exec
+  16: cargo::main
+  17: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  18: std::rt::lang_start::<()>::{closure#0}
+  19: std::rt::lang_start_internal
+  20: _main
+   0.337902292s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="proc_macro2"}: cargo::core::compiler::fingerprint: fingerprint error for proc-macro2 v1.0.103/Build/TargetInner { ..: lib_target("proc_macro2", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.103/src/lib.rs", Edition2021) }
+   0.337905375s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="proc_macro2"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/proc-macro2-079aea5811e7de43/lib-proc_macro2`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.338236375s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for proc-macro2 v1.0.103/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.103/build.rs", Edition2021) }
+   0.338239375s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/proc-macro2-1b76a4c28ad7d3b1/run-build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::custom_build::build_work
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: cargo::core::compiler::compile
+  13: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  14: cargo::ops::cargo_compile::compile_ws
+  15: cargo::ops::cargo_compile::compile_with_exec
+  16: cargo::ops::cargo_compile::compile
+  17: cargo::commands::check::exec
+  18: <cargo::cli::Exec>::exec
+  19: cargo::main
+  20: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  21: std::rt::lang_start::<()>::{closure#0}
+  22: std::rt::lang_start_internal
+  23: _main
+   0.338370500s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for proc-macro2 v1.0.103/Build/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.103/build.rs", Edition2021) }
+   0.338373542s  INFO prepare_target{force=false package_id=proc-macro2 v1.0.103 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/proc-macro2-642f3cf04d624076/build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: cargo::core::compiler::compile
+  13: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  14: cargo::ops::cargo_compile::compile_ws
+  15: cargo::ops::cargo_compile::compile_with_exec
+  16: cargo::ops::cargo_compile::compile
+  17: cargo::commands::check::exec
+  18: <cargo::cli::Exec>::exec
+  19: cargo::main
+  20: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  21: std::rt::lang_start::<()>::{closure#0}
+  22: std::rt::lang_start_internal
+  23: _main
+   0.338521042s  INFO prepare_target{force=false package_id=unicode-ident v1.0.22 target="unicode_ident"}: cargo::core::compiler::fingerprint: fingerprint error for unicode-ident v1.0.22/Build/TargetInner { ..: lib_target("unicode_ident", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.22/src/lib.rs", Edition2018) }
+   0.338524250s  INFO prepare_target{force=false package_id=unicode-ident v1.0.22 target="unicode_ident"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/unicode-ident-7c950f58c67e729a/lib-unicode_ident`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  13: cargo::ops::cargo_compile::compile_ws
+  14: cargo::ops::cargo_compile::compile_with_exec
+  15: cargo::ops::cargo_compile::compile
+  16: cargo::commands::check::exec
+  17: <cargo::cli::Exec>::exec
+  18: cargo::main
+  19: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  20: std::rt::lang_start::<()>::{closure#0}
+  21: std::rt::lang_start_internal
+  22: _main
+   0.338798958s  INFO prepare_target{force=false package_id=quote v1.0.41 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for quote v1.0.41/RunCustomBuild/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.41/build.rs", Edition2018) }
+   0.338802000s  INFO prepare_target{force=false package_id=quote v1.0.41 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/quote-076adf1107724e7e/run-build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::custom_build::build_work
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  13: cargo::ops::cargo_compile::compile_ws
+  14: cargo::ops::cargo_compile::compile_with_exec
+  15: cargo::ops::cargo_compile::compile
+  16: cargo::commands::check::exec
+  17: <cargo::cli::Exec>::exec
+  18: cargo::main
+  19: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  20: std::rt::lang_start::<()>::{closure#0}
+  21: std::rt::lang_start_internal
+  22: _main
+   0.338897208s  INFO prepare_target{force=false package_id=quote v1.0.41 target="build-script-build"}: cargo::core::compiler::fingerprint: fingerprint error for quote v1.0.41/Build/TargetInner { ..: custom_build_target("build-script-build", "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.41/build.rs", Edition2018) }
+   0.338900125s  INFO prepare_target{force=false package_id=quote v1.0.41 target="build-script-build"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/quote-d29f2e76da10b7c4/build-script-build-script-build`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: cargo::core::compiler::compile
+  12: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  13: cargo::ops::cargo_compile::compile_ws
+  14: cargo::ops::cargo_compile::compile_with_exec
+  15: cargo::ops::cargo_compile::compile
+  16: cargo::commands::check::exec
+  17: <cargo::cli::Exec>::exec
+  18: cargo::main
+  19: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  20: std::rt::lang_start::<()>::{closure#0}
+  21: std::rt::lang_start_internal
+  22: _main
+   0.339012292s  INFO prepare_target{force=false package_id=wasm-bindgen-macro-support v0.2.105 target="wasm_bindgen_macro_support"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-macro-support v0.2.105/Build/TargetInner { ..: lib_target("wasm_bindgen_macro_support", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-support-0.2.105/src/lib.rs", Edition2021) }
+   0.339016125s  INFO prepare_target{force=false package_id=wasm-bindgen-macro-support v0.2.105 target="wasm_bindgen_macro_support"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-macro-support-1321b7b6c10ef782/lib-wasm_bindgen_macro_support`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  11: cargo::ops::cargo_compile::compile_ws
+  12: cargo::ops::cargo_compile::compile_with_exec
+  13: cargo::ops::cargo_compile::compile
+  14: cargo::commands::check::exec
+  15: <cargo::cli::Exec>::exec
+  16: cargo::main
+  17: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  18: std::rt::lang_start::<()>::{closure#0}
+  19: std::rt::lang_start_internal
+  20: _main
+   0.339260208s  INFO prepare_target{force=false package_id=bumpalo v3.19.0 target="bumpalo"}: cargo::core::compiler::fingerprint: fingerprint error for bumpalo v3.19.0/Build/TargetInner { benched: false, ..: lib_target("bumpalo", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bumpalo-3.19.0/src/lib.rs", Edition2021) }
+   0.339263375s  INFO prepare_target{force=false package_id=bumpalo v3.19.0 target="bumpalo"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/bumpalo-08ca63473e090f27/lib-bumpalo`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.339499167s  INFO prepare_target{force=false package_id=syn v2.0.108 target="syn"}: cargo::core::compiler::fingerprint: fingerprint error for syn v2.0.108/Build/TargetInner { ..: lib_target("syn", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/syn-2.0.108/src/lib.rs", Edition2021) }
+   0.339502083s  INFO prepare_target{force=false package_id=syn v2.0.108 target="syn"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/syn-360f87c088ef64c6/lib-syn`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.339692542s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="wasm_bindgen_shared"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-shared v0.2.105/Build/TargetInner { ..: lib_target("wasm_bindgen_shared", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.105/src/lib.rs", Edition2021) }
+   0.339695708s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="wasm_bindgen_shared"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-shared-d30616003612f68b/lib-wasm_bindgen_shared`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: cargo::core::compiler::compile
+  11: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  12: cargo::ops::cargo_compile::compile_ws
+  13: cargo::ops::cargo_compile::compile_with_exec
+  14: cargo::ops::cargo_compile::compile
+  15: cargo::commands::check::exec
+  16: <cargo::cli::Exec>::exec
+  17: cargo::main
+  18: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  19: std::rt::lang_start::<()>::{closure#0}
+  20: std::rt::lang_start_internal
+  21: _main
+   0.339831333s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="wasm_bindgen_shared"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-shared v0.2.105/Check { test: false }/TargetInner { ..: lib_target("wasm_bindgen_shared", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.105/src/lib.rs", Edition2021) }
+   0.339834708s  INFO prepare_target{force=false package_id=wasm-bindgen-shared v0.2.105 target="wasm_bindgen_shared"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-shared-c2cb6959309c1a45/lib-wasm_bindgen_shared`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  10: cargo::ops::cargo_compile::compile_ws
+  11: cargo::ops::cargo_compile::compile_with_exec
+  12: cargo::ops::cargo_compile::compile
+  13: cargo::commands::check::exec
+  14: <cargo::cli::Exec>::exec
+  15: cargo::main
+  16: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  17: std::rt::lang_start::<()>::{closure#0}
+  18: std::rt::lang_start_internal
+  19: _main
+   0.339971875s  INFO prepare_target{force=false package_id=unicode-ident v1.0.22 target="unicode_ident"}: cargo::core::compiler::fingerprint: fingerprint error for unicode-ident v1.0.22/Check { test: false }/TargetInner { ..: lib_target("unicode_ident", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.22/src/lib.rs", Edition2018) }
+   0.339975125s  INFO prepare_target{force=false package_id=unicode-ident v1.0.22 target="unicode_ident"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/unicode-ident-53b114d3361301f6/lib-unicode_ident`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: cargo::core::compiler::compile
+   9: cargo::core::compiler::compile
+  10: <cargo::core::compiler::build_runner::BuildRunner>::compile
+  11: cargo::ops::cargo_compile::compile_ws
+  12: cargo::ops::cargo_compile::compile_with_exec
+  13: cargo::ops::cargo_compile::compile
+  14: cargo::commands::check::exec
+  15: <cargo::cli::Exec>::exec
+  16: cargo::main
+  17: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  18: std::rt::lang_start::<()>::{closure#0}
+  19: std::rt::lang_start_internal
+  20: _main
+   0.340243083s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="frontend_rs"}: cargo::core::compiler::fingerprint: fingerprint error for frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("frontend_rs", ["cdylib", "rlib"], "/Users/andrepopovitch/coding/test/pictolab/frontend-rs/src/lib.rs", Edition2018) }
+   0.340247375s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="frontend_rs"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/frontend-rs-70d785c308504ff1/test-lib-frontend_rs`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   0.340448958s  INFO prepare_target{force=false package_id=wasm-bindgen-test v0.3.55 target="wasm_bindgen_test"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-test v0.3.55/Check { test: false }/TargetInner { tested: false, ..: lib_target("wasm_bindgen_test", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-test-0.3.55/src/lib.rs", Edition2021) }
+   0.340452208s  INFO prepare_target{force=false package_id=wasm-bindgen-test v0.3.55 target="wasm_bindgen_test"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-test-4e35e4ded04c3754/lib-wasm_bindgen_test`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.340660458s  INFO prepare_target{force=false package_id=js-sys v0.3.82 target="js_sys"}: cargo::core::compiler::fingerprint: fingerprint error for js-sys v0.3.82/Check { test: false }/TargetInner { tested: false, doctest: false, ..: lib_target("js_sys", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/js-sys-0.3.82/src/lib.rs", Edition2021) }
+   0.340663792s  INFO prepare_target{force=false package_id=js-sys v0.3.82 target="js_sys"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/js-sys-4f1237ece8d42625/lib-js_sys`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.340828500s  INFO prepare_target{force=false package_id=wasm-bindgen-futures v0.4.55 target="wasm_bindgen_futures"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-futures v0.4.55/Check { test: false }/TargetInner { ..: lib_target("wasm_bindgen_futures", ["lib"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-futures-0.4.55/src/lib.rs", Edition2021) }
+   0.340831792s  INFO prepare_target{force=false package_id=wasm-bindgen-futures v0.4.55 target="wasm_bindgen_futures"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-futures-fa64ef3508bd8bcd/lib-wasm_bindgen_futures`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.341031208s  INFO prepare_target{force=false package_id=wasm-bindgen-test-macro v0.3.55 target="wasm_bindgen_test_macro"}: cargo::core::compiler::fingerprint: fingerprint error for wasm-bindgen-test-macro v0.3.55/Build/TargetInner { for_host: true, proc_macro: true, ..: lib_target("wasm_bindgen_test_macro", ["proc-macro"], "/Users/andrepopovitch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-test-macro-0.3.55/src/lib.rs", Edition2021) }
+   0.341034833s  INFO prepare_target{force=false package_id=wasm-bindgen-test-macro v0.3.55 target="wasm_bindgen_test_macro"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/wasm-bindgen-test-macro-9db0d197310e19c4/lib-wasm_bindgen_test_macro`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.341220750s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="web"}: cargo::core::compiler::fingerprint: fingerprint error for frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs)/Check { test: true }/TargetInner { kind: "test", name: "web", benched: false, ..: with_path("/Users/andrepopovitch/coding/test/pictolab/frontend-rs/tests/web.rs", Edition2018) }
+   0.341224750s  INFO prepare_target{force=false package_id=frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs) target="web"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/andrepopovitch/coding/test/pictolab/frontend-rs/target/debug/.fingerprint/frontend-rs-a6f9ed476cbdf774/test-integration-test-web`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: cargo_util::paths::read_bytes
+   2: cargo_util::paths::read
+   3: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   4: cargo::core::compiler::fingerprint::prepare_target
+   5: cargo::core::compiler::compile
+   6: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   7: cargo::ops::cargo_compile::compile_ws
+   8: cargo::ops::cargo_compile::compile_with_exec
+   9: cargo::ops::cargo_compile::compile
+  10: cargo::commands::check::exec
+  11: <cargo::cli::Exec>::exec
+  12: cargo::main
+  13: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  14: std::rt::lang_start::<()>::{closure#0}
+  15: std::rt::lang_start_internal
+  16: _main
+   Compiling proc-macro2 v1.0.103
+   Compiling unicode-ident v1.0.22
+   Compiling wasm-bindgen-shared v0.2.105
+   Compiling quote v1.0.41
+   Compiling rustversion v1.0.22
+   Compiling bumpalo v3.19.0
+    Checking once_cell v1.21.3
+    Checking cfg-if v1.0.4
+   Compiling wasm-bindgen v0.2.105
+   Compiling syn v2.0.108
+   Compiling wasm-bindgen-macro-support v0.2.105
+   Compiling wasm-bindgen-test-macro v0.3.55
+   Compiling wasm-bindgen-macro v0.2.105
+    Checking js-sys v0.3.82
+    Checking console_error_panic_hook v0.1.7
+    Checking frontend-rs v0.1.0 (/Users/andrepopovitch/coding/test/pictolab/frontend-rs)
+    Checking wasm-bindgen-futures v0.4.55
+    Checking wasm-bindgen-test v0.3.55
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.55s
