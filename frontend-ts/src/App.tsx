@@ -3,6 +3,7 @@ import Home from './pages/Home';
 import LabInversion from './pages/LabInversion';
 import EqualizeLight from './pages/EqualizeLight';
 import Laberation from './pages/Laberation';
+import SeamCarving from './pages/SeamCarving';
 import './App.css';
 
 function App() {
@@ -13,6 +14,7 @@ function App() {
         <Route path="/lab-inversion" element={<LabInversion />} />
         <Route path="/equalize-light" element={<EqualizeLight />} />
         <Route path="/laberation" element={<Laberation />} />
+        <Route path="/seam-carving" element={<SeamCarving />} />
       </Routes>
     </Router>
   );

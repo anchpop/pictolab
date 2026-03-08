@@ -28,6 +28,11 @@ function Home() {
               <p>Chromatic aberration, but in LAB color space</p>
             </Link>
 
+            <Link to="/seam-carving" className="experiment-card">
+              <h3>Seam Carving</h3>
+              <p>Content-aware resizing with forward energy in LAB space</p>
+            </Link>
+
             <div className="experiment-card coming-soon">
               <h3>More Coming Soon</h3>
               <p>Stay tuned for more photo experiments</p>

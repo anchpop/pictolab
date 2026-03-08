@@ -17,4 +17,11 @@ declare module 'frontend-rs' {
     height: number,
     offset: number
   ): Uint8Array;
+
+  export function seam_carve_lab(
+    image_data: Uint8Array,
+    width: number,
+    height: number,
+    seams_to_remove: number
+  ): Uint8Array;
 }
