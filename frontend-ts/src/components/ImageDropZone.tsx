@@ -1,6 +1,85 @@
 import { useRef, useState, useEffect } from 'react';
 import './ImageDropZone.css';
 
+const EXAMPLE_IMAGES = [
+  { src: '/examples/artwork_01.jpg', label: 'Artwork 1' },
+  { src: '/examples/artwork_02.jpg', label: 'Artwork 2' },
+  { src: '/examples/artwork_03.jpg', label: 'Artwork 3' },
+  { src: '/examples/artwork_04.jpg', label: 'Artwork 4' },
+  { src: '/examples/artwork_05.jpg', label: 'Artwork 5' },
+];
+
+const DB_NAME = 'pictolab-images';
+const STORE_NAME = 'uploads';
+const MAX_SAVED_IMAGES = 10;
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getSavedImages(): Promise<{ id: number; dataUrl: string; thumbnail: string }[]> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveImage(dataUrl: string, thumbnail: string) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  const store = tx.objectStore(STORE_NAME);
+
+  // Check count and evict oldest if needed
+  const countReq = store.count();
+  countReq.onsuccess = () => {
+    if (countReq.result >= MAX_SAVED_IMAGES) {
+      const cursorReq = store.openCursor();
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        if (cursor) cursor.delete();
+      };
+    }
+  };
+
+  store.add({ dataUrl, thumbnail });
+}
+
+async function removeSavedImage(id: number) {
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  tx.objectStore(STORE_NAME).delete(id);
+}
+
+function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(maxSize / img.width, maxSize / img.height, 1);
+      canvas.width = img.width * scale;
+      canvas.height = img.height * scale;
+      const ctx = canvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.7));
+    };
+    img.src = dataUrl;
+  });
+}
+
 interface ImageDropZoneProps {
   onImageSelect: (imageUrl: string) => void;
   disabled?: boolean;
@@ -8,7 +87,12 @@ interface ImageDropZoneProps {
 
 function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
+  const [savedImages, setSavedImages] = useState<{ id: number; dataUrl: string; thumbnail: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    getSavedImages().then(setSavedImages).catch(() => {});
+  }, []);
 
   const handleFile = (file: File) => {
     if (!file.type.startsWith('image/')) {
@@ -17,9 +101,19 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
     }
 
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       const imageUrl = e.target?.result as string;
       onImageSelect(imageUrl);
+
+      // Save to IndexedDB for future use
+      try {
+        const thumbnail = await makeThumbnail(imageUrl);
+        await saveImage(imageUrl, thumbnail);
+        const updated = await getSavedImages();
+        setSavedImages(updated);
+      } catch {
+        // Storage failure is non-critical
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -85,27 +179,99 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
     }
   };
 
+  const handleExampleClick = (src: string) => {
+    if (disabled) return;
+    // Fetch the example image and convert to data URL so it works the same as uploads
+    fetch(src)
+      .then((res) => res.blob())
+      .then((blob) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUrl = e.target?.result as string;
+          onImageSelect(dataUrl);
+        };
+        reader.readAsDataURL(blob);
+      });
+  };
+
+  const handleSavedClick = (img: { id: number; dataUrl: string }) => {
+    if (disabled) return;
+    onImageSelect(img.dataUrl);
+  };
+
+  const handleRemoveSaved = async (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
+    await removeSavedImage(id);
+    setSavedImages((prev) => prev.filter((img) => img.id !== id));
+  };
+
   return (
-    <div
-      className={`image-drop-zone ${isDragging ? 'dragging' : ''} ${disabled ? 'disabled' : ''}`}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      onClick={handleClick}
-    >
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="image/*"
-        onChange={handleFileInput}
-        style={{ display: 'none' }}
-      />
-      <div className="drop-zone-content">
-        <svg className="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-        </svg>
-        <p className="drop-zone-title">Drop an image here</p>
-        <p className="drop-zone-subtitle">or click to browse, or paste from clipboard</p>
+    <div className="image-picker">
+      <div
+        className={`image-drop-zone ${isDragging ? 'dragging' : ''} ${disabled ? 'disabled' : ''}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        onClick={handleClick}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          onChange={handleFileInput}
+          style={{ display: 'none' }}
+        />
+        <div className="drop-zone-content">
+          <svg className="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+          </svg>
+          <p className="drop-zone-title">Drop an image here</p>
+          <p className="drop-zone-subtitle">or click to browse, or paste from clipboard</p>
+        </div>
+      </div>
+
+      <div className="image-gallery">
+        <div className="gallery-section">
+          <p className="gallery-label">Examples</p>
+          <div className="gallery-thumbs">
+            {EXAMPLE_IMAGES.map((img) => (
+              <button
+                key={img.src}
+                className="gallery-thumb"
+                onClick={() => handleExampleClick(img.src)}
+                disabled={disabled}
+                title={img.label}
+              >
+                <img src={img.src} alt={img.label} loading="lazy" />
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {savedImages.length > 0 && (
+          <div className="gallery-section">
+            <p className="gallery-label">Your uploads</p>
+            <div className="gallery-thumbs">
+              {savedImages.map((img) => (
+                <button
+                  key={img.id}
+                  className="gallery-thumb saved-thumb"
+                  onClick={() => handleSavedClick(img)}
+                  disabled={disabled}
+                >
+                  <img src={img.thumbnail} alt="Saved upload" />
+                  <span
+                    className="remove-thumb"
+                    onClick={(e) => handleRemoveSaved(e, img.id)}
+                    title="Remove"
+                  >
+                    &times;
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
