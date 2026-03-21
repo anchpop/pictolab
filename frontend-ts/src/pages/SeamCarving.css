@@ -152,3 +152,26 @@
 .result-canvas {
   display: block;
 }
+
+.energy-section {
+  max-width: 800px;
+  margin: 2rem auto 0;
+  text-align: center;
+}
+
+.energy-section h3 {
+  margin-bottom: 0.25rem;
+  color: #333;
+}
+
+.energy-description {
+  color: #666;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.energy-canvas {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}

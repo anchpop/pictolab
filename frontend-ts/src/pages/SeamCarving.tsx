@@ -13,6 +13,7 @@ function SeamCarving() {
   const [aspectText, setAspectText] = useState('');
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const energyCanvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
   const stateRef = useRef({
@@ -39,6 +40,30 @@ function SeamCarving() {
       );
     }
     return workerRef.current;
+  };
+
+  const renderEnergyView = () => {
+    const { orderMap, origW, origH, direction: dir } = stateRef.current;
+    const canvas = energyCanvasRef.current;
+    if (!orderMap || !canvas) return;
+
+    canvas.width = origW;
+    canvas.height = origH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const imgData = ctx.createImageData(origW, origH);
+    // Order values range from 1 to maxDim (the dimension being reduced)
+    const maxOrder = dir === 'width' ? origW : origH;
+    for (let i = 0; i < origW * origH; i++) {
+      // Normalize: step 1 (first removed) = black, step maxOrder (last surviving) = white
+      const v = Math.round(((orderMap[i] - 1) / (maxOrder - 1)) * 255);
+      imgData.data[i * 4] = v;
+      imgData.data[i * 4 + 1] = v;
+      imgData.data[i * 4 + 2] = v;
+      imgData.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(imgData, 0, 0);
   };
 
   const renderAtSize = (size: number) => {
@@ -93,8 +118,11 @@ function SeamCarving() {
       setReady(true);
       updateAspectText(dir, defaultTarget, w, h);
 
-      // Defer render to next frame so React has mounted the canvas
-      requestAnimationFrame(() => renderAtSize(defaultTarget));
+      // Defer render to next frame so React has mounted the canvases
+      requestAnimationFrame(() => {
+        renderAtSize(defaultTarget);
+        renderEnergyView();
+      });
     };
 
     // Send image data to worker (structured clone copies it)
@@ -308,6 +336,14 @@ function SeamCarving() {
                 </button>
               </div>
             )}
+          </div>
+        )}
+
+        {ready && (
+          <div className="energy-section">
+            <h3>Seam Removal Order</h3>
+            <p className="energy-description">Black pixels are removed first, white pixels survive the longest</p>
+            <canvas ref={energyCanvasRef} className="energy-canvas" />
           </div>
         )}
       </main>
