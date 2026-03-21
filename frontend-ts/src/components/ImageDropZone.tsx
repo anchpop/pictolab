@@ -2,11 +2,11 @@ import { useRef, useState, useEffect } from 'react';
 import './ImageDropZone.css';
 
 const EXAMPLE_IMAGES = [
-  { src: '/examples/artwork_01.jpg', label: 'Artwork 1' },
-  { src: '/examples/artwork_02.jpg', label: 'Artwork 2' },
-  { src: '/examples/artwork_03.jpg', label: 'Artwork 3' },
-  { src: '/examples/artwork_04.jpg', label: 'Artwork 4' },
-  { src: '/examples/artwork_05.jpg', label: 'Artwork 5' },
+  { src: '/examples/artwork_01.webp', label: 'Artwork 1' },
+  { src: '/examples/artwork_02.webp', label: 'Artwork 2' },
+  { src: '/examples/artwork_03.webp', label: 'Artwork 3' },
+  { src: '/examples/artwork_04.webp', label: 'Artwork 4' },
+  { src: '/examples/artwork_05.webp', label: 'Artwork 5' },
 ];
 
 const DB_NAME = 'pictolab-images';
