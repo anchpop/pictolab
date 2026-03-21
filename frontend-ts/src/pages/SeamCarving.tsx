@@ -19,6 +19,7 @@ function SeamCarving() {
   const stateRef = useRef({
     imageData: null as Uint8Array | null,
     orderMap: null as Uint32Array | null,
+    energyRgba: null as Uint8Array | null,
     wasm: null as any,
     origW: 0,
     origH: 0,
@@ -42,28 +43,38 @@ function SeamCarving() {
     return workerRef.current;
   };
 
-  const renderEnergyView = () => {
+  const buildEnergyRgba = () => {
     const { orderMap, origW, origH, direction: dir } = stateRef.current;
-    const canvas = energyCanvasRef.current;
-    if (!orderMap || !canvas) return;
+    if (!orderMap) return;
 
-    canvas.width = origW;
-    canvas.height = origH;
+    const maxOrder = dir === 'width' ? origW : origH;
+    const rgba = new Uint8Array(origW * origH * 4);
+    for (let i = 0; i < origW * origH; i++) {
+      const v = Math.round(((orderMap[i] - 1) / (maxOrder - 1)) * 255);
+      rgba[i * 4] = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
+    }
+    stateRef.current.energyRgba = rgba;
+  };
+
+  const renderEnergyAtSize = (size: number) => {
+    const { wasm, energyRgba, orderMap, origW, origH, direction: dir } = stateRef.current;
+    const canvas = energyCanvasRef.current;
+    if (!wasm || !energyRgba || !orderMap || !canvas) return;
+
+    const dirNum = dir === 'width' ? 0 : 1;
+    const outputArray = wasm.render_seam_carved(energyRgba, orderMap, origW, origH, size, dirNum);
+
+    const outW = dir === 'width' ? size : origW;
+    const outH = dir === 'height' ? size : origH;
+    canvas.width = outW;
+    canvas.height = outH;
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
-    const imgData = ctx.createImageData(origW, origH);
-    // Order values range from 1 to maxDim (the dimension being reduced)
-    const maxOrder = dir === 'width' ? origW : origH;
-    for (let i = 0; i < origW * origH; i++) {
-      // Normalize: step 1 (first removed) = black, step maxOrder (last surviving) = white
-      const v = Math.round(((orderMap[i] - 1) / (maxOrder - 1)) * 255);
-      imgData.data[i * 4] = v;
-      imgData.data[i * 4 + 1] = v;
-      imgData.data[i * 4 + 2] = v;
-      imgData.data[i * 4 + 3] = 255;
-    }
-    ctx.putImageData(imgData, 0, 0);
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(outputArray), outW, outH), 0, 0);
   };
 
   const renderAtSize = (size: number) => {
@@ -118,10 +129,12 @@ function SeamCarving() {
       setReady(true);
       updateAspectText(dir, defaultTarget, w, h);
 
+      buildEnergyRgba();
+
       // Defer render to next frame so React has mounted the canvases
       requestAnimationFrame(() => {
         renderAtSize(defaultTarget);
-        renderEnergyView();
+        renderEnergyAtSize(defaultTarget);
       });
     };
 
@@ -171,6 +184,7 @@ function SeamCarving() {
     setTargetSize(clamped);
     updateAspectText(dir, clamped, stateRef.current.origW, stateRef.current.origH);
     renderAtSize(clamped);
+    renderEnergyAtSize(clamped);
   };
 
   const updateAspectText = (dir: string, target: number, w: number, h: number) => {
@@ -343,7 +357,21 @@ function SeamCarving() {
           <div className="energy-section">
             <h3>Seam Removal Order</h3>
             <p className="energy-description">Black pixels are removed first, white pixels survive the longest</p>
-            <canvas ref={energyCanvasRef} className="energy-canvas" />
+            <div
+              className="canvas-container"
+              style={{
+                aspectRatio: `${origDims.w} / ${origDims.h}`,
+              }}
+            >
+              <canvas
+                ref={energyCanvasRef}
+                className="result-canvas"
+                style={{
+                  width: direction === 'width' ? `${(targetSize / origDims.w) * 100}%` : '100%',
+                  height: direction === 'height' ? `${(targetSize / origDims.h) * 100}%` : '100%',
+                }}
+              />
+            </div>
           </div>
         )}
       </main>
