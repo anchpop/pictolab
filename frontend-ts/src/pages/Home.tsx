@@ -47,7 +47,7 @@ function Home() {
       </main>
 
       <footer className="home-footer">
-        <p>Built with Rust + WASM + React</p>
+        <p>Built with Rust + WASM + React — <a href="https://github.com/anchpop/pictolab" target="_blank" rel="noopener noreferrer">GitHub</a></p>
       </footer>
     </div>
   );

@@ -90,8 +90,8 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
         };
 
         // First row: M(x, 0) = C_U(x, 0)
-        for x in 0..cur_w {
-            cost[x] = compute_c_u(&rows[0], x, cur_w);
+        for (x, c) in cost[..cur_w].iter_mut().enumerate() {
+            *c = compute_c_u(&rows[0], x, cur_w);
         }
 
         for y in 1..h {
@@ -113,9 +113,17 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
                 };
 
                 // M(x, y) = min(M(x-1,y-1)+C_L, M(x,y-1)+C_U, M(x+1,y-1)+C_R)
-                let from_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] + c_l } else { f32::MAX / 2.0 };
+                let from_left = if x > 0 {
+                    cost[(y - 1) * cur_w + x - 1] + c_l
+                } else {
+                    f32::MAX / 2.0
+                };
                 let from_above = cost[(y - 1) * cur_w + x] + c_u;
-                let from_right = if x < cur_w - 1 { cost[(y - 1) * cur_w + x + 1] + c_r } else { f32::MAX / 2.0 };
+                let from_right = if x < cur_w - 1 {
+                    cost[(y - 1) * cur_w + x + 1] + c_r
+                } else {
+                    f32::MAX / 2.0
+                };
 
                 let min = from_above.min(from_left).min(from_right);
                 cost[y * cur_w + x] = min;
