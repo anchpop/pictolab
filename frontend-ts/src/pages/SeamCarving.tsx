@@ -93,7 +93,8 @@ function SeamCarving() {
       setReady(true);
       updateAspectText(dir, defaultTarget, w, h);
 
-      renderAtSize(defaultTarget);
+      // Defer render to next frame so React has mounted the canvas
+      requestAnimationFrame(() => renderAtSize(defaultTarget));
     };
 
     // Send image data to worker (structured clone copies it)
