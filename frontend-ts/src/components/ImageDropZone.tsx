@@ -232,7 +232,13 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
 
       <div className="image-gallery">
         <div className="gallery-section">
-          <p className="gallery-label">Examples</p>
+          <p className="gallery-label">
+            Examples — art by{' '}
+            <a href="https://x.com/aletiune" target="_blank" rel="noopener noreferrer" className="gallery-attribution">
+              aletiune
+            </a>
+            , used with permission
+          </p>
           <div className="gallery-thumbs">
             {EXAMPLE_IMAGES.map((img) => (
               <button

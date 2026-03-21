@@ -68,6 +68,15 @@
   letter-spacing: 0.04em;
 }
 
+.gallery-attribution {
+  color: #667eea;
+  text-decoration: none;
+}
+
+.gallery-attribution:hover {
+  text-decoration: underline;
+}
+
 .gallery-thumbs {
   display: flex;
   gap: 0.5rem;
