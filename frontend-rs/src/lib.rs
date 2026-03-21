@@ -70,70 +70,52 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
         }
 
         // Build forward energy cost matrix with parent pointers for traceback
+        // Reference: https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html
         let mut cost = vec![0.0_f32; cur_w * h];
         // Parent direction: -1=came from above-left, 0=above, 1=above-right
         let mut parent = vec![0i8; cur_w * h];
 
-        // Compute per-pixel gradient energy (dual gradient magnitude)
-        let mut energy = vec![0.0_f32; cur_w * h];
-        for y in 0..h {
-            for x in 0..cur_w {
-                let left = if x > 0 { &rows[y][x - 1] } else { &rows[y][x] };
-                let right = if x < cur_w - 1 {
-                    &rows[y][x + 1]
-                } else {
-                    &rows[y][x]
-                };
-                let up = if y > 0 { &rows[y - 1][x] } else { &rows[y][x] };
-                let down = if y < h - 1 {
-                    &rows[y + 1][x]
-                } else {
-                    &rows[y][x]
-                };
-                energy[y * cur_w + x] = lab_dist(left, right) + lab_dist(up, down);
+        // Helper: compute C_U(x, y) = D[(x-1, y), (x+1, y)]
+        // At boundaries, replace out-of-bounds pixel with current pixel
+        let compute_c_u = |row: &[Lab], x: usize, w: usize| -> f32 {
+            if w <= 1 {
+                0.0
+            } else if x > 0 && x < w - 1 {
+                lab_dist(&row[x - 1], &row[x + 1])
+            } else if x == 0 {
+                lab_dist(&row[0], &row[1])
+            } else {
+                lab_dist(&row[w - 2], &row[w - 1])
             }
-        }
+        };
 
-        // First row: base energy only
-        cost[..cur_w].copy_from_slice(&energy[..cur_w]);
+        // First row: M(x, 0) = C_U(x, 0)
+        for x in 0..cur_w {
+            cost[x] = compute_c_u(&rows[0], x, cur_w);
+        }
 
         for y in 1..h {
             for x in 0..cur_w {
-                // Forward energy: cost of new edges created by removing this pixel
-                let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
-                } else if cur_w > 1 && x == 0 {
-                    lab_dist(&rows[y][0], &rows[y][1])
-                } else if cur_w > 1 {
-                    lab_dist(&rows[y][cur_w - 2], &rows[y][cur_w - 1])
-                } else {
-                    0.0
-                };
+                let c_u = compute_c_u(&rows[y], x, cur_w);
 
+                // C_L(x, y) = C_U(x, y) + D[(x, y-1), (x-1, y)]
                 let c_l = if x > 0 {
                     c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
+                // C_R(x, y) = C_U(x, y) + D[(x, y-1), (x+1, y)]
                 let c_r = if x < cur_w - 1 {
                     c_u + lab_dist(&rows[y - 1][x], &rows[y][x + 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
-                let e = energy[y * cur_w + x];
-                let from_left = if x > 0 {
-                    cost[(y - 1) * cur_w + x - 1] + c_l + e
-                } else {
-                    f32::MAX / 2.0
-                };
-                let from_above = cost[(y - 1) * cur_w + x] + c_u + e;
-                let from_right = if x < cur_w - 1 {
-                    cost[(y - 1) * cur_w + x + 1] + c_r + e
-                } else {
-                    f32::MAX / 2.0
-                };
+                // M(x, y) = min(M(x-1,y-1)+C_L, M(x,y-1)+C_U, M(x+1,y-1)+C_R)
+                let from_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] + c_l } else { f32::MAX / 2.0 };
+                let from_above = cost[(y - 1) * cur_w + x] + c_u;
+                let from_right = if x < cur_w - 1 { cost[(y - 1) * cur_w + x + 1] + c_r } else { f32::MAX / 2.0 };
 
                 let min = from_above.min(from_left).min(from_right);
                 cost[y * cur_w + x] = min;
