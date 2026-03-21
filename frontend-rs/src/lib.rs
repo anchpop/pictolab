@@ -1,3 +1,4 @@
+mod gpu;
 mod utils;
 
 use palette::{IntoColor, Lab, Srgb};

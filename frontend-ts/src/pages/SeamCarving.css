@@ -91,6 +91,11 @@
   cursor: not-allowed;
 }
 
+.gpu-toggle {
+  font-size: 0.8rem !important;
+  padding: 0.4rem 0.75rem !important;
+}
+
 .size-inputs {
   display: flex;
   align-items: center;

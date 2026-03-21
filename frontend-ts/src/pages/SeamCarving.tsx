@@ -11,6 +11,8 @@ function SeamCarving() {
   const [targetSize, setTargetSize] = useState(0);
   const [origDims, setOrigDims] = useState({ w: 0, h: 0 });
   const [aspectText, setAspectText] = useState('');
+  const [gpuAvailable, setGpuAvailable] = useState(false);
+  const [useGPU, setUseGPU] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const energyCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -25,8 +27,24 @@ function SeamCarving() {
     direction: 'width' as 'width' | 'height',
   });
 
-  // Clean up worker on unmount
+  const useGPURef = useRef(false);
+
+  // Detect WebGPU on mount, clean up worker on unmount
   useEffect(() => {
+    (async () => {
+      try {
+        const wasm = await import('frontend-rs');
+        if (wasm.is_webgpu_available()) {
+          // Verify we can actually get an adapter
+          const adapter = await navigator.gpu?.requestAdapter();
+          if (adapter) {
+            setGpuAvailable(true);
+            setUseGPU(true);
+            useGPURef.current = true;
+          }
+        }
+      } catch { /* GPU not available */ }
+    })();
     return () => {
       workerRef.current?.terminate();
     };
@@ -132,6 +150,7 @@ function SeamCarving() {
       height: h,
       direction: dirNum,
       requestId: currentId,
+      useGPU: useGPURef.current,
     });
   };
 
@@ -234,6 +253,18 @@ function SeamCarving() {
                 disabled={isPrecomputing}
               >
                 Reduce Height
+              </button>
+              <button
+                className={`gpu-toggle ${useGPU ? 'active' : ''}`}
+                onClick={() => {
+                  const next = !useGPU;
+                  setUseGPU(next);
+                  useGPURef.current = next;
+                }}
+                disabled={!gpuAvailable || isPrecomputing}
+                title={gpuAvailable ? `WebGPU ${useGPU ? 'enabled' : 'disabled'}` : 'WebGPU not available on this device'}
+              >
+                WebGPU {useGPU ? 'ON' : 'OFF'}
               </button>
             </div>
 

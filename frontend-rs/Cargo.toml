@@ -12,6 +12,7 @@ default = ["console_error_panic_hook"]
 
 [dependencies]
 wasm-bindgen = "0.2.84"
+wasm-bindgen-futures = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 palette = "0.7"
 js-sys = "0.3"

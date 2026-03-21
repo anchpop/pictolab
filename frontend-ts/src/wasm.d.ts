@@ -40,4 +40,13 @@ declare module 'frontend-rs' {
     height: number,
     factor: number
   ): Uint8Array;
+
+  export function precompute_seam_order_gpu(
+    image_data: Uint8Array,
+    width: number,
+    height: number,
+    direction: number
+  ): Promise<Uint32Array>;
+
+  export function is_webgpu_available(): boolean;
 }
