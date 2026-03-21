@@ -181,7 +181,7 @@ function SeamCarving() {
         <Link to="/" className="back-link">← Back to Home</Link>
         <h1>Seam Carving</h1>
         <p className="main-description">Content-aware image resizing with forward energy</p>
-        <p className="technical-description">Precomputes all seams in LAB space, then renders any size in real-time</p>
+        <p className="technical-description">Uses <a href="https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html" target="_blank" rel="noopener noreferrer">seam carving with forward energy</a> in LAB color space. All seams are precomputed so any target size renders in real-time.</p>
       </header>
 
       <main className="demo-main">
