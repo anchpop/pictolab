@@ -18,11 +18,20 @@ declare module 'frontend-rs' {
     offset: number
   ): Uint8Array;
 
-  export function seam_carve_lab(
+  export function precompute_seam_order(
     image_data: Uint8Array,
     width: number,
     height: number,
-    seams_to_remove: number
+    direction: number
+  ): Uint32Array;
+
+  export function render_seam_carved(
+    image_data: Uint8Array,
+    order: Uint32Array,
+    orig_width: number,
+    orig_height: number,
+    target_size: number,
+    direction: number
   ): Uint8Array;
 
   export function boost_chroma_lab(

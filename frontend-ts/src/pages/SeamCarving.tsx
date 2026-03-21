@@ -5,85 +5,140 @@ import './SeamCarving.css';
 
 function SeamCarving() {
   const [originalImage, setOriginalImage] = useState<string | null>(null);
-  const [processedImage, setProcessedImage] = useState<string | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [seamsPercent, setSeamsPercent] = useState(20);
-  const [imageWidth, setImageWidth] = useState(0);
+  const [isPrecomputing, setIsPrecomputing] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [direction, setDirection] = useState<'width' | 'height'>('width');
+  const [targetSize, setTargetSize] = useState(0);
+  const [origDims, setOrigDims] = useState({ w: 0, h: 0 });
+  const [aspectText, setAspectText] = useState('');
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const stateRef = useRef({
+    imageData: null as Uint8Array | null,
+    orderMap: null as Uint32Array | null,
+    wasm: null as any,
+    origW: 0,
+    origH: 0,
+    direction: 'width' as 'width' | 'height',
+  });
+
+  const renderAtSize = (size: number) => {
+    const { wasm, imageData, orderMap, origW, origH, direction: dir } = stateRef.current;
+    if (!wasm || !imageData || !orderMap) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dirNum = dir === 'width' ? 0 : 1;
+    const outputArray = wasm.render_seam_carved(imageData, orderMap, origW, origH, size, dirNum);
+
+    const outW = dir === 'width' ? size : origW;
+    const outH = dir === 'height' ? size : origH;
+    canvas.width = outW;
+    canvas.height = outH;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(outputArray), outW, outH), 0, 0);
+  };
+
+  const runPrecompute = async (w: number, h: number, dir: 'width' | 'height') => {
+    const imageData = stateRef.current.imageData;
+    if (!imageData) return;
+
+    setIsPrecomputing(true);
+    setReady(false);
+
+    const wasm = await import('frontend-rs');
+    stateRef.current.wasm = wasm;
+    stateRef.current.direction = dir;
+
+    // Yield to let the UI render the loading state
+    await new Promise(r => setTimeout(r, 50));
+
+    const dirNum = dir === 'width' ? 0 : 1;
+    const order = wasm.precompute_seam_order(imageData, w, h, dirNum);
+    stateRef.current.orderMap = order;
+
+    const max = dir === 'width' ? w : h;
+    const defaultTarget = Math.round(max * 0.8);
+
+    setTargetSize(defaultTarget);
+    setIsPrecomputing(false);
+    setReady(true);
+    updateAspectText(dir, defaultTarget, w, h);
+
+    renderAtSize(defaultTarget);
+  };
 
   const handleImageSelect = (imageUrl: string) => {
     setOriginalImage(imageUrl);
-    // Need to load image to get width before processing
+
     const img = new Image();
     img.onload = () => {
-      setImageWidth(img.width);
-      processImage(imageUrl, seamsPercent, img.width);
+      setOrigDims({ w: img.width, h: img.height });
+      stateRef.current.origW = img.width;
+      stateRef.current.origH = img.height;
+
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = img.width;
+      tempCanvas.height = img.height;
+      const ctx = tempCanvas.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const data = ctx.getImageData(0, 0, img.width, img.height);
+      stateRef.current.imageData = new Uint8Array(data.data);
+
+      runPrecompute(img.width, img.height, direction);
     };
     img.src = imageUrl;
   };
 
-  const handleSeamsChange = (newPercent: number) => {
-    setSeamsPercent(newPercent);
-    if (originalImage && imageWidth > 0) {
-      processImage(originalImage, newPercent, imageWidth);
+  const handleDirectionChange = (dir: 'width' | 'height') => {
+    setDirection(dir);
+    if (stateRef.current.imageData) {
+      runPrecompute(stateRef.current.origW, stateRef.current.origH, dir);
     }
   };
 
-  const processImage = async (imageUrl: string, percent: number, imgWidth: number) => {
-    setIsProcessing(true);
+  const handleTargetChange = (size: number) => {
+    const dir = stateRef.current.direction;
+    const max = dir === 'width' ? stateRef.current.origW : stateRef.current.origH;
+    const clamped = Math.max(1, Math.min(max, Math.round(size)));
+    setTargetSize(clamped);
+    updateAspectText(dir, clamped, stateRef.current.origW, stateRef.current.origH);
+    renderAtSize(clamped);
+  };
 
-    try {
-      const wasm = await import('frontend-rs');
+  const updateAspectText = (dir: string, target: number, w: number, h: number) => {
+    const outW = dir === 'width' ? target : w;
+    const outH = dir === 'height' ? target : h;
+    setAspectText(outH > 0 ? (outW / outH).toFixed(2) : '');
+  };
 
-      const img = new Image();
-      img.onload = () => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-
-        canvas.width = img.width;
-        canvas.height = img.height;
-
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-
-        ctx.drawImage(img, 0, 0);
-
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const inputArray = new Uint8Array(imageData.data);
-        const seamsToRemove = Math.floor(imgWidth * (percent / 100));
-        const outputArray = wasm.seam_carve_lab(inputArray, canvas.width, canvas.height, seamsToRemove);
-
-        const newWidth = canvas.width - seamsToRemove;
-        canvas.width = newWidth;
-
-        const outputImageData = new ImageData(
-          new Uint8ClampedArray(outputArray),
-          newWidth,
-          canvas.height
-        );
-        ctx.putImageData(outputImageData, 0, 0);
-
-        setProcessedImage(canvas.toDataURL());
-        setIsProcessing(false);
-      };
-
-      img.src = imageUrl;
-    } catch (error) {
-      console.error('Error processing image:', error);
-      setIsProcessing(false);
+  const handleAspectCommit = () => {
+    const ratio = parseFloat(aspectText);
+    if (!ratio || ratio <= 0 || !isFinite(ratio)) return;
+    const dir = stateRef.current.direction;
+    if (dir === 'width') {
+      handleTargetChange(ratio * stateRef.current.origH);
+    } else {
+      handleTargetChange(stateRef.current.origW / ratio);
     }
   };
 
   const handleDownload = () => {
-    if (!processedImage) return;
-
+    const canvas = canvasRef.current;
+    if (!canvas) return;
     const link = document.createElement('a');
-    link.href = processedImage;
+    link.href = canvas.toDataURL();
     link.download = 'seam-carved.png';
     link.click();
   };
 
-  const seamsToRemove = Math.floor(imageWidth * (seamsPercent / 100));
+  const dir = stateRef.current.direction;
+  const outputWidth = dir === 'width' ? targetSize : origDims.w;
+  const outputHeight = dir === 'height' ? targetSize : origDims.h;
+  const maxSize = dir === 'width' ? origDims.w : origDims.h;
 
   return (
     <div className="lab-inversion">
@@ -91,50 +146,113 @@ function SeamCarving() {
         <Link to="/" className="back-link">← Back to Home</Link>
         <h1>Seam Carving</h1>
         <p className="main-description">Content-aware image resizing with forward energy</p>
-        <p className="technical-description">Computes energy in LAB color space for perceptually accurate seam detection, using forward energy to minimize artifacts</p>
+        <p className="technical-description">Precomputes all seams in LAB space, then renders any size in real-time</p>
       </header>
 
       <main className="demo-main">
         <div className="upload-section">
-          <ImageDropZone onImageSelect={handleImageSelect} disabled={isProcessing} />
+          <ImageDropZone onImageSelect={handleImageSelect} disabled={isPrecomputing} />
         </div>
 
         {originalImage && (
           <div className="controls">
-            <label htmlFor="seams-slider">
-              Remove: {seamsPercent}% width ({seamsToRemove}px)
-            </label>
-            <input
-              id="seams-slider"
-              type="range"
-              min="1"
-              max="50"
-              value={seamsPercent}
-              onChange={(e) => handleSeamsChange(Number(e.target.value))}
-              disabled={isProcessing}
-            />
+            <div className="direction-toggle">
+              <button
+                className={direction === 'width' ? 'active' : ''}
+                onClick={() => handleDirectionChange('width')}
+                disabled={isPrecomputing}
+              >
+                Reduce Width
+              </button>
+              <button
+                className={direction === 'height' ? 'active' : ''}
+                onClick={() => handleDirectionChange('height')}
+                disabled={isPrecomputing}
+              >
+                Reduce Height
+              </button>
+            </div>
+
+            {ready && (
+              <>
+                <label htmlFor="size-slider">
+                  {direction === 'width' ? 'Width' : 'Height'}: {targetSize}px
+                </label>
+                <input
+                  id="size-slider"
+                  type="range"
+                  min="1"
+                  max={maxSize}
+                  value={targetSize}
+                  onChange={(e) => handleTargetChange(Number(e.target.value))}
+                />
+
+                <div className="size-inputs">
+                  <label>
+                    W:
+                    <input
+                      type="number"
+                      value={outputWidth}
+                      min={1}
+                      max={origDims.w}
+                      onChange={(e) => {
+                        if (direction === 'width') handleTargetChange(Number(e.target.value));
+                      }}
+                      disabled={direction !== 'width'}
+                    />
+                  </label>
+                  <span className="times">&times;</span>
+                  <label>
+                    H:
+                    <input
+                      type="number"
+                      value={outputHeight}
+                      min={1}
+                      max={origDims.h}
+                      onChange={(e) => {
+                        if (direction === 'height') handleTargetChange(Number(e.target.value));
+                      }}
+                      disabled={direction !== 'height'}
+                    />
+                  </label>
+                </div>
+
+                <div className="aspect-input">
+                  <label>
+                    Aspect Ratio:
+                    <input
+                      type="text"
+                      value={aspectText}
+                      onChange={(e) => setAspectText(e.target.value)}
+                      onBlur={handleAspectCommit}
+                      onKeyDown={(e) => { if (e.key === 'Enter') handleAspectCommit(); }}
+                    />
+                  </label>
+                </div>
+              </>
+            )}
           </div>
         )}
 
-        {isProcessing && (
+        {isPrecomputing && (
           <div className="processing">
-            Carving seams...
+            Precomputing seam order...
           </div>
         )}
 
-        {(originalImage || processedImage) && (
+        {(originalImage || ready) && (
           <div className="images-container">
             {originalImage && (
               <div className="image-box">
-                <h3>Original</h3>
+                <h3>Original ({origDims.w} &times; {origDims.h})</h3>
                 <img src={originalImage} alt="Original" />
               </div>
             )}
 
-            {processedImage && (
+            {ready && (
               <div className="image-box">
-                <h3>Carved</h3>
-                <img src={processedImage} alt="Processed" />
+                <h3>Carved ({outputWidth} &times; {outputHeight})</h3>
+                <canvas ref={canvasRef} className="result-canvas" />
                 <button className="download-button" onClick={handleDownload}>
                   Download
                 </button>
@@ -142,8 +260,6 @@ function SeamCarving() {
             )}
           </div>
         )}
-
-        <canvas ref={canvasRef} style={{ display: 'none' }} />
       </main>
     </div>
   );

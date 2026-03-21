@@ -3,63 +3,89 @@ mod utils;
 use wasm_bindgen::prelude::*;
 use palette::{IntoColor, Lab, Srgb};
 
-/// Seam carving with forward energy, computed in LAB color space.
-/// Converts to LAB once, carves seams on the LAB buffer, converts back at the end.
+/// Precompute seam removal order using forward energy in LAB color space.
+/// Returns a u32 array of size width*height where each value is the step at which
+/// that pixel gets removed (1-indexed). Pixels surviving to the end get value = max_dimension.
+/// direction: 0 = vertical seams (reduce width), 1 = horizontal seams (reduce height)
 #[wasm_bindgen]
-pub fn seam_carve_lab(image_data: &[u8], width: u32, height: u32, seams_to_remove: u32) -> Vec<u8> {
+pub fn precompute_seam_order(image_data: &[u8], width: u32, height: u32, direction: u32) -> Vec<u32> {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
 
     let w = width as usize;
     let h = height as usize;
-    let seams = seams_to_remove as usize;
 
-    // Convert entire image to LAB once
-    let mut lab_img: Vec<Lab> = Vec::with_capacity(w * h);
-    let mut alpha_img: Vec<u8> = Vec::with_capacity(w * h);
+    if direction == 0 {
+        precompute_vertical_order(image_data, w, h)
+    } else {
+        // Transpose image, compute vertical order, map back
+        let mut transposed = vec![0u8; image_data.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let src = (y * w + x) * 4;
+                let dst = (x * h + y) * 4;
+                transposed[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
+            }
+        }
+        let order_t = precompute_vertical_order(&transposed, h, w);
+        // Map transposed coords back: order_t[tx * h + ty] → order[ty * w + tx]
+        let mut order = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                order[y * w + x] = order_t[x * h + y];
+            }
+        }
+        order
+    }
+}
 
-    for i in (0..image_data.len()).step_by(4) {
-        let r = image_data[i] as f32 / 255.0;
-        let g = image_data[i + 1] as f32 / 255.0;
-        let b = image_data[i + 2] as f32 / 255.0;
-        let rgb = Srgb::new(r, g, b);
-        lab_img.push(rgb.into_color());
-        alpha_img.push(image_data[i + 3]);
+fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> {
+    // Convert to LAB, row-based for efficient removal
+    let mut rows: Vec<Vec<Lab>> = Vec::with_capacity(h);
+    for y in 0..h {
+        let mut row = Vec::with_capacity(w);
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            let r = image_data[i] as f32 / 255.0;
+            let g = image_data[i + 1] as f32 / 255.0;
+            let b = image_data[i + 2] as f32 / 255.0;
+            row.push(Srgb::new(r, g, b).into_color());
+        }
+        rows.push(row);
     }
 
+    // Track original x indices for each row
+    let mut indices: Vec<Vec<usize>> = (0..h).map(|_| (0..w).collect()).collect();
+    let mut order = vec![0u32; w * h];
     let mut cur_w = w;
 
-    for _ in 0..seams.min(cur_w.saturating_sub(1)) {
-        // Build forward energy cost matrix
-        // Forward energy considers the cost of new edges created by removing a pixel
-        let mut cost = vec![0.0_f32; cur_w * h];
+    for step in 1..w as u32 {
+        if cur_w <= 1 {
+            break;
+        }
 
-        // First row: zero cost
-        // (cost is already zero from initialization)
+        // Build forward energy cost matrix
+        let mut cost = vec![0.0_f32; cur_w * h];
 
         for y in 1..h {
             for x in 0..cur_w {
-                let idx = |yy: usize, xx: usize| -> &Lab {
-                    &lab_img[yy * cur_w + xx]
-                };
-
                 // Cost of creating a new horizontal edge between (y, x-1) and (y, x+1)
                 let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(idx(y, x - 1), idx(y, x + 1))
+                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
                 } else {
                     0.0
                 };
 
                 // Cost of creating edge between (y-1, x) and (y, x-1) -- for left path
                 let c_l = if x > 0 {
-                    c_u + lab_dist(idx(y - 1, x), idx(y, x - 1))
+                    c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
                 // Cost of creating edge between (y-1, x) and (y, x+1) -- for right path
                 let c_r = if x < cur_w - 1 {
-                    c_u + lab_dist(idx(y - 1, x), idx(y, x + 1))
+                    c_u + lab_dist(&rows[y - 1][x], &rows[y][x + 1])
                 } else {
                     f32::MAX / 2.0
                 };
@@ -83,7 +109,7 @@ pub fn seam_carve_lab(image_data: &[u8], width: u32, height: u32, seams_to_remov
             }
         }
 
-        // Trace seam back from bottom to top
+        // Trace seam back from bottom to top using forward energy
         let mut seam = vec![0_usize; h];
         seam[h - 1] = min_x;
         for y in (1..h).rev() {
@@ -91,12 +117,13 @@ pub fn seam_carve_lab(image_data: &[u8], width: u32, height: u32, seams_to_remov
             let above = cost[(y - 1) * cur_w + x];
             let above_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] } else { f32::MAX };
 
-            // Retrace using the same forward energy logic
             if x > 0 {
                 let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(&lab_img[y * cur_w + x - 1], &lab_img[y * cur_w + x + 1])
-                } else { 0.0 };
-                let c_l = c_u + lab_dist(&lab_img[(y - 1) * cur_w + x], &lab_img[y * cur_w + x - 1]);
+                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
+                } else {
+                    0.0
+                };
+                let c_l = c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1]);
                 if (above_left + c_l - cost[y * cur_w + x]).abs() < 1e-3 {
                     seam[y - 1] = x - 1;
                     continue;
@@ -104,8 +131,10 @@ pub fn seam_carve_lab(image_data: &[u8], width: u32, height: u32, seams_to_remov
             }
             {
                 let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(&lab_img[y * cur_w + x - 1], &lab_img[y * cur_w + x + 1])
-                } else { 0.0 };
+                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
+                } else {
+                    0.0
+                };
                 if (above + c_u - cost[y * cur_w + x]).abs() < 1e-3 {
                     seam[y - 1] = x;
                     continue;
@@ -118,33 +147,87 @@ pub fn seam_carve_lab(image_data: &[u8], width: u32, height: u32, seams_to_remov
             }
         }
 
-        // Remove the seam from lab_img and alpha_img
-        for y in (0..h).rev() {
-            let row_start = y * cur_w;
-            let remove_x = seam[y];
-            lab_img.remove(row_start + remove_x);
-            alpha_img.remove(row_start + remove_x);
+        // Record removal order and remove from working buffers
+        for y in 0..h {
+            let sx = seam[y];
+            let orig_x = indices[y][sx];
+            order[y * w + orig_x] = step;
+            rows[y].remove(sx);
+            indices[y].remove(sx);
         }
 
         cur_w -= 1;
     }
 
-    // Convert LAB back to RGBA
-    let new_width = cur_w;
-    let mut output = Vec::with_capacity(new_width * h * 4);
-
+    // Surviving pixels (last one per row) get order = w
     for y in 0..h {
-        for x in 0..new_width {
-            let lab = lab_img[y * new_width + x];
-            let rgb_out: Srgb = lab.into_color();
-            output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push(alpha_img[y * new_width + x]);
+        for &orig_x in &indices[y] {
+            order[y * w + orig_x] = w as u32;
         }
     }
 
-    output
+    order
+}
+
+/// Render a seam-carved image at any target size using the precomputed order map.
+/// direction: 0 = vertical seams (target_size is width), 1 = horizontal seams (target_size is height)
+#[wasm_bindgen]
+pub fn render_seam_carved(
+    image_data: &[u8],
+    order: &[u32],
+    orig_width: u32,
+    orig_height: u32,
+    target_size: u32,
+    direction: u32,
+) -> Vec<u8> {
+    let w = orig_width as usize;
+    let h = orig_height as usize;
+    let target = target_size as usize;
+
+    if direction == 0 {
+        // Reducing width: keep pixels where order > seams_removed
+        let seams_removed = w - target;
+        let mut output = vec![0u8; target * h * 4];
+        let mut out_idx = 0;
+
+        for y in 0..h {
+            for x in 0..w {
+                if order[y * w + x] as usize > seams_removed {
+                    let src = (y * w + x) * 4;
+                    output[out_idx..out_idx + 4].copy_from_slice(&image_data[src..src + 4]);
+                    out_idx += 4;
+                }
+            }
+        }
+
+        output
+    } else {
+        // Reducing height: keep pixels where order > seams_removed, per column
+        let seams_removed = h - target;
+
+        // Build surviving row indices per column
+        let mut col_survivors: Vec<Vec<usize>> = vec![Vec::with_capacity(target); w];
+        for x in 0..w {
+            for y in 0..h {
+                if order[y * w + x] as usize > seams_removed {
+                    col_survivors[x].push(y);
+                }
+            }
+        }
+
+        // Output in row-major order
+        let mut output = vec![0u8; w * target * 4];
+        for r in 0..target {
+            for x in 0..w {
+                let orig_y = col_survivors[x][r];
+                let src = (orig_y * w + x) * 4;
+                let dst = (r * w + x) * 4;
+                output[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
+            }
+        }
+
+        output
+    }
 }
 
 /// Euclidean distance between two LAB colors

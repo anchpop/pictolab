@@ -60,3 +60,89 @@
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.direction-toggle {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.direction-toggle button {
+  flex: 1;
+  padding: 0.5rem 1rem;
+  border: 2px solid #e0e0e0;
+  background: white;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  color: #666;
+  font-size: 0.9rem;
+  transition: all 0.2s;
+}
+
+.direction-toggle button.active {
+  border-color: #667eea;
+  background: #667eea;
+  color: white;
+}
+
+.direction-toggle button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.size-inputs {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.size-inputs label {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0;
+}
+
+.size-inputs input[type="number"] {
+  width: 80px;
+  padding: 0.25rem 0.5rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.size-inputs input[type="number"]:disabled {
+  opacity: 0.5;
+  background: #f5f5f5;
+}
+
+.size-inputs .times {
+  font-weight: 600;
+  color: #666;
+}
+
+.aspect-input {
+  margin-top: 0.75rem;
+}
+
+.aspect-input label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0;
+}
+
+.aspect-input input[type="text"] {
+  width: 80px;
+  padding: 0.25rem 0.5rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.result-canvas {
+  max-width: 100%;
+  height: auto;
+}
