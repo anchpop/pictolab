@@ -33,6 +33,11 @@ function Home() {
               <p>Content-aware resizing with forward energy in LAB space</p>
             </Link>
 
+            <Link to="/chroma-boost" className="experiment-card">
+              <h3>Chroma Boost</h3>
+              <p>Increase or decrease color intensity in LAB space</p>
+            </Link>
+
             <div className="experiment-card coming-soon">
               <h3>More Coming Soon</h3>
               <p>Stay tuned for more photo experiments</p>

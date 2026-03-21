@@ -313,3 +313,34 @@ pub fn laberation(image_data: &[u8], width: u32, height: u32, offset: i32) -> Ve
 
     output
 }
+
+#[wasm_bindgen]
+pub fn boost_chroma_lab(image_data: &[u8], _width: u32, _height: u32, factor: f32) -> Vec<u8> {
+    #[cfg(feature = "console_error_panic_hook")]
+    console_error_panic_hook::set_once();
+
+    let mut output = Vec::with_capacity(image_data.len());
+
+    for i in (0..image_data.len()).step_by(4) {
+        let r = image_data[i] as f32 / 255.0;
+        let g = image_data[i + 1] as f32 / 255.0;
+        let b = image_data[i + 2] as f32 / 255.0;
+        let a = image_data[i + 3];
+
+        let rgb = Srgb::new(r, g, b);
+        let mut lab: Lab = rgb.into_color();
+
+        // Scale the A and B channels to boost chroma
+        lab.a *= factor;
+        lab.b *= factor;
+
+        let rgb_out: Srgb = lab.into_color();
+
+        output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
+        output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
+        output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
+        output.push(a);
+    }
+
+    output
+}

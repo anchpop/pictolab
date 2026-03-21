@@ -24,4 +24,11 @@ declare module 'frontend-rs' {
     height: number,
     seams_to_remove: number
   ): Uint8Array;
+
+  export function boost_chroma_lab(
+    image_data: Uint8Array,
+    width: number,
+    height: number,
+    factor: number
+  ): Uint8Array;
 }
