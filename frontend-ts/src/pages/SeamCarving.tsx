@@ -230,6 +230,18 @@ function SeamCarving() {
         <h1>Seam Carving</h1>
         <p className="main-description">Content-aware image resizing with forward energy</p>
         <p className="technical-description">Uses <a href="https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html" target="_blank" rel="noopener noreferrer">seam carving with forward energy</a> in LAB color space. All seams are precomputed so any target size renders in real-time.</p>
+        <button
+          className={`gpu-toggle ${useGPU ? 'active' : ''}`}
+          onClick={() => {
+            const next = !useGPU;
+            setUseGPU(next);
+            useGPURef.current = next;
+          }}
+          disabled={!gpuAvailable || isPrecomputing}
+          title={gpuAvailable ? `WebGPU ${useGPU ? 'enabled' : 'disabled'}` : 'WebGPU not available on this device'}
+        >
+          WebGPU {useGPU ? 'ON' : 'OFF'}
+        </button>
       </header>
 
       <main className="demo-main">
@@ -253,18 +265,6 @@ function SeamCarving() {
                 disabled={isPrecomputing}
               >
                 Reduce Height
-              </button>
-              <button
-                className={`gpu-toggle ${useGPU ? 'active' : ''}`}
-                onClick={() => {
-                  const next = !useGPU;
-                  setUseGPU(next);
-                  useGPURef.current = next;
-                }}
-                disabled={!gpuAvailable || isPrecomputing}
-                title={gpuAvailable ? `WebGPU ${useGPU ? 'enabled' : 'disabled'}` : 'WebGPU not available on this device'}
-              >
-                WebGPU {useGPU ? 'ON' : 'OFF'}
               </button>
             </div>
 

@@ -230,11 +230,11 @@ fn dp_up(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: ve
   let gap=wg.x; let strip=params[1]; let jl=lid.x; let w=params[0];
   let center=(gap+1u)*BB; let row0=strip*SS;
   for (var k=0u; k<SS; k++) {{
-    let i=row0+k; var active=false; var j=0u;
+    let i=row0+k; var is_active=false; var j=0u;
     if (k>0u && center>=k && jl<2u*k) {{
-      j=center-k+jl; active=(i<MH)&&(i>0u)&&(j<w);
+      j=center-k+jl; is_active=(i<MH)&&(i>0u)&&(j<w);
     }}
-    if (active) {{ dp_step(i,j,w); }}
+    if (is_active) {{ dp_step(i,j,w); }}
     storageBarrier();
   }}
 }}
