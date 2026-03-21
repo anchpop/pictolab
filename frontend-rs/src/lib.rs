@@ -1,14 +1,19 @@
 mod utils;
 
-use wasm_bindgen::prelude::*;
 use palette::{IntoColor, Lab, Srgb};
+use wasm_bindgen::prelude::*;
 
 /// Precompute seam removal order using forward energy in LAB color space.
 /// Returns a u32 array of size width*height where each value is the step at which
 /// that pixel gets removed (1-indexed). Pixels surviving to the end get value = max_dimension.
 /// direction: 0 = vertical seams (reduce width), 1 = horizontal seams (reduce height)
 #[wasm_bindgen]
-pub fn precompute_seam_order(image_data: &[u8], width: u32, height: u32, direction: u32) -> Vec<u32> {
+pub fn precompute_seam_order(
+    image_data: &[u8],
+    width: u32,
+    height: u32,
+    direction: u32,
+) -> Vec<u32> {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
 
@@ -74,17 +79,23 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
         for y in 0..h {
             for x in 0..cur_w {
                 let left = if x > 0 { &rows[y][x - 1] } else { &rows[y][x] };
-                let right = if x < cur_w - 1 { &rows[y][x + 1] } else { &rows[y][x] };
+                let right = if x < cur_w - 1 {
+                    &rows[y][x + 1]
+                } else {
+                    &rows[y][x]
+                };
                 let up = if y > 0 { &rows[y - 1][x] } else { &rows[y][x] };
-                let down = if y < h - 1 { &rows[y + 1][x] } else { &rows[y][x] };
+                let down = if y < h - 1 {
+                    &rows[y + 1][x]
+                } else {
+                    &rows[y][x]
+                };
                 energy[y * cur_w + x] = lab_dist(left, right) + lab_dist(up, down);
             }
         }
 
         // First row: base energy only
-        for x in 0..cur_w {
-            cost[x] = energy[x];
-        }
+        cost[..cur_w].copy_from_slice(&energy[..cur_w]);
 
         for y in 1..h {
             for x in 0..cur_w {
@@ -112,9 +123,17 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
                 };
 
                 let e = energy[y * cur_w + x];
-                let from_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] + c_l + e } else { f32::MAX / 2.0 };
+                let from_left = if x > 0 {
+                    cost[(y - 1) * cur_w + x - 1] + c_l + e
+                } else {
+                    f32::MAX / 2.0
+                };
                 let from_above = cost[(y - 1) * cur_w + x] + c_u + e;
-                let from_right = if x < cur_w - 1 { cost[(y - 1) * cur_w + x + 1] + c_r + e } else { f32::MAX / 2.0 };
+                let from_right = if x < cur_w - 1 {
+                    cost[(y - 1) * cur_w + x + 1] + c_r + e
+                } else {
+                    f32::MAX / 2.0
+                };
 
                 let min = from_above.min(from_left).min(from_right);
                 cost[y * cur_w + x] = min;
@@ -220,12 +239,12 @@ pub fn render_seam_carved(
 
         // Output in row-major order
         let mut output = vec![0u8; w * target * 4];
-        for r in 0..target {
-            for x in 0..w {
-                let orig_y = col_survivors[x][r];
+        for (r, row) in output.chunks_exact_mut(w * 4).enumerate().take(target) {
+            for (x, survivors) in col_survivors.iter().enumerate().take(w) {
+                let orig_y = survivors[r];
                 let src = (orig_y * w + x) * 4;
-                let dst = (r * w + x) * 4;
-                output[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
+                let dst = x * 4;
+                row[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
             }
         }
 
@@ -447,7 +466,11 @@ mod tests {
         let mut data = Vec::with_capacity(w * h * 4);
         for _y in 0..h {
             for x in 0..w {
-                let px = if x == 3 { make_pixel(0, 255, 0) } else { make_pixel(255, 0, 0) };
+                let px = if x == 3 {
+                    make_pixel(0, 255, 0)
+                } else {
+                    make_pixel(255, 0, 0)
+                };
                 data.extend_from_slice(&px);
             }
         }
@@ -511,8 +534,8 @@ mod tests {
         let w = 4;
         let h = 2;
         let data: Vec<u8> = vec![
-            255, 0, 0, 255,   0, 255, 0, 255,   0, 0, 255, 255,   255, 255, 0, 255, // row 0
-            128, 0, 0, 255,   0, 128, 0, 255,   0, 0, 128, 255,   128, 128, 0, 255, // row 1
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255, // row 0
+            128, 0, 0, 255, 0, 128, 0, 255, 0, 0, 128, 255, 128, 128, 0, 255, // row 1
         ];
 
         let order = precompute_vertical_order(&data, w, h);
@@ -527,6 +550,9 @@ mod tests {
 
         // Render at original size (remove 0 seams) should be identical to input
         let result = render_seam_carved(&data, &order, 4, 2, 4, 0);
-        assert_eq!(result, data, "Rendering at original size should produce identical output");
+        assert_eq!(
+            result, data,
+            "Rendering at original size should produce identical output"
+        );
     }
 }
