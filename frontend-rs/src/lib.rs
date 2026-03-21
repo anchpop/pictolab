@@ -64,37 +64,69 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
             break;
         }
 
-        // Build forward energy cost matrix
+        // Build forward energy cost matrix with parent pointers for traceback
         let mut cost = vec![0.0_f32; cur_w * h];
+        // Parent direction: -1=came from above-left, 0=above, 1=above-right
+        let mut parent = vec![0i8; cur_w * h];
+
+        // Compute per-pixel gradient energy (dual gradient magnitude)
+        let mut energy = vec![0.0_f32; cur_w * h];
+        for y in 0..h {
+            for x in 0..cur_w {
+                let left = if x > 0 { &rows[y][x - 1] } else { &rows[y][x] };
+                let right = if x < cur_w - 1 { &rows[y][x + 1] } else { &rows[y][x] };
+                let up = if y > 0 { &rows[y - 1][x] } else { &rows[y][x] };
+                let down = if y < h - 1 { &rows[y + 1][x] } else { &rows[y][x] };
+                energy[y * cur_w + x] = lab_dist(left, right) + lab_dist(up, down);
+            }
+        }
+
+        // First row: base energy only
+        for x in 0..cur_w {
+            cost[x] = energy[x];
+        }
 
         for y in 1..h {
             for x in 0..cur_w {
-                // Cost of creating a new horizontal edge between (y, x-1) and (y, x+1)
+                // Forward energy: cost of new edges created by removing this pixel
                 let c_u = if x > 0 && x < cur_w - 1 {
                     lab_dist(&rows[y][x - 1], &rows[y][x + 1])
+                } else if cur_w > 1 && x == 0 {
+                    lab_dist(&rows[y][0], &rows[y][1])
+                } else if cur_w > 1 {
+                    lab_dist(&rows[y][cur_w - 2], &rows[y][cur_w - 1])
                 } else {
                     0.0
                 };
 
-                // Cost of creating edge between (y-1, x) and (y, x-1) -- for left path
                 let c_l = if x > 0 {
                     c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
-                // Cost of creating edge between (y-1, x) and (y, x+1) -- for right path
                 let c_r = if x < cur_w - 1 {
                     c_u + lab_dist(&rows[y - 1][x], &rows[y][x + 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
-                let above_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] + c_l } else { f32::MAX / 2.0 };
-                let above = cost[(y - 1) * cur_w + x] + c_u;
-                let above_right = if x < cur_w - 1 { cost[(y - 1) * cur_w + x + 1] + c_r } else { f32::MAX / 2.0 };
+                let e = energy[y * cur_w + x];
+                let from_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] + c_l + e } else { f32::MAX / 2.0 };
+                let from_above = cost[(y - 1) * cur_w + x] + c_u + e;
+                let from_right = if x < cur_w - 1 { cost[(y - 1) * cur_w + x + 1] + c_r + e } else { f32::MAX / 2.0 };
 
-                cost[y * cur_w + x] = above.min(above_left).min(above_right);
+                let min = from_above.min(from_left).min(from_right);
+                cost[y * cur_w + x] = min;
+
+                // Store parent direction for exact traceback
+                if min == from_above {
+                    parent[y * cur_w + x] = 0;
+                } else if min == from_left {
+                    parent[y * cur_w + x] = -1;
+                } else {
+                    parent[y * cur_w + x] = 1;
+                }
             }
         }
 
@@ -109,42 +141,13 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
             }
         }
 
-        // Trace seam back from bottom to top using forward energy
+        // Trace seam back from bottom to top using parent pointers
         let mut seam = vec![0_usize; h];
         seam[h - 1] = min_x;
         for y in (1..h).rev() {
             let x = seam[y];
-            let above = cost[(y - 1) * cur_w + x];
-            let above_left = if x > 0 { cost[(y - 1) * cur_w + x - 1] } else { f32::MAX };
-
-            if x > 0 {
-                let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
-                } else {
-                    0.0
-                };
-                let c_l = c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1]);
-                if (above_left + c_l - cost[y * cur_w + x]).abs() < 1e-3 {
-                    seam[y - 1] = x - 1;
-                    continue;
-                }
-            }
-            {
-                let c_u = if x > 0 && x < cur_w - 1 {
-                    lab_dist(&rows[y][x - 1], &rows[y][x + 1])
-                } else {
-                    0.0
-                };
-                if (above + c_u - cost[y * cur_w + x]).abs() < 1e-3 {
-                    seam[y - 1] = x;
-                    continue;
-                }
-            }
-            if x < cur_w - 1 {
-                seam[y - 1] = x + 1;
-            } else {
-                seam[y - 1] = x;
-            }
+            let dir = parent[y * cur_w + x];
+            seam[y - 1] = (x as isize + dir as isize) as usize;
         }
 
         // Record removal order and remove from working buffers
@@ -426,4 +429,104 @@ pub fn boost_chroma_lab(image_data: &[u8], _width: u32, _height: u32, factor: f3
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pixel(r: u8, g: u8, b: u8) -> [u8; 4] {
+        [r, g, b, 255]
+    }
+
+    #[test]
+    fn test_seam_order_each_row_is_permutation() {
+        // 6x4 image: red background with a green vertical stripe at x=3
+        let w = 6;
+        let h = 4;
+        let mut data = Vec::with_capacity(w * h * 4);
+        for _y in 0..h {
+            for x in 0..w {
+                let px = if x == 3 { make_pixel(0, 255, 0) } else { make_pixel(255, 0, 0) };
+                data.extend_from_slice(&px);
+            }
+        }
+
+        let order = precompute_vertical_order(&data, w, h);
+
+        // Each row should have order values that form a permutation of 1..=w
+        for y in 0..h {
+            let mut row_orders: Vec<u32> = (0..w).map(|x| order[y * w + x]).collect();
+            row_orders.sort();
+            assert_eq!(
+                row_orders,
+                vec![1, 2, 3, 4, 5, 6],
+                "Row {y}: expected permutation of 1..=6, got {row_orders:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seam_order_not_just_left_to_right() {
+        // Image with a gradient and a bright object in the middle
+        // Left side: smooth dark gradient. Center: bright spot. Right: smooth dark gradient.
+        // The seam carving should avoid the bright center and remove from the dark edges.
+        let w = 10;
+        let h = 6;
+        let mut data = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                // Create a "landscape" with important center content
+                let dist_from_center = ((x as f32 - 4.5).abs() + (y as f32 - 2.5).abs()) / 7.0;
+                let brightness = (255.0 * (1.0 - dist_from_center).max(0.0)) as u8;
+                // Add some variation based on position to prevent uniform regions
+                let r = brightness.saturating_add((x * 17 % 30) as u8);
+                let g = brightness.saturating_add((y * 23 % 20) as u8);
+                let b = brightness.saturating_add(((x + y) * 13 % 25) as u8);
+                data.extend_from_slice(&make_pixel(r, g, b));
+            }
+        }
+
+        let order = precompute_vertical_order(&data, w, h);
+
+        // Check that the order is not trivially sequential for each row
+        for y in 0..h {
+            let row_orders: Vec<u32> = (0..w).map(|x| order[y * w + x]).collect();
+            let sequential: Vec<u32> = (1..=w as u32).collect();
+            assert_ne!(
+                row_orders, sequential,
+                "Row {y}: order should not be trivially left-to-right sequential, got {row_orders:?}"
+            );
+            let reverse_sequential: Vec<u32> = (1..=w as u32).rev().collect();
+            assert_ne!(
+                row_orders, reverse_sequential,
+                "Row {y}: order should not be trivially right-to-left sequential"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_preserves_correct_pixels() {
+        // 4x2 image with distinct pixels
+        let w = 4;
+        let h = 2;
+        let data: Vec<u8> = vec![
+            255, 0, 0, 255,   0, 255, 0, 255,   0, 0, 255, 255,   255, 255, 0, 255, // row 0
+            128, 0, 0, 255,   0, 128, 0, 255,   0, 0, 128, 255,   128, 128, 0, 255, // row 1
+        ];
+
+        let order = precompute_vertical_order(&data, w, h);
+
+        // Render at target=3 (remove 1 seam)
+        let result = render_seam_carved(&data, &order, 4, 2, 3, 0);
+        assert_eq!(result.len(), 3 * 2 * 4, "Output should be 3x2 pixels");
+
+        // Render at target=1 (remove 3 seams)
+        let result = render_seam_carved(&data, &order, 4, 2, 1, 0);
+        assert_eq!(result.len(), 1 * 2 * 4, "Output should be 1x2 pixels");
+
+        // Render at original size (remove 0 seams) should be identical to input
+        let result = render_seam_carved(&data, &order, 4, 2, 4, 0);
+        assert_eq!(result, data, "Rendering at original size should produce identical output");
+    }
 }

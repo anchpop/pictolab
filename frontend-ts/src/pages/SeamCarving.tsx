@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import ImageDropZone from '../components/ImageDropZone';
 import './SeamCarving.css';
@@ -13,6 +13,8 @@ function SeamCarving() {
   const [aspectText, setAspectText] = useState('');
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
   const stateRef = useRef({
     imageData: null as Uint8Array | null,
     orderMap: null as Uint32Array | null,
@@ -21,6 +23,23 @@ function SeamCarving() {
     origH: 0,
     direction: 'width' as 'width' | 'height',
   });
+
+  // Clean up worker on unmount
+  useEffect(() => {
+    return () => {
+      workerRef.current?.terminate();
+    };
+  }, []);
+
+  const getWorker = () => {
+    if (!workerRef.current) {
+      workerRef.current = new Worker(
+        new URL('../workers/seam-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+    }
+    return workerRef.current;
+  };
 
   const renderAtSize = (size: number) => {
     const { wasm, imageData, orderMap, origW, origH, direction: dir } = stateRef.current;
@@ -49,26 +68,42 @@ function SeamCarving() {
     setIsPrecomputing(true);
     setReady(false);
 
+    // Load WASM on main thread for render_seam_carved
     const wasm = await import('frontend-rs');
     stateRef.current.wasm = wasm;
     stateRef.current.direction = dir;
 
-    // Yield to let the UI render the loading state
-    await new Promise(r => setTimeout(r, 50));
-
+    const currentId = ++requestIdRef.current;
     const dirNum = dir === 'width' ? 0 : 1;
-    const order = wasm.precompute_seam_order(imageData, w, h, dirNum);
-    stateRef.current.orderMap = order;
 
-    const max = dir === 'width' ? w : h;
-    const defaultTarget = Math.round(max * 0.8);
+    const worker = getWorker();
+    worker.onmessage = (e: MessageEvent) => {
+      const { order, requestId } = e.data;
 
-    setTargetSize(defaultTarget);
-    setIsPrecomputing(false);
-    setReady(true);
-    updateAspectText(dir, defaultTarget, w, h);
+      // Ignore stale results from previous precomputations
+      if (requestId !== requestIdRef.current) return;
 
-    renderAtSize(defaultTarget);
+      stateRef.current.orderMap = order;
+
+      const max = dir === 'width' ? w : h;
+      const defaultTarget = Math.round(max * 0.8);
+
+      setTargetSize(defaultTarget);
+      setIsPrecomputing(false);
+      setReady(true);
+      updateAspectText(dir, defaultTarget, w, h);
+
+      renderAtSize(defaultTarget);
+    };
+
+    // Send image data to worker (structured clone copies it)
+    worker.postMessage({
+      imageData: imageData,
+      width: w,
+      height: h,
+      direction: dirNum,
+      requestId: currentId,
+    });
   };
 
   const handleImageSelect = (imageUrl: string) => {
@@ -252,7 +287,21 @@ function SeamCarving() {
             {ready && (
               <div className="image-box">
                 <h3>Carved ({outputWidth} &times; {outputHeight})</h3>
-                <canvas ref={canvasRef} className="result-canvas" />
+                <div
+                  className="canvas-container"
+                  style={{
+                    aspectRatio: `${origDims.w} / ${origDims.h}`,
+                  }}
+                >
+                  <canvas
+                    ref={canvasRef}
+                    className="result-canvas"
+                    style={{
+                      width: direction === 'width' ? `${(targetSize / origDims.w) * 100}%` : '100%',
+                      height: direction === 'height' ? `${(targetSize / origDims.h) * 100}%` : '100%',
+                    }}
+                  />
+                </div>
                 <button className="download-button" onClick={handleDownload}>
                   Download
                 </button>

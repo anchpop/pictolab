@@ -16,6 +16,12 @@ export default defineConfig({
     wasm(),
     topLevelAwait(),
   ],
+  worker: {
+    format: 'es',
+    plugins: () => [
+      wasm(),
+    ],
+  },
   resolve: {
     alias: {
       'frontend-rs': path.resolve(__dirname, '../frontend-rs/pkg'),
