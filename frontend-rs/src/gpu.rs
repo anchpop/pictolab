@@ -37,7 +37,9 @@ fn js_call1(obj: &JsValue, method: &str, a: &JsValue) -> Result<JsValue, JsValue
 }
 
 fn js_call2(obj: &JsValue, method: &str, a: &JsValue, b: &JsValue) -> Result<JsValue, JsValue> {
-    js_get(obj, method)?.dyn_into::<Function>()?.call2(obj, a, b)
+    js_get(obj, method)?
+        .dyn_into::<Function>()?
+        .call2(obj, a, b)
 }
 
 async fn js_await(val: JsValue) -> Result<JsValue, JsValue> {
@@ -73,7 +75,11 @@ fn write_buffer_u32(queue: &JsValue, buffer: &JsValue, data: &[u32]) -> Result<(
 }
 
 fn create_shader(device: &JsValue, code: &str) -> Result<JsValue, JsValue> {
-    js_call1(device, "createShaderModule", &js_obj(&[("code", code.into())]))
+    js_call1(
+        device,
+        "createShaderModule",
+        &js_obj(&[("code", code.into())]),
+    )
 }
 
 fn create_pipeline(
@@ -87,18 +93,34 @@ fn create_pipeline(
     js_call1(device, "createComputePipeline", &desc)
 }
 
-fn create_storage_bgl(device: &JsValue, count: u32, read_only_mask: u32) -> Result<JsValue, JsValue> {
+fn create_storage_bgl(
+    device: &JsValue,
+    count: u32,
+    read_only_mask: u32,
+) -> Result<JsValue, JsValue> {
     let entries = Array::new();
     for i in 0..count {
         let is_ro = (read_only_mask >> i) & 1 == 1;
-        let buf_desc = js_obj(&[("type", if is_ro { "read-only-storage" } else { "storage" }.into())]);
+        let buf_desc = js_obj(&[(
+            "type",
+            if is_ro {
+                "read-only-storage"
+            } else {
+                "storage"
+            }
+            .into(),
+        )]);
         entries.push(&js_obj(&[
             ("binding", i.into()),
             ("visibility", SHADER_COMPUTE.into()),
             ("buffer", buf_desc.into()),
         ]));
     }
-    js_call1(device, "createBindGroupLayout", &js_obj(&[("entries", entries.into())]))
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
 }
 
 fn create_bind_group(
@@ -320,9 +342,9 @@ pub fn is_webgpu_available() -> bool {
 
 async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, JsValue> {
     let n = w * h;
-    let n_down = (w + B - 1) / B;
+    let n_down = w.div_ceil(B);
     let n_up = if n_down > 0 { n_down - 1 } else { 0 };
-    let n_strips = (h + S - 1) / S;
+    let n_strips = h.div_ceil(S);
 
     // ── Get GPU device ──────────────────────────────────────────────────
     let nav = js_get(&js_sys::global(), "navigator")?;
@@ -338,7 +360,10 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     let adapter_limits = js_get(&js_get(&adapter, "limits")?, "maxStorageBufferBindingSize")?;
     let max_storage = adapter_limits.as_f64().unwrap_or(134217728.0) as u32;
 
-    let required_limits = js_obj(&[("maxStorageBufferBindingSize", JsValue::from_f64(max_storage as f64))]);
+    let required_limits = js_obj(&[(
+        "maxStorageBufferBindingSize",
+        JsValue::from_f64(max_storage as f64),
+    )]);
     let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
     let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
     let queue = js_get(&device, "queue")?;
@@ -400,7 +425,7 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     // ── LAB conversion ──────────────────────────────────────────────────
     let lab_bg = create_bind_group(&device, &lab_bgl, &[&rgba_b, &lab_b])?;
     let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
-    dispatch(&enc, &lab_pipe, &lab_bg, (n + 255) / 256)?;
+    dispatch(&enc, &lab_pipe, &lab_bg, n.div_ceil(256))?;
     let cmd_buf = js_call0(&enc, "finish")?;
     let cmds = Array::of1(&cmd_buf);
     js_call1(&queue, "submit", &cmds)?;
@@ -412,7 +437,7 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
         &[&lab_b, &dp_b, &dirs_b, &seam_b, &cm_b, &order_b, &params_b],
     )?;
 
-    let compact_wg = (h + 255) / 256;
+    let compact_wg = h.div_ceil(256);
     let batch_size = 50u32;
     let total_seams = w - 1;
 
@@ -443,8 +468,7 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
         // Copy result on last batch
         if batch_end >= total_seams {
             let copy_fn: Function = js_get(&enc, "copyBufferToBuffer")?.dyn_into()?;
-            let args =
-                Array::of5(&order_b, &0.into(), &read_b, &0.into(), &(n * 4).into());
+            let args = Array::of5(&order_b, &0.into(), &read_b, &0.into(), &(n * 4).into());
             Reflect::apply(&copy_fn, &enc, &args)?;
         }
 
