@@ -195,7 +195,7 @@ pub fn render_seam_carved(
 ) -> Vec<u8> {
     let w = orig_width as usize;
     let h = orig_height as usize;
-    let target = target_size as usize;
+    let target = (target_size as usize).clamp(1, if direction == 0 { w } else { h });
 
     if direction == 0 {
         // Reducing width: keep pixels where order > seams_removed
@@ -206,6 +206,9 @@ pub fn render_seam_carved(
         for y in 0..h {
             for x in 0..w {
                 if order[y * w + x] as usize > seams_removed {
+                    if out_idx + 4 > output.len() {
+                        break;
+                    }
                     let src = (y * w + x) * 4;
                     output[out_idx..out_idx + 4].copy_from_slice(&image_data[src..src + 4]);
                     out_idx += 4;
@@ -232,10 +235,12 @@ pub fn render_seam_carved(
         let mut output = vec![0u8; w * target * 4];
         for (r, row) in output.chunks_exact_mut(w * 4).enumerate().take(target) {
             for (x, survivors) in col_survivors.iter().enumerate().take(w) {
-                let orig_y = survivors[r];
-                let src = (orig_y * w + x) * 4;
-                let dst = x * 4;
-                row[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
+                if r < survivors.len() {
+                    let orig_y = survivors[r];
+                    let src = (orig_y * w + x) * 4;
+                    let dst = x * 4;
+                    row[dst..dst + 4].copy_from_slice(&image_data[src..src + 4]);
+                }
             }
         }
 
