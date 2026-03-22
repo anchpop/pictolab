@@ -67,6 +67,13 @@
   margin-top: 2rem;
 }
 
+@media (max-width: 860px) {
+  .images-container {
+    display: flex;
+    flex-direction: column-reverse;
+  }
+}
+
 .image-box {
   border: 2px solid #e0e0e0;
   border-radius: 12px;
