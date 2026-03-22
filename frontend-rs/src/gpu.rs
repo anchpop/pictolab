@@ -334,7 +334,13 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     if adapter.is_null() || adapter.is_undefined() {
         return Err("No GPU adapter".into());
     }
-    let device = js_await(js_call0(&adapter, "requestDevice")?).await?;
+    // Request the adapter's max storage buffer binding size
+    let adapter_limits = js_get(&js_get(&adapter, "limits")?, "maxStorageBufferBindingSize")?;
+    let max_storage = adapter_limits.as_f64().unwrap_or(134217728.0) as u32;
+
+    let required_limits = js_obj(&[("maxStorageBufferBindingSize", JsValue::from_f64(max_storage as f64))]);
+    let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
+    let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
     let queue = js_get(&device, "queue")?;
 
     // ── Create shaders + pipelines ──────────────────────────────────────
