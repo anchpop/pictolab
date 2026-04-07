@@ -20,6 +20,10 @@ interface SourceState {
   // (`hdr: true`) it is tightly packed half-float RGBA in linear extended
   // Display P3 (8 bytes/pixel), ready for gpu_set_source_linear_f16.
   data: Uint8Array;
+  // 8-bit Display P3 RGBA proxy used by the seam worker + histogram. For
+  // SDR sources this is the same buffer as `data`; for HDR sources it's
+  // a tonemapped quantization of the f16 pixels.
+  sdrData: Uint8Array;
   w: number;
   h: number;
   hdr: boolean;
@@ -155,13 +159,6 @@ function Editor() {
       targetHRef.current = src.h;
       setTargetW(src.w);
       setTargetH(src.h);
-      // The seam worker still expects 8-bit RGBA for energy compute, so
-      // HDR sources fall back to squish on load. Carve becomes available
-      // again once we add an HDR-aware energy path.
-      if (src.hdr && resizeModeRef.current === 'carve') {
-        resizeModeRef.current = 'squish';
-        setResizeMode('squish');
-      }
       // Carve is the default mode but needs the seam precompute before
       // build_carve_lut works. Show the squish output immediately for a
       // snappy first paint, then swap in the carved result once the
@@ -307,7 +304,7 @@ function Editor() {
     };
 
     worker.postMessage({
-      imageData: src.data,
+      imageData: src.sdrData,
       width: src.w,
       height: src.h,
       direction: dirNum,
@@ -342,15 +339,15 @@ function Editor() {
           // Stash the f16 bytes; the GPU upload effect picks the HDR path
           // when `hdr` is set.
           data: hdr.pixels,
+          sdrData: hdr.sdrPixels,
           w: hdr.width,
           h: hdr.height,
           hdr: true,
         };
         setSource(src);
         sourceRef.current = src;
-        // The histogram path expects 8-bit RGBA; skip it for HDR sources
-        // (clipping readouts will be inert until we add an HDR variant).
-        lcHistRef.current = null;
+        // Histogram + seam worker run on the tonemapped SDR proxy.
+        lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
         return;
       }
     } catch (err) {
@@ -369,9 +366,11 @@ function Editor() {
       const data = ctx.getImageData(0, 0, img.width, img.height, {
         colorSpace: 'display-p3',
       });
+      const sdrData = new Uint8Array(data.data);
       const src: SourceState = {
         url: imageUrl,
-        data: new Uint8Array(data.data),
+        data: sdrData,
+        sdrData,
         w: img.width,
         h: img.height,
         hdr: false,
@@ -380,7 +379,7 @@ function Editor() {
       sourceRef.current = src;
 
       // Compute the L+chroma histogram once so the clipping readouts are live.
-      lcHistRef.current = wasm.compute_lc_histogram(src.data);
+      lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
       URL.revokeObjectURL(img.src);
     };
     img.src = URL.createObjectURL(blob);

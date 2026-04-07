@@ -22,6 +22,10 @@ export interface HdrDecodeResult {
   // Linear extended Display P3, half-float RGBA, tightly packed
   // (8 bytes/pixel). Suitable for gpu_set_source_linear_f16.
   pixels: Uint8Array;
+  // 8-bit Display P3 RGBA proxy for the seam worker + histogram, which
+  // both still want quantized SDR pixels. Highlights are tonemapped via
+  // a simple Reinhard-style rolloff so above-1.0 detail isn't crushed.
+  sdrPixels: Uint8Array;
   width: number;
   height: number;
 }
@@ -87,6 +91,38 @@ function f32ToF16(val: number): number {
     return sign | 0x7c00;
   }
   return sign | (exp << 10) | ((frac + 0x1000) >>> 13);
+}
+
+// Quantize a linear extended Display P3 f32 RGBA buffer down to 8-bit
+// Display P3 RGBA. Highlights >1 are softened with a Reinhard-ish curve
+// so the seam-energy / histogram passes still see meaningful structure
+// in the bright areas instead of a flat clip.
+function quantizeToSdrP3(linF32: Float32Array): Uint8Array {
+  const n = linF32.length / 4;
+  const out = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    let r = Math.max(linF32[i * 4], 0);
+    let g = Math.max(linF32[i * 4 + 1], 0);
+    let b = Math.max(linF32[i * 4 + 2], 0);
+    // Simple per-channel Reinhard tonemap: x / (1 + x).
+    r = r / (1 + r);
+    g = g / (1 + g);
+    b = b / (1 + b);
+    // Compensate for the SDR midtone shift the tonemap introduces by
+    // rescaling so 0.5 (where most SDR content sits) maps back near 0.5.
+    const k = 1 / 0.5; // 0.5 -> 0.333 after Reinhard, ×2 -> 0.666; close enough
+    r = Math.min(r * k, 1);
+    g = Math.min(g * k, 1);
+    b = Math.min(b * k, 1);
+    // sRGB / Display P3 OETF.
+    const enc = (x: number) =>
+      x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
+    out[i * 4] = Math.round(enc(r) * 255);
+    out[i * 4 + 1] = Math.round(enc(g) * 255);
+    out[i * 4 + 2] = Math.round(enc(b) * 255);
+    out[i * 4 + 3] = Math.round(Math.min(Math.max(linF32[i * 4 + 3], 0), 1) * 255);
+  }
+  return out;
 }
 
 // Pack a Float32Array RGBA buffer into the f16 layout the WASM expects.
@@ -216,7 +252,12 @@ async function decodeAvif(buf: Uint8Array): Promise<HdrDecodeResult | null> {
     primaries,
     transfer
   );
-  return { pixels: packF16(f32), width: result.width, height: result.height };
+  return {
+    pixels: packF16(f32),
+    sdrPixels: quantizeToSdrP3(f32),
+    width: result.width,
+    height: result.height,
+  };
 }
 
 // Decode an Ultra HDR JPEG through libultrahdr. Returns null if the JPEG
@@ -228,9 +269,28 @@ async function decodeUhdr(buf: Uint8Array): Promise<HdrDecodeResult | null> {
   const result: any = mod.decode(buf);
   if (!result) return null;
   // libultrahdr returned linear half-float RGBA in P3 already — exactly
-  // what gpu_set_source_linear_f16 wants.
+  // what gpu_set_source_linear_f16 wants. Build a quantized SDR proxy
+  // from the same f16 data for the seam worker / histogram path.
+  const f16 = result.data as Uint8Array;
+  const n = result.width * result.height;
+  const f32 = new Float32Array(n * 4);
+  for (let i = 0; i < n * 4; i++) {
+    const lo = f16[i * 2];
+    const hi = f16[i * 2 + 1];
+    // Inline f16→f32 (mirror frontend-rs/src/gpu.rs::f16_to_f32).
+    const h = lo | (hi << 8);
+    const sign = (h & 0x8000) >>> 15;
+    const exp = (h & 0x7c00) >>> 10;
+    const frac = h & 0x03ff;
+    let v: number;
+    if (exp === 0) v = (frac / 1024) * Math.pow(2, -14);
+    else if (exp === 31) v = frac ? NaN : Infinity;
+    else v = (1 + frac / 1024) * Math.pow(2, exp - 15);
+    f32[i] = sign ? -v : v;
+  }
   return {
-    pixels: result.data as Uint8Array,
+    pixels: f16,
+    sdrPixels: quantizeToSdrP3(f32),
     width: result.width,
     height: result.height,
   };
