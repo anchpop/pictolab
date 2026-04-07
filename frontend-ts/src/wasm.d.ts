@@ -55,6 +55,8 @@ declare module 'frontend-rs' {
     target_h: number
   ): void;
 
+  export function gpu_set_squish_dims(target_w: number, target_h: number): void;
+
   export function gpu_render(
     l_min: number,
     l_max: number,

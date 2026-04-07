@@ -7,8 +7,11 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { DualSlider } from '@/components/ui/dual-slider';
+import { Segmented } from '@/components/ui/segmented';
 
 type Direction = 'width' | 'height';
+type ResizeMode = 'squish' | 'carve';
+type AspectRatio = 'free' | 'lock' | '1:1' | '4:3' | '3:4' | '16:9' | '9:16';
 
 interface SourceState {
   url: string;
@@ -17,10 +20,68 @@ interface SourceState {
   h: number;
 }
 
+const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
+  { value: 'free', label: 'Free' },
+  { value: 'lock', label: 'Lock' },
+  { value: '1:1', label: '1:1' },
+  { value: '4:3', label: '4:3' },
+  { value: '3:4', label: '3:4' },
+  { value: '16:9', label: '16:9' },
+  { value: '9:16', label: '9:16' },
+];
+
+// Numeric ratio (W/H) for a named aspect, or null for "free".
+function aspectRatioValue(ar: AspectRatio, src: SourceState): number | null {
+  switch (ar) {
+    case 'free': return null;
+    case 'lock': return src.w / src.h;
+    case '1:1': return 1;
+    case '4:3': return 4 / 3;
+    case '3:4': return 3 / 4;
+    case '16:9': return 16 / 9;
+    case '9:16': return 9 / 16;
+  }
+}
+
+// Largest (W, H) ≤ (src.w, src.h) that satisfies the ratio. Used for the
+// initial snap when an aspect is selected; subsequent slider drags
+// re-derive the other dim from the dragged one.
+function snapSquish(ratio: number, src: SourceState): [number, number] {
+  const srcRatio = src.w / src.h;
+  if (ratio >= srcRatio) {
+    return [src.w, Math.round(src.w / ratio)];
+  }
+  return [Math.round(src.h * ratio), src.h];
+}
+
+// Carve can only change one dimension, so for a given direction the ratio
+// must satisfy r ≤ srcRatio (direction=width — vertical seams shrink the
+// width) or r ≥ srcRatio (direction=height — horizontal seams shrink the
+// height). Returns null when the ratio isn't directly reachable; the
+// caller should hide the button rather than offer an inverted alias,
+// since the inverted ratio has its own button anyway.
+function snapCarve(
+  ratio: number,
+  src: SourceState,
+  dir: Direction
+): { w: number; h: number } | null {
+  const srcRatio = src.w / src.h;
+  if (dir === 'width' && ratio <= srcRatio) {
+    return { w: Math.max(1, Math.round(src.h * ratio)), h: src.h };
+  }
+  if (dir === 'height' && ratio >= srcRatio) {
+    return { w: src.w, h: Math.max(1, Math.round(src.w / ratio)) };
+  }
+  return null;
+}
+
 function Editor() {
   const [source, setSource] = useState<SourceState | null>(null);
   const [direction, setDirection] = useState<Direction>('width');
-  const [targetSize, setTargetSize] = useState(0);
+  const [resizeMode, setResizeMode] = useState<ResizeMode>('squish');
+  const [aspect, setAspect] = useState<AspectRatio>('free');
+  const [targetW, setTargetW] = useState(0);
+  const [targetH, setTargetH] = useState(0);
   const [isPrecomputing, setIsPrecomputing] = useState(false);
   const [ready, setReady] = useState(false);
   const [lRange, setLRange] = useState<[number, number]>([0, 100]);
@@ -40,13 +101,19 @@ function Editor() {
   // Cached pieces of the pipeline.
   const wasmRef = useRef<typeof import('frontend-rs') | null>(null);
   const orderRef = useRef<Uint32Array | null>(null);
+  // Direction the cached `orderRef` was computed for. Used to skip the
+  // worker re-run when toggling resize mode without changing direction.
+  const orderDirectionRef = useRef<Direction | null>(null);
+  const resizeModeRef = useRef<ResizeMode>('squish');
+  const aspectRef = useRef<AspectRatio>('free');
   const sourceRef = useRef<SourceState | null>(null);
   // Combined L (101 bins) + chroma (161 bins) histogram for the current
   // source. Used to display how many pixels would clip under the current
   // L/C remap settings.
   const lcHistRef = useRef<Uint32Array | null>(null);
   const directionRef = useRef<Direction>('width');
-  const targetSizeRef = useRef(0);
+  const targetWRef = useRef(0);
+  const targetHRef = useRef(0);
   const lRangeRef = useRef<[number, number]>([0, 100]);
   const cRangeRef = useRef<[number, number]>([0, 100]);
   const hueRef = useRef(0);
@@ -75,7 +142,15 @@ function Editor() {
         console.error('GPU init/upload failed:', err);
         return;
       }
-      runPrecompute(src, directionRef.current);
+      // Default to the squish (Lanczos) path so the editor is interactive
+      // immediately — no need to wait on the seam precompute.
+      targetWRef.current = src.w;
+      targetHRef.current = src.h;
+      setTargetW(src.w);
+      setTargetH(src.h);
+      applyResize();
+      setReady(true);
+      requestAnimationFrame(render);
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -117,20 +192,28 @@ function Editor() {
     return workerRef.current;
   };
 
-  // Push the current LUT (carve mapping) into the GPU context based on the
-  // active seam order, source dims, target size, and direction.
-  const refreshLut = () => {
+  // Push the current resize state into the GPU context. Branches on the
+  // active resize mode: squish writes a Lanczos dims uniform; carve
+  // requires a precomputed seam order and rebuilds + uploads the LUT.
+  const applyResize = () => {
     const wasm = wasmRef.current;
     const src = sourceRef.current;
-    const order = orderRef.current;
-    if (!wasm || !src || !order) return;
-    const dir = directionRef.current;
-    const dirNum = dir === 'width' ? 0 : 1;
-    const target = targetSizeRef.current;
-    const targetW = dir === 'width' ? target : src.w;
-    const targetH = dir === 'height' ? target : src.h;
-    const lut = wasm.build_carve_lut(order, src.w, src.h, target, dirNum);
-    wasm.gpu_set_carve_lut(lut, targetW, targetH);
+    if (!wasm || !src) return;
+    const tw = targetWRef.current;
+    const th = targetHRef.current;
+    if (resizeModeRef.current === 'carve') {
+      const order = orderRef.current;
+      if (!order) return;
+      // Carve only resizes along the active direction; the inactive
+      // dimension stays at the source size.
+      const dir = directionRef.current;
+      const dirNum = dir === 'width' ? 0 : 1;
+      const target = dir === 'width' ? tw : th;
+      const lut = wasm.build_carve_lut(order, src.w, src.h, target, dirNum);
+      wasm.gpu_set_carve_lut(lut, tw, th);
+    } else {
+      wasm.gpu_set_squish_dims(tw, th);
+    }
   };
 
   // Issue a render with the current L/C/hue params. Cheap; safe to call
@@ -176,10 +259,10 @@ function Editor() {
     }
   };
 
-  // Run seam-order precompute via worker.
-  const runPrecompute = (src: SourceState, dir: Direction) => {
+  // Run seam-order precompute via worker. Used by the carve path; the
+  // squish path doesn't need this.
+  const runPrecompute = (src: SourceState, dir: Direction, onDone?: () => void) => {
     setIsPrecomputing(true);
-    setReady(false);
 
     const id = ++requestIdRef.current;
     const dirNum = dir === 'width' ? 0 : 1;
@@ -190,14 +273,9 @@ function Editor() {
       if (requestId !== requestIdRef.current) return;
 
       orderRef.current = order;
-      const max = dir === 'width' ? src.w : src.h;
-      // Default target = original size (no carving applied yet).
-      targetSizeRef.current = max;
-      setTargetSize(max);
+      orderDirectionRef.current = dir;
       setIsPrecomputing(false);
-      setReady(true);
-      refreshLut();
-      requestAnimationFrame(render);
+      onDone?.();
     };
 
     worker.postMessage({
@@ -250,19 +328,168 @@ function Editor() {
   const handleDirectionChange = (dir: Direction) => {
     setDirection(dir);
     directionRef.current = dir;
-    if (sourceRef.current) {
-      runPrecompute(sourceRef.current, dir);
+    const src = sourceRef.current;
+    if (!src) return;
+    // Carve constrains the *other* dimension to the source size — snap
+    // it back when switching axes.
+    if (dir === 'width') {
+      targetHRef.current = src.h;
+      setTargetH(src.h);
+    } else {
+      targetWRef.current = src.w;
+      setTargetW(src.w);
+    }
+    // Re-apply any active aspect ratio against the new direction. If it
+    // becomes infeasible in this direction (carve only), drop back to free.
+    if (aspectRef.current !== 'free') {
+      const snapped = snapToAspect(src, aspectRef.current, resizeModeRef.current, dir);
+      if (snapped) {
+        setDims(snapped.w, snapped.h);
+      } else {
+        aspectRef.current = 'free';
+        setAspect('free');
+      }
+    }
+    if (resizeModeRef.current === 'carve' && orderDirectionRef.current !== dir) {
+      runPrecompute(src, dir, () => {
+        applyResize();
+        render();
+      });
+    } else {
+      applyResize();
+      render();
     }
   };
 
-  const handleTargetChange = (size: number) => {
-    if (!sourceRef.current) return;
-    const max = directionRef.current === 'width' ? sourceRef.current.w : sourceRef.current.h;
-    const clamped = Math.max(1, Math.min(max, Math.round(size)));
-    setTargetSize(clamped);
-    targetSizeRef.current = clamped;
-    refreshLut();
+  // Push (w, h) into state + refs together. Used by all the dim-changing
+  // helpers so the squish/carve aspect-locked paths can update both at once.
+  const setDims = (w: number, h: number) => {
+    targetWRef.current = w;
+    targetHRef.current = h;
+    setTargetW(w);
+    setTargetH(h);
+  };
+
+  // In carve mode an active aspect ratio fully determines (W, H), so a
+  // direct slider/input edit means the user wants out of that constraint.
+  // Drop the aspect lock back to "free" so the dim they're dragging is
+  // actually editable.
+  const breakAspectIfCarve = () => {
+    if (resizeModeRef.current === 'carve' && aspectRef.current !== 'free') {
+      aspectRef.current = 'free';
+      setAspect('free');
+    }
+  };
+
+  const handleTargetWChange = (size: number) => {
+    const src = sourceRef.current;
+    if (!src) return;
+    breakAspectIfCarve();
+    let w = Math.max(1, Math.min(src.w, Math.round(size)));
+    let h = targetHRef.current;
+    const ratio = aspectRatioValue(aspectRef.current, src);
+    if (ratio !== null && resizeModeRef.current === 'squish') {
+      h = Math.max(1, Math.min(src.h, Math.round(w / ratio)));
+      // If the derived H clipped against source, back-solve W to keep ratio.
+      if (h === src.h) w = Math.max(1, Math.min(src.w, Math.round(h * ratio)));
+    }
+    setDims(w, h);
+    applyResize();
     render();
+  };
+
+  const handleTargetHChange = (size: number) => {
+    const src = sourceRef.current;
+    if (!src) return;
+    breakAspectIfCarve();
+    let h = Math.max(1, Math.min(src.h, Math.round(size)));
+    let w = targetWRef.current;
+    const ratio = aspectRatioValue(aspectRef.current, src);
+    if (ratio !== null && resizeModeRef.current === 'squish') {
+      w = Math.max(1, Math.min(src.w, Math.round(h * ratio)));
+      if (w === src.w) h = Math.max(1, Math.min(src.h, Math.round(w / ratio)));
+    }
+    setDims(w, h);
+    applyResize();
+    render();
+  };
+
+  // Apply the current aspect ratio constraint to the dims given the current
+  // mode + direction. In carve mode this may flip the direction.
+  // Returns null when the requested aspect can't be reached in carve mode
+  // for the current direction (even after inverting). The caller falls
+  // back to leaving the dims unchanged in that case.
+  const snapToAspect = (
+    src: SourceState,
+    ar: AspectRatio,
+    mode: ResizeMode,
+    dir: Direction
+  ): { w: number; h: number } | null => {
+    const ratio = aspectRatioValue(ar, src);
+    if (ratio === null) {
+      return { w: targetWRef.current || src.w, h: targetHRef.current || src.h };
+    }
+    if (mode === 'squish') {
+      const [w, h] = snapSquish(ratio, src);
+      return { w, h };
+    }
+    return snapCarve(ratio, src, dir);
+  };
+
+  const handleAspectChange = (next: AspectRatio) => {
+    const src = sourceRef.current;
+    if (!src) return;
+    const snapped = snapToAspect(src, next, resizeModeRef.current, directionRef.current);
+    if (!snapped) return; // infeasible — leave the prior aspect selected
+    setAspect(next);
+    aspectRef.current = next;
+    setDims(snapped.w, snapped.h);
+    applyResize();
+    render();
+  };
+
+  const handleResizeModeChange = (mode: ResizeMode) => {
+    if (mode === resizeModeRef.current) return;
+    setResizeMode(mode);
+    resizeModeRef.current = mode;
+    const src = sourceRef.current;
+    if (!src) return;
+    // Switching to carve constrains the inactive dimension to source.
+    if (mode === 'carve') {
+      if (directionRef.current === 'width') {
+        targetHRef.current = src.h;
+        setTargetH(src.h);
+      } else {
+        targetWRef.current = src.w;
+        setTargetW(src.w);
+      }
+    }
+    // Lock collapses to "no resize" in carve mode (since carve can only
+    // change one dim, the only solution that preserves source aspect is
+    // the source dims). Drop it.
+    if (mode === 'carve' && aspectRef.current === 'lock') {
+      aspectRef.current = 'free';
+      setAspect('free');
+    }
+    // Re-apply any remaining active aspect against the new mode.
+    if (aspectRef.current !== 'free') {
+      const snapped = snapToAspect(src, aspectRef.current, mode, directionRef.current);
+      if (snapped) {
+        setDims(snapped.w, snapped.h);
+      } else {
+        aspectRef.current = 'free';
+        setAspect('free');
+      }
+    }
+    if (mode === 'carve' && orderDirectionRef.current !== directionRef.current) {
+      runPrecompute(src, directionRef.current, () => {
+        applyResize();
+        render();
+      });
+    } else {
+      applyResize();
+      render();
+    }
   };
 
   const handleLRangeChange = (next: [number, number]) => {
@@ -310,10 +537,8 @@ function Editor() {
       const [cMin, cMax] = cRangeRef.current;
       wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0);
 
-      const dir = directionRef.current;
-      const target = targetSizeRef.current;
-      const outW = dir === 'width' ? target : src.w;
-      const outH = dir === 'height' ? target : src.h;
+      const outW = targetWRef.current;
+      const outH = targetHRef.current;
 
       let blob: Blob;
       let filename: string;
@@ -359,19 +584,23 @@ function Editor() {
     setSource(null);
     sourceRef.current = null;
     orderRef.current = null;
+    orderDirectionRef.current = null;
     lcHistRef.current = null;
     setReady(false);
     setLRange([0, 100]);
     setCRange([0, 100]);
     setHue(0);
+    setResizeMode('squish');
+    resizeModeRef.current = 'squish';
+    setAspect('free');
+    aspectRef.current = 'free';
     lRangeRef.current = [0, 100];
     cRangeRef.current = [0, 100];
     hueRef.current = 0;
   };
 
-  const outW = direction === 'width' ? targetSize : source?.w ?? 0;
-  const outH = direction === 'height' ? targetSize : source?.h ?? 0;
-  const maxSize = direction === 'width' ? source?.w ?? 1 : source?.h ?? 1;
+  const outW = targetW;
+  const outH = targetH;
 
   // Live clipping percentages for the current L remap.
   const lClipping = (() => {
@@ -421,15 +650,7 @@ function Editor() {
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
             <p className="text-xs text-muted-foreground">
-              <a
-                href="https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="underline decoration-dotted hover:text-foreground"
-              >
-                Seam carving with forward energy
-              </a>
-              {' · '}OKLab color remap · WebGPU
+              Lanczos / content-aware resize · OKLab color remap · WebGPU
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -489,8 +710,8 @@ function Editor() {
                   ref={canvasRef}
                   className="absolute top-0 left-0 block"
                   style={{
-                    width: direction === 'width' ? `${(targetSize / source.w) * 100}%` : '100%',
-                    height: direction === 'height' ? `${(targetSize / source.h) * 100}%` : '100%',
+                    width: `${(targetW / source.w) * 100}%`,
+                    height: `${(targetH / source.h) * 100}%`,
                   }}
                 />
               </div>
@@ -528,42 +749,107 @@ function Editor() {
                 <CardTitle>Resize</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="flex gap-2">
-                  <Button
-                    variant={direction === 'width' ? 'default' : 'outline'}
-                    size="sm"
-                    className="flex-1"
-                    onClick={() => handleDirectionChange('width')}
-                    disabled={isPrecomputing}
-                  >
-                    Width
-                  </Button>
-                  <Button
-                    variant={direction === 'height' ? 'default' : 'outline'}
-                    size="sm"
-                    className="flex-1"
-                    onClick={() => handleDirectionChange('height')}
-                    disabled={isPrecomputing}
-                  >
-                    Height
-                  </Button>
+                <Segmented<ResizeMode>
+                  value={resizeMode}
+                  onValueChange={handleResizeModeChange}
+                  options={[
+                    {
+                      value: 'squish',
+                      label: 'Squish',
+                      title: 'Lanczos resampling — fast, classic resize',
+                    },
+                    {
+                      value: 'carve',
+                      label: 'Content aware',
+                      title: 'Content-aware resize via seam carving',
+                      disabled: isPrecomputing,
+                    },
+                  ]}
+                />
+
+                <div>
+                  <Label className="text-xs">Aspect ratio</Label>
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {ASPECT_OPTIONS.filter((opt) => {
+                      // Lock is meaningless in carve mode — the only ratio
+                      // that preserves source aspect is the source itself.
+                      if (resizeMode === 'carve' && opt.value === 'lock') return false;
+                      // Hide any aspect that can't be directly reached in
+                      // the current carve direction. The inverted ratio
+                      // has its own button (e.g. 9:16 vs 16:9), so we'd
+                      // just be duplicating it.
+                      if (
+                        source &&
+                        resizeMode === 'carve' &&
+                        opt.value !== 'free'
+                      ) {
+                        const r = aspectRatioValue(opt.value, source);
+                        if (r === null || snapCarve(r, source, direction) === null) {
+                          return false;
+                        }
+                      }
+                      return true;
+                    }).map((opt) => (
+                      <Button
+                        key={opt.value}
+                        variant={aspect === opt.value ? 'default' : 'outline'}
+                        size="sm"
+                        className="h-7 flex-1 px-2 text-xs"
+                        onClick={() => handleAspectChange(opt.value)}
+                        disabled={isPrecomputing}
+                      >
+                        {opt.label}
+                      </Button>
+                    ))}
+                  </div>
                 </div>
+                {resizeMode === 'carve' && (
+                  <Segmented<Direction>
+                    value={direction}
+                    onValueChange={handleDirectionChange}
+                    options={[
+                      { value: 'width', label: 'Width', disabled: isPrecomputing },
+                      { value: 'height', label: 'Height', disabled: isPrecomputing },
+                    ]}
+                  />
+                )}
 
                 {ready && (
                   <>
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <Label>{direction === 'width' ? 'Width' : 'Height'}</Label>
-                        <span className="text-xs text-muted-foreground">{targetSize}px</span>
+                    {/* Width slider — always present in squish mode; only
+                        when direction=width in carve mode. */}
+                    {(resizeMode === 'squish' || direction === 'width') && (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <Label>Width</Label>
+                          <span className="text-xs text-muted-foreground">{targetW}px</span>
+                        </div>
+                        <Slider
+                          min={1}
+                          max={source.w}
+                          step={1}
+                          value={[targetW]}
+                          onValueChange={(v) => handleTargetWChange(v[0])}
+                        />
                       </div>
-                      <Slider
-                        min={1}
-                        max={maxSize}
-                        step={1}
-                        value={[targetSize]}
-                        onValueChange={(v) => handleTargetChange(v[0])}
-                      />
-                    </div>
+                    )}
+
+                    {/* Height slider — same logic, mirrored. */}
+                    {(resizeMode === 'squish' || direction === 'height') && (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <Label>Height</Label>
+                          <span className="text-xs text-muted-foreground">{targetH}px</span>
+                        </div>
+                        <Slider
+                          min={1}
+                          max={source.h}
+                          step={1}
+                          value={[targetH]}
+                          onValueChange={(v) => handleTargetHChange(v[0])}
+                        />
+                      </div>
+                    )}
 
                     <div className="grid grid-cols-2 gap-2">
                       <div>
@@ -573,10 +859,8 @@ function Editor() {
                           value={outW}
                           min={1}
                           max={source.w}
-                          disabled={direction !== 'width'}
-                          onChange={(e) => {
-                            if (direction === 'width') handleTargetChange(Number(e.target.value));
-                          }}
+                          disabled={resizeMode === 'carve' && direction !== 'width'}
+                          onChange={(e) => handleTargetWChange(Number(e.target.value))}
                         />
                       </div>
                       <div>
@@ -586,14 +870,25 @@ function Editor() {
                           value={outH}
                           min={1}
                           max={source.h}
-                          disabled={direction !== 'height'}
-                          onChange={(e) => {
-                            if (direction === 'height') handleTargetChange(Number(e.target.value));
-                          }}
+                          disabled={resizeMode === 'carve' && direction !== 'height'}
+                          onChange={(e) => handleTargetHChange(Number(e.target.value))}
                         />
                       </div>
                     </div>
                   </>
+                )}
+                {resizeMode === 'carve' && (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    <a
+                      href="https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline decoration-dotted hover:text-foreground"
+                    >
+                      Seam carving with forward energy
+                    </a>
+                    {' '}— removes low-energy seams instead of resampling.
+                  </p>
                 )}
               </CardContent>
             </Card>
@@ -703,24 +998,22 @@ function Editor() {
             </Card>
 
             <div className="space-y-2">
-              <div className="grid grid-cols-2 gap-2">
-                <Button
-                  variant={exportFormat === 'jpeg' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setExportFormat('jpeg')}
-                  title="Ultra HDR JPEG (SDR base + gain map). Widely supported."
-                >
-                  JPEG
-                </Button>
-                <Button
-                  variant={exportFormat === 'avif' ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setExportFormat('avif')}
-                  title="10-bit BT.2020 PQ AVIF. Smaller, real HDR."
-                >
-                  AVIF
-                </Button>
-              </div>
+              <Segmented<ExportFormat>
+                value={exportFormat}
+                onValueChange={setExportFormat}
+                options={[
+                  {
+                    value: 'jpeg',
+                    label: 'JPEG',
+                    title: 'Ultra HDR JPEG (SDR base + gain map). Widely supported.',
+                  },
+                  {
+                    value: 'avif',
+                    label: 'AVIF',
+                    title: '10-bit BT.2020 PQ AVIF. Smaller, real HDR.',
+                  },
+                ]}
+              />
               <Button
                 className="w-full"
                 onClick={handleDownload}

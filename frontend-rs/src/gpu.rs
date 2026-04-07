@@ -572,6 +572,16 @@ struct GpuCtx {
     target_w: u32,
     target_h: u32,
 
+    // Lanczos resample (squish) compute pipeline. Shares the output_tex
+    // and render pipeline with the carve path; only one mode is active
+    // at a time, controlled by `resize_mode`.
+    resample_pipeline: JsValue,
+    resample_bind_group: Option<JsValue>,
+    resample_dims_buf: JsValue, // uniform vec4u: src_w, src_h, target_w, target_h
+    // 0 = squish (lanczos), 1 = carve. Determined by which gpu_set_*
+    // function was called most recently.
+    resize_mode: u32,
+
     // Render pipeline + canvas context.
     render_pipeline: JsValue,
     render_bgl: JsValue,
@@ -737,6 +747,78 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 "#
 }
 
+// Lanczos-3 separable resample done as a single 2D pass. Each output
+// pixel sums an a×a window of source pixels weighted by the product of
+// per-axis Lanczos kernels. For downscale (target < source) the kernel
+// width is scaled up by the inverse zoom factor so each output sample
+// integrates over the corresponding source neighborhood — that's the
+// anti-aliasing the LUT-based carve path doesn't need to think about.
+fn resample_shader() -> &'static str {
+    r#"
+@group(0) @binding(0) var<storage, read> linp3_in: array<vec4f>;
+@group(0) @binding(1) var output_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> dims: vec4u; // src_w, src_h, target_w, target_h
+
+const PI: f32 = 3.14159265358979323846;
+const A: f32 = 3.0;
+
+fn sinc(x: f32) -> f32 {
+  let ax = abs(x);
+  if (ax < 1e-6) { return 1.0; }
+  let px = PI * x;
+  return sin(px) / px;
+}
+
+fn lanczos(x: f32) -> f32 {
+  if (abs(x) >= A) { return 0.0; }
+  return sinc(x) * sinc(x / A);
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let sw = dims.x;
+  let sh = dims.y;
+  let tw = dims.z;
+  let th = dims.w;
+  if (gid.x >= tw || gid.y >= th) { return; }
+
+  let scale_x = f32(sw) / f32(tw);
+  let scale_y = f32(sh) / f32(th);
+  // Sample at output pixel center, mapped back to source coordinates.
+  let cx = (f32(gid.x) + 0.5) * scale_x - 0.5;
+  let cy = (f32(gid.y) + 0.5) * scale_y - 0.5;
+
+  // Widen the kernel for downscale so we average over a full source
+  // neighborhood; for upscale (scale < 1) the kernel stays at radius A.
+  let kx = max(scale_x, 1.0);
+  let ky = max(scale_y, 1.0);
+  let radius_x = A * kx;
+  let radius_y = A * ky;
+
+  let x0 = max(i32(floor(cx - radius_x)), 0);
+  let x1 = min(i32(ceil(cx + radius_x)), i32(sw) - 1);
+  let y0 = max(i32(floor(cy - radius_y)), 0);
+  let y1 = min(i32(ceil(cy + radius_y)), i32(sh) - 1);
+
+  var sum = vec4f(0.0);
+  var w_total = 0.0;
+  for (var y = y0; y <= y1; y = y + 1) {
+    let wy = lanczos((f32(y) - cy) / ky);
+    for (var x = x0; x <= x1; x = x + 1) {
+      let wx = lanczos((f32(x) - cx) / kx);
+      let w = wx * wy;
+      let src = linp3_in[u32(y) * sw + u32(x)];
+      sum = sum + src * w;
+      w_total = w_total + w;
+    }
+  }
+
+  let out = sum / max(w_total, 1e-6);
+  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), out);
+}
+"#
+}
+
 fn render_shader() -> &'static str {
     r#"
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -846,6 +928,44 @@ fn make_carve_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     )
 }
 
+fn make_resample_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    // 0: linp3_in
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "buffer",
+            js_obj(&[("type", "read-only-storage".into())]).into(),
+        ),
+    ]));
+    // 1: output_tex
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "storageTexture",
+            js_obj(&[
+                ("access", "write-only".into()),
+                ("format", "rgba16float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 2: dims uniform
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
 const SHADER_VERTEX: u32 = 1;
 const SHADER_FRAGMENT: u32 = 2;
 
@@ -945,6 +1065,19 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     };
     let carve_pipeline = create_pipeline(&device, &carve_pl_layout, &carve_module, "main")?;
 
+    // ── Resample (Lanczos) pipeline ─────────────────────────────────────
+    let resample_module = create_shader(&device, resample_shader())?;
+    let resample_bgl = make_resample_bgl(&device)?;
+    let resample_pl_layout = {
+        let layouts = Array::of1(&resample_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let resample_pipeline = create_pipeline(&device, &resample_pl_layout, &resample_module, "main")?;
+
     // ── Render pipeline ─────────────────────────────────────────────────
     let render_module = create_shader(&device, render_shader())?;
     let render_bgl = make_render_bgl(&device)?;
@@ -992,6 +1125,8 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     let params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the carve shader
     let carve_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
+    // 4 u32 dims (16 bytes) for the resample shader
+    let resample_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
 
     // Source/remap buffers and textures are created lazily by gpu_set_source
     // and gpu_set_carve_lut once the dimensions are known.
@@ -1013,6 +1148,10 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         output_tex_view: None,
         target_w: 0,
         target_h: 0,
+        resample_pipeline,
+        resample_bind_group: None,
+        resample_dims_buf,
+        resize_mode: 0,
         render_pipeline,
         render_bgl,
         render_bind_group: None,
@@ -1070,6 +1209,47 @@ pub fn gpu_set_source(image_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> 
     })
 }
 
+// (Re)create the output_tex + render bind group if target dims changed.
+// Both the carve and squish paths share the same destination texture and
+// the render pipeline that samples it.
+fn ensure_output_tex(ctx: &mut GpuCtx, target_w: u32, target_h: u32) -> Result<(), JsValue> {
+    if ctx.target_w == target_w && ctx.target_h == target_h && ctx.output_tex.is_some() {
+        return Ok(());
+    }
+    if let Some(old) = ctx.output_tex.take() {
+        let _ = js_call0(&old, "destroy");
+    }
+    ctx.output_tex_view = None;
+
+    let size = js_obj(&[
+        ("width", target_w.into()),
+        ("height", target_h.into()),
+        ("depthOrArrayLayers", 1u32.into()),
+    ]);
+    let tex_desc = js_obj(&[
+        ("size", size.into()),
+        ("format", "rgba16float".into()),
+        ("usage", (TEX_BINDING | TEX_STORAGE | 1 /* COPY_SRC */).into()),
+    ]);
+    let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
+    let view = js_call1(&tex, "createView", &Object::new())?;
+    ctx.output_tex = Some(tex);
+    ctx.output_tex_view = Some(view);
+    ctx.target_w = target_w;
+    ctx.target_h = target_h;
+
+    ctx.render_bind_group = Some(make_render_bind_group(
+        &ctx.device,
+        &ctx.render_bgl,
+        ctx.output_tex_view.as_ref().unwrap().clone(),
+        ctx.sampler.clone(),
+    )?);
+    // Bind groups that point at the old texture view are now invalid.
+    ctx.carve_bind_group = None;
+    ctx.resample_bind_group = None;
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<(), JsValue> {
     GPU_CTX.with(|c| -> Result<(), JsValue> {
@@ -1080,41 +1260,23 @@ pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<()
             return Err(format!("lut len {} != target_w*target_h {count}", lut.len()).into());
         }
 
-        // (Re)allocate the LUT buffer + output texture if dimensions changed.
-        let dims_changed = ctx.target_w != target_w || ctx.target_h != target_h;
-        if dims_changed {
+        ensure_output_tex(ctx, target_w, target_h)?;
+
+        // (Re)allocate the LUT buffer if it doesn't fit the new target.
+        let need_new_lut = ctx
+            .lut_buf
+            .as_ref()
+            .map(|_| false)
+            .unwrap_or(true)
+            || ctx.carve_bind_group.is_none();
+        if need_new_lut {
             if let Some(old) = ctx.lut_buf.take() {
                 let _ = js_call0(&old, "destroy");
             }
-            if let Some(old) = ctx.output_tex.take() {
-                let _ = js_call0(&old, "destroy");
-            }
-            ctx.output_tex_view = None;
-
             let lut_buf =
                 create_buffer(&ctx.device, (count * 4) as u32, BUF_STORAGE | BUF_COPY_DST)?;
             ctx.lut_buf = Some(lut_buf);
 
-            // Storage texture for the carved+remapped result.
-            let size = js_obj(&[
-                ("width", target_w.into()),
-                ("height", target_h.into()),
-                ("depthOrArrayLayers", 1u32.into()),
-            ]);
-            let tex_desc = js_obj(&[
-                ("size", size.into()),
-                ("format", "rgba16float".into()),
-                ("usage", (TEX_BINDING | TEX_STORAGE | 1 /* COPY_SRC */).into()),
-            ]);
-            let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
-            let view = js_call1(&tex, "createView", &Object::new())?;
-            ctx.output_tex = Some(tex);
-            ctx.output_tex_view = Some(view);
-
-            ctx.target_w = target_w;
-            ctx.target_h = target_h;
-
-            // Recreate carve + render bind groups against the new resources.
             let carve_bgl = make_carve_bgl(&ctx.device)?;
             ctx.carve_bind_group = Some(make_carve_bind_group(
                 &ctx.device,
@@ -1124,22 +1286,60 @@ pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<()
                 ctx.output_tex_view.as_ref().unwrap().clone(),
                 ctx.carve_dims_buf.clone(),
             )?);
-
-            ctx.render_bind_group = Some(make_render_bind_group(
-                &ctx.device,
-                &ctx.render_bgl,
-                ctx.output_tex_view.as_ref().unwrap().clone(),
-                ctx.sampler.clone(),
-            )?);
-
-            // Update the carve dims uniform.
-            let dims = [target_w, target_h, 0u32, 0u32];
-            let dims_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
-            write_buffer_u8(&ctx.queue, &ctx.carve_dims_buf, dims_bytes)?;
         }
 
+        // Update the carve dims uniform every call — cheap.
+        let dims = [target_w, target_h, 0u32, 0u32];
+        let dims_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
+        write_buffer_u8(&ctx.queue, &ctx.carve_dims_buf, dims_bytes)?;
+
         write_buffer_u32(&ctx.queue, ctx.lut_buf.as_ref().unwrap(), lut)?;
+        ctx.resize_mode = 1;
+        Ok(())
+    })
+}
+
+// Configure the squish (Lanczos) path. No LUT — just target dims plus
+// the dims uniform that tells the resample shader the source size.
+#[wasm_bindgen]
+pub fn gpu_set_squish_dims(target_w: u32, target_h: u32) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+
+        ensure_output_tex(ctx, target_w, target_h)?;
+
+        if ctx.resample_bind_group.is_none() {
+            let bgl = make_resample_bgl(&ctx.device)?;
+            let entries = Array::new();
+            entries.push(&js_obj(&[
+                ("binding", 0u32.into()),
+                ("resource", js_obj(&[("buffer", ctx.remap_buf.clone())]).into()),
+            ]));
+            entries.push(&js_obj(&[
+                ("binding", 1u32.into()),
+                ("resource", ctx.output_tex_view.as_ref().unwrap().clone()),
+            ]));
+            entries.push(&js_obj(&[
+                ("binding", 2u32.into()),
+                (
+                    "resource",
+                    js_obj(&[("buffer", ctx.resample_dims_buf.clone())]).into(),
+                ),
+            ]));
+            ctx.resample_bind_group = Some(js_call1(
+                &ctx.device,
+                "createBindGroup",
+                &js_obj(&[("layout", bgl), ("entries", entries.into())]),
+            )?);
+        }
+
+        let dims = [ctx.src_w, ctx.src_h, target_w, target_h];
+        let dims_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
+        write_buffer_u8(&ctx.queue, &ctx.resample_dims_buf, dims_bytes)?;
+        ctx.resize_mode = 0;
         Ok(())
     })
 }
@@ -1202,8 +1402,14 @@ pub fn gpu_render(
     GPU_CTX.with(|c| -> Result<(), JsValue> {
         let c = c.borrow();
         let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-        if ctx.lut_buf.is_none() || ctx.output_tex_view.is_none() {
-            return Err("gpu_render called before gpu_set_carve_lut".into());
+        if ctx.output_tex_view.is_none() {
+            return Err("gpu_render called before gpu_set_carve_lut/gpu_set_squish_dims".into());
+        }
+        if ctx.resize_mode == 1 && ctx.carve_bind_group.is_none() {
+            return Err("carve mode active but no carve bind group".into());
+        }
+        if ctx.resize_mode == 0 && ctx.resample_bind_group.is_none() {
+            return Err("squish mode active but no resample bind group".into());
         }
 
         // Upload params.
@@ -1237,18 +1443,25 @@ pub fn gpu_render(
             ctx.src_n.div_ceil(256),
         )?;
 
-        // Pass 2: carve compute → output_tex
-        let carve_x = ctx.target_w.div_ceil(8);
-        let carve_y = ctx.target_h.div_ceil(8);
-        let carve_bg = ctx.carve_bind_group.as_ref().unwrap();
+        // Pass 2: carve compute or Lanczos resample → output_tex
+        let resize_x = ctx.target_w.div_ceil(8);
+        let resize_y = ctx.target_h.div_ceil(8);
+        let (resize_pipeline, resize_bg) = if ctx.resize_mode == 1 {
+            (&ctx.carve_pipeline, ctx.carve_bind_group.as_ref().unwrap())
+        } else {
+            (
+                &ctx.resample_pipeline,
+                ctx.resample_bind_group.as_ref().unwrap(),
+            )
+        };
         let pass = js_call1(&enc, "beginComputePass", &Object::new())?;
-        js_call1(&pass, "setPipeline", &ctx.carve_pipeline)?;
-        js_call2(&pass, "setBindGroup", &0.into(), carve_bg)?;
+        js_call1(&pass, "setPipeline", resize_pipeline)?;
+        js_call2(&pass, "setBindGroup", &0.into(), resize_bg)?;
         let dispatch_fn: Function = js_get(&pass, "dispatchWorkgroups")?.dyn_into()?;
         Reflect::apply(
             &dispatch_fn,
             &pass,
-            &Array::of2(&carve_x.into(), &carve_y.into()),
+            &Array::of2(&resize_x.into(), &resize_y.into()),
         )?;
         js_call0(&pass, "end")?;
 
