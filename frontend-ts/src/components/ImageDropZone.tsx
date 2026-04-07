@@ -64,8 +64,11 @@ async function removeSavedImage(id: number) {
   tx.objectStore(STORE_NAME).delete(id);
 }
 
-function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
-  return new Promise((resolve) => {
+// Decode-via-canvas thumbnail. Works for any format the browser can
+// natively decode (PNG/JPEG/WebP/AVIF). Rejects on error so the caller
+// can fall through to the wasm-decode path for HEIC etc.
+function makeThumbnailViaImage(dataUrl: string, maxSize: number): Promise<string> {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
@@ -76,8 +79,44 @@ function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       resolve(canvas.toDataURL('image/jpeg', 0.7));
     };
+    img.onerror = () => reject(new Error('image decode failed'));
     img.src = dataUrl;
   });
+}
+
+// Fallback that decodes through our HDR dispatcher (handles HEIC and
+// any other format the browser can't natively render). Operates on the
+// 8-bit Display P3 sdrPixels the dispatcher already produces.
+async function makeThumbnailViaWasm(dataUrl: string, maxSize: number): Promise<string> {
+  const buf = new Uint8Array(await (await fetch(dataUrl)).arrayBuffer());
+  const { decodeHdr } = await import('@/lib/hdr-decode');
+  const decoded = await decodeHdr(buf);
+  if (!decoded) throw new Error('wasm decode failed');
+  const scale = Math.min(maxSize / decoded.width, maxSize / decoded.height, 1);
+  const w = Math.max(1, Math.round(decoded.width * scale));
+  const h = Math.max(1, Math.round(decoded.height * scale));
+  // Drop the source pixels into a full-size canvas first, then scale.
+  const src = document.createElement('canvas');
+  src.width = decoded.width;
+  src.height = decoded.height;
+  const sctx = src.getContext('2d')!;
+  const id = sctx.createImageData(decoded.width, decoded.height);
+  id.data.set(decoded.sdrPixels);
+  sctx.putImageData(id, 0, 0);
+  const dst = document.createElement('canvas');
+  dst.width = w;
+  dst.height = h;
+  const dctx = dst.getContext('2d')!;
+  dctx.drawImage(src, 0, 0, w, h);
+  return dst.toDataURL('image/jpeg', 0.7);
+}
+
+async function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
+  try {
+    return await makeThumbnailViaImage(dataUrl, maxSize);
+  } catch {
+    return await makeThumbnailViaWasm(dataUrl, maxSize);
+  }
 }
 
 interface ImageDropZoneProps {
