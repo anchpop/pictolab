@@ -1,4 +1,4 @@
-use js_sys::{Array, Function, Object, Promise, Reflect, Uint32Array, Uint8Array};
+use js_sys::{Array, Function, Object, Promise, Reflect, Uint16Array, Uint32Array, Uint8Array};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -1380,6 +1380,143 @@ pub async fn gpu_readback_rgba8() -> Result<Uint8Array, JsValue> {
     let _ = js_call0(&staging, "destroy");
 
     Ok(Uint8Array::from(&out[..]))
+}
+
+// Inverse sRGB / Display P3 transfer (decode encoded → linear).
+// Sign-preserving so extended-range HDR values keep their sign.
+fn srgb_decode(v: f32) -> f32 {
+    let a = v.abs();
+    let lin = if a <= 0.04045 {
+        a / 12.92
+    } else {
+        ((a + 0.055) / 1.055).powf(2.4)
+    };
+    lin.copysign(v)
+}
+
+// SMPTE ST 2084 (PQ) inverse EOTF: linear normalized luminance [0,1]
+// (where 1.0 = 10000 nits) → encoded signal [0,1].
+fn pq_encode(y: f32) -> f32 {
+    const M1: f32 = 0.1593017578125;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+    let y = y.max(0.0);
+    let yp = y.powf(M1);
+    ((C1 + C2 * yp) / (1.0 + C3 * yp)).powf(M2)
+}
+
+// Read back the output texture as PQ-encoded BT.2020 16-bit RGB. Used for
+// the HDR AVIF export path. The texture currently stores sRGB-encoded
+// extended-range Display P3 values; we undo the sRGB transfer, convert
+// linear D65 P3 → linear D65 BT.2020 (matrix from BT.2407), apply the
+// PQ EOTF inverse using a 203-nit HDR/SDR reference white per ITU BT.2408,
+// and quantize into the bottom `depth` bits of a u16 (libavif convention).
+#[wasm_bindgen]
+pub async fn gpu_readback_hdr_pq_u16(depth: u32) -> Result<Uint16Array, JsValue> {
+    let (device, queue, output_tex, target_w, target_h) =
+        GPU_CTX.with(|c| -> Result<_, JsValue> {
+            let c = c.borrow();
+            let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+            let tex = ctx
+                .output_tex
+                .as_ref()
+                .ok_or_else(|| JsValue::from("no output texture"))?;
+            Ok((
+                ctx.device.clone(),
+                ctx.queue.clone(),
+                tex.clone(),
+                ctx.target_w,
+                ctx.target_h,
+            ))
+        })?;
+
+    let bpp = 8u32; // rgba16float source
+    let bytes_per_row_unpadded = target_w * bpp;
+    let bytes_per_row = bytes_per_row_unpadded.div_ceil(256) * 256;
+    let buf_size = bytes_per_row * target_h;
+
+    let staging = create_buffer(&device, buf_size, BUF_MAP_READ | BUF_COPY_DST)?;
+
+    let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
+    let src = js_obj(&[("texture", output_tex)]);
+    let dst = js_obj(&[
+        ("buffer", staging.clone()),
+        ("bytesPerRow", bytes_per_row.into()),
+        ("rowsPerImage", target_h.into()),
+    ]);
+    let extent = js_obj(&[
+        ("width", target_w.into()),
+        ("height", target_h.into()),
+        ("depthOrArrayLayers", 1u32.into()),
+    ]);
+    let copy_fn: Function = js_get(&enc, "copyTextureToBuffer")?.dyn_into()?;
+    Reflect::apply(
+        &copy_fn,
+        &enc,
+        &Array::of3(&src.into(), &dst.into(), &extent.into()),
+    )?;
+    let cmd = js_call0(&enc, "finish")?;
+    js_call1(&queue, "submit", &Array::of1(&cmd))?;
+
+    let map_promise = js_call1(&staging, "mapAsync", &1u32.into())?;
+    js_await(map_promise).await?;
+
+    let mapped = js_call0(&staging, "getMappedRange")?;
+    let raw_view = Uint8Array::new(&mapped);
+    let mut raw = vec![0u8; buf_size as usize];
+    raw_view.copy_to(&mut raw[..]);
+
+    let max_val: f32 = ((1u32 << depth) - 1) as f32;
+    // 1.0 in linear extended P3 = SDR diffuse white. ITU BT.2408 maps SDR
+    // diffuse white to 203 nits in HDR signals; PQ normalizes 10000 nits
+    // to 1.0, so the scale is 203/10000.
+    const SDR_WHITE_TO_PQ: f32 = 203.0 / 10000.0;
+
+    let n = (target_w * target_h) as usize;
+    let mut out = vec![0u16; n * 4];
+    for y in 0..target_h {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..target_w {
+            let pix_off = row_start + (x * bpp) as usize;
+            let mut ch = [0f32; 4];
+            for i in 0..4 {
+                let off = pix_off + i * 2;
+                let h = (raw[off] as u16) | ((raw[off + 1] as u16) << 8);
+                ch[i] = f16_to_f32(h);
+            }
+            // Undo sRGB encoding → linear extended-range P3.
+            let lr = srgb_decode(ch[0]);
+            let lg = srgb_decode(ch[1]);
+            let lb = srgb_decode(ch[2]);
+
+            // Linear D65 P3 → linear D65 BT.2020 (matrix derived from
+            // M_p3_to_xyz · M_xyz_to_2020 with a Bradford D65↔D65 noop).
+            let r2020 = 0.7538330 * lr + 0.1985801 * lg + 0.0475869 * lb;
+            let g2020 = 0.0457345 * lr + 0.9417696 * lg + 0.0124960 * lb;
+            let b2020 = -0.0011422 * lr + 0.0176061 * lg + 0.9835361 * lb;
+
+            // Scale into PQ-normalized luminance, encode with PQ inverse EOTF.
+            let pr = pq_encode(r2020 * SDR_WHITE_TO_PQ).clamp(0.0, 1.0);
+            let pg = pq_encode(g2020 * SDR_WHITE_TO_PQ).clamp(0.0, 1.0);
+            let pb = pq_encode(b2020 * SDR_WHITE_TO_PQ).clamp(0.0, 1.0);
+
+            let idx = ((y * target_w + x) as usize) * 4;
+            out[idx] = (pr * max_val + 0.5) as u16;
+            out[idx + 1] = (pg * max_val + 0.5) as u16;
+            out[idx + 2] = (pb * max_val + 0.5) as u16;
+            // Alpha pass-through (linear, no PQ) — quantized to the same depth.
+            out[idx + 3] = (ch[3].clamp(0.0, 1.0) * max_val + 0.5) as u16;
+        }
+    }
+
+    let _ = js_call0(&staging, "unmap");
+    let _ = js_call0(&staging, "destroy");
+
+    let arr = Uint16Array::new_with_length(out.len() as u32);
+    arr.copy_from(&out);
+    Ok(arr)
 }
 
 #[wasm_bindgen]

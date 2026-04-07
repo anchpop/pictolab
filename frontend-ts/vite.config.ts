@@ -24,9 +24,9 @@ export default defineConfig({
       wasm(),
     ],
   },
-  optimizeDeps: {
-    exclude: ['@jsquash/avif'],
-  },
+  // Vendored emscripten encoder ships its own .wasm next to the JS glue;
+  // we need to keep it out of Vite's depopt and let it serve the wasm asset.
+  assetsInclude: ['**/avif_enc.wasm'],
   resolve: {
     alias: {
       'frontend-rs': path.resolve(__dirname, '../frontend-rs/pkg'),

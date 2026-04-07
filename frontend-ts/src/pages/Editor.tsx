@@ -308,21 +308,23 @@ function Editor() {
       const [cMin, cMax] = cRangeRef.current;
       wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0);
 
-      const rgba = await wasm.gpu_readback_rgba8();
       const dir = directionRef.current;
       const target = targetSizeRef.current;
       const outW = dir === 'width' ? target : src.w;
       const outH = dir === 'height' ? target : src.h;
 
-      const { default: encode } = await import('@jsquash/avif/encode');
-      const imageData: ImageData = {
-        data: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
-        width: outW,
-        height: outH,
-        colorSpace: 'display-p3',
-      } as ImageData;
-      const avif = await encode(imageData);
-      const blob = new Blob([avif], { type: 'image/avif' });
+      // 10-bit BT.2020 PQ readback for HDR AVIF.
+      const rgba16 = await wasm.gpu_readback_hdr_pq_u16(10);
+      const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL } = await import('@/lib/avif-hdr');
+      const avif = await encodeAvif(rgba16, outW, outH, {
+        bitDepth: 10,
+        quality: 60,
+        cicpColorPrimaries: CP_BT2020,
+        cicpTransferCharacteristics: TC_PQ,
+        cicpMatrixCoefficients: MC_BT2020_NCL,
+        fullRange: false,
+      });
+      const blob = new Blob([new Uint8Array(avif)], { type: 'image/avif' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
