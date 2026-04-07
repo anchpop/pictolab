@@ -27,6 +27,17 @@ interface SourceState {
   w: number;
   h: number;
   hdr: boolean;
+  // True if any pixel has alpha < 255. Used to warn the user that JPEG
+  // export silently drops the alpha channel.
+  hasAlpha: boolean;
+}
+
+// Scan an 8-bit RGBA buffer for any non-opaque pixel. Cheap O(n) walk.
+function bufferHasAlpha(rgba: Uint8Array): boolean {
+  for (let i = 3; i < rgba.length; i += 4) {
+    if (rgba[i] !== 255) return true;
+  }
+  return false;
 }
 
 const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
@@ -345,6 +356,7 @@ function Editor() {
           w: decoded.width,
           h: decoded.height,
           hdr: decoded.hdr,
+          hasAlpha: bufferHasAlpha(decoded.sdrPixels),
         };
         setSource(src);
         sourceRef.current = src;
@@ -376,6 +388,7 @@ function Editor() {
         w: img.width,
         h: img.height,
         hdr: false,
+        hasAlpha: bufferHasAlpha(sdrData),
       };
       setSource(src);
       sourceRef.current = src;
@@ -1122,6 +1135,13 @@ function Editor() {
                   },
                 ]}
               />
+              {exportFormat === 'jpeg' && source.hasAlpha && (
+                <p className="text-[11px] leading-snug text-amber-500">
+                  This image has transparency, which JPEG can't store —
+                  transparent pixels will be flattened to a background
+                  color. Use AVIF to preserve alpha.
+                </p>
+              )}
               <Button
                 className="w-full"
                 onClick={handleDownload}

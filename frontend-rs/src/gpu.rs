@@ -183,6 +183,7 @@ fn convert(@builtin(global_invocation_id) gid: vec3u) {{
   let lr = srgb_to_linear(f32(p & 0xFFu) / 255.0);
   let lg = srgb_to_linear(f32((p >> 8u) & 0xFFu) / 255.0);
   let lb = srgb_to_linear(f32((p >> 16u) & 0xFFu) / 255.0);
+  let a8 = f32((p >> 24u) & 0xFFu) / 255.0;
 
   // Linear Display P3 → LMS (precomputed M_xyz_to_lms · M_p3_to_xyz).
   let lms_l = 0.4813371*lr + 0.4620734*lg + 0.0565038*lb;
@@ -198,7 +199,15 @@ fn convert(@builtin(global_invocation_id) gid: vec3u) {{
   let big_l = (0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_) * 100.0;
   let aa    = (1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_) * 400.0;
   let bb    = (0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_) * 400.0;
-  lab_out[idx] = vec4f(big_l, aa, bb, 0.0);
+  // Scale Lab by alpha so the seam-carve energy treats fully-transparent
+  // pixels as zero (free to remove regardless of whatever stale RGB the
+  // source happened to leave there) and weights translucent pixels in
+  // proportion to how visible they are. Forward energy compares xyz
+  // distances between neighbors, so this also produces a high-energy
+  // ridge along opaque/transparent boundaries — exactly what we want
+  // because seams should path *around* visible content, not cut through
+  // its silhouette.
+  lab_out[idx] = vec4f(big_l * a8, aa * a8, bb * a8, 0.0);
 }}
 "#
     )
@@ -867,7 +876,13 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
-  return textureSample(src_tex, src_smp, in.uv);
+  // The canvas is configured with alphaMode=premultiplied, so we have
+  // to multiply RGB by A here. Our internal pipeline carries straight
+  // alpha all the way through (because OKLab math on premultiplied
+  // colors is meaningless), and we only premultiply at the very last
+  // step before handing pixels to the swap chain.
+  let s = textureSample(src_tex, src_smp, in.uv);
+  return vec4f(s.rgb * s.a, s.a);
 }
 "#
 }
