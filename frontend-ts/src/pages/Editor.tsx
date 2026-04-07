@@ -113,7 +113,7 @@ function Editor() {
   // Direction the cached `orderRef` was computed for. Used to skip the
   // worker re-run when toggling resize mode without changing direction.
   const orderDirectionRef = useRef<Direction | null>(null);
-  const resizeModeRef = useRef<ResizeMode>('squish');
+  const resizeModeRef = useRef<ResizeMode>('carve');
   const aspectRef = useRef<AspectRatio>('free');
   const sourceRef = useRef<SourceState | null>(null);
   // Combined L (101 bins) + chroma (161 bins) histogram for the current
@@ -225,10 +225,11 @@ function Editor() {
     const th = targetHRef.current;
     if (resizeModeRef.current === 'carve') {
       const order = orderRef.current;
-      if (!order) return;
-      // Carve only resizes along the active direction; the inactive
-      // dimension stays at the source size.
       const dir = directionRef.current;
+      // The seam order is direction-specific. If we're mid-direction-
+      // switch and the precompute hasn't landed yet, bail rather than
+      // build a LUT against the wrong axis (which produces garbage).
+      if (!order || orderDirectionRef.current !== dir) return;
       const dirNum = dir === 'width' ? 0 : 1;
       const target = dir === 'width' ? tw : th;
       const lut = wasm.build_carve_lut(order, src.w, src.h, target, dirNum);
@@ -647,8 +648,8 @@ function Editor() {
     setLRange([0, 100]);
     setCRange([0, 100]);
     setHue(0);
-    setResizeMode('squish');
-    resizeModeRef.current = 'squish';
+    setResizeMode('carve');
+    resizeModeRef.current = 'carve';
     setAspect('free');
     aspectRef.current = 'free';
     lRangeRef.current = [0, 100];
