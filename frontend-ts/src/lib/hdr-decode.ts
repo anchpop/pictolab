@@ -445,8 +445,10 @@ async function decodeHeicViaCApi(buf: Uint8Array): Promise<HdrDecodeResult | nul
     const depth = bppRange > 0 ? bppRange : lumaBits;
 
     // Pull the pixels into a contiguous typed array. The source is row-
-    // padded so we copy a row at a time.
-    let f32: Float32Array;
+    // padded so we copy a row at a time. SDR sources skip the linear
+    // roundtrip entirely — re-quantizing through quantizeToSdrP3 would
+    // apply a Reinhard rolloff that's only correct for actual HDR data
+    // and would crush SDR midtones.
     if (depth > 8) {
       const u16Row = width * 4;
       const u16 = new Uint16Array(width * height * 4);
@@ -454,28 +456,28 @@ async function decodeHeicViaCApi(buf: Uint8Array): Promise<HdrDecodeResult | nul
         const srcOff = (planePtr + y * stride) >>> 1;
         u16.set(M.HEAPU16.subarray(srcOff, srcOff + u16Row), y * u16Row);
       }
-      f32 = avifToLinearP3(u16, width, height, depth, primaries, transfer);
+      const f32 = avifToLinearP3(u16, width, height, depth, primaries, transfer);
+      return {
+        hdr: true,
+        pixels: packF16(f32),
+        sdrPixels: quantizeToSdrP3(f32),
+        width,
+        height,
+      };
     } else {
       const u8 = new Uint8Array(width * height * 4);
       for (let y = 0; y < height; y++) {
         const srcOff = planePtr + y * stride;
         u8.set(M.HEAPU8.subarray(srcOff, srcOff + width * 4), y * width * 4);
       }
-      // Reuse the linearizer by widening 8 → 16 with the right shift so
-      // avifToLinearP3's `/max` math holds.
-      const u16 = new Uint16Array(u8.length);
-      for (let i = 0; i < u8.length; i++) u16[i] = u8[i] << 8;
-      // Treat as 16-bit; primaries/transfer still apply.
-      f32 = avifToLinearP3(u16, width, height, 16, primaries, transfer);
+      return {
+        hdr: false,
+        pixels: null,
+        sdrPixels: u8,
+        width,
+        height,
+      };
     }
-
-    return {
-      hdr: depth > 8,
-      pixels: depth > 8 ? packF16(f32) : null,
-      sdrPixels: quantizeToSdrP3(f32),
-      width,
-      height,
-    };
   } catch (err) {
     console.warn('HEIC C-API decode failed:', err);
     return null;
