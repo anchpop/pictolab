@@ -825,11 +825,12 @@ function Editor() {
                 </div>
               )}
               <div
-                className="relative max-h-[75vh] overflow-hidden rounded-lg border border-border shadow-sm"
+                className="relative overflow-hidden rounded-lg border border-border shadow-sm"
                 style={{
                   aspectRatio: `${source.w} / ${source.h}`,
-                  height: 'min(50vh, 90vw)',
-                  maxWidth: '100%',
+                  // Fit inside both 90vw and 50vh (mobile) / 75vh (desktop)
+                  // by computing the largest width that satisfies both.
+                  width: `min(90vw, 60vh * ${source.w / source.h})`,
                   // Checkerboard so transparent pixels are obvious as
                   // such instead of getting blended with the (white)
                   // card background.
