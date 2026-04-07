@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
 import { DualSlider } from '@/components/ui/dual-slider';
 import { Segmented } from '@/components/ui/segmented';
@@ -597,8 +598,9 @@ function Editor() {
   };
 
   type ExportFormat = 'jpeg' | 'avif';
-  const [exportFormat, setExportFormat] = useState<ExportFormat>('jpeg');
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('avif');
   const [downloading, setDownloading] = useState(false);
+  const [smallerFile, setSmallerFile] = useState(false);
 
   const handleDownload = async () => {
     const wasm = wasmRef.current;
@@ -650,6 +652,8 @@ function Editor() {
         const { encodeUhdr } = await import('@/lib/uhdr');
         const jpeg = await encodeUhdr(f16, outW, outH, {
           targetDisplayPeakNits: peakNits,
+          baseQuality: smallerFile ? 70 : 90,
+          gainMapQuality: smallerFile ? 80 : 95,
         });
         blob = new Blob([new Uint8Array(jpeg)], { type: 'image/jpeg' });
         filename = 'pictolab.jpg';
@@ -662,7 +666,7 @@ function Editor() {
           // Higher than the libavif default (~60) — for HDR master output
           // we want chroma transitions in saturated highlights to stay
           // clean, and 60 leaves visible banding/blocking on bright sky.
-          quality: 80,
+          quality: smallerFile ? 55 : 80,
           cicpColorPrimaries: CP_BT2020,
           cicpTransferCharacteristics: TC_PQ,
           cicpMatrixCoefficients: MC_BT2020_NCL,
@@ -753,10 +757,8 @@ function Editor() {
   const gpuMissing = gpuAvailable === false;
 
   return (
-    <div className="flex h-full min-h-screen bg-background text-foreground">
-      {/* ── Main preview area ──────────────────────────────────────── */}
-      <main className="flex flex-1 flex-col">
-        <header className="flex items-center justify-between border-b border-border px-6 py-4">
+    <div className="flex h-full min-h-screen flex-col bg-background text-foreground">
+      <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
             <p className="text-xs text-muted-foreground">
@@ -790,8 +792,11 @@ function Editor() {
           </div>
         </header>
 
+      <div className="flex flex-1 flex-col lg:flex-row">
+        {/* ── Main preview area ──────────────────────────────────────── */}
+        <main className="sticky top-0 z-30 flex max-h-[70vh] flex-1 flex-col bg-background lg:static lg:max-h-none">
         <div
-          className="flex flex-1 items-center justify-center overflow-auto p-8"
+          className="flex flex-1 items-center justify-center overflow-auto p-4 sm:p-8"
           style={{
             // Dark canvas with a faint dot grid so the preview area reads
             // as a workspace, not a flat panel.
@@ -823,7 +828,8 @@ function Editor() {
                 className="relative max-h-[75vh] overflow-hidden rounded-lg border border-border shadow-sm"
                 style={{
                   aspectRatio: `${source.w} / ${source.h}`,
-                  height: 'min(75vh, 80vw)',
+                  height: 'min(50vh, 90vw)',
+                  maxWidth: '100%',
                   // Checkerboard so transparent pixels are obvious as
                   // such instead of getting blended with the (white)
                   // card background.
@@ -852,7 +858,7 @@ function Editor() {
       </main>
 
       {/* ── Right sidebar ──────────────────────────────────────────── */}
-      <aside className="w-80 shrink-0 overflow-y-auto border-l border-border bg-card p-4">
+      <aside className="w-full shrink-0 overflow-y-auto border-t border-border bg-card p-4 lg:w-80 lg:border-t-0 lg:border-l">
         {!source ? (
           <div className="text-sm text-muted-foreground">
             {gpuMissing
@@ -1068,6 +1074,7 @@ function Editor() {
                   value={lRange}
                   onValueChange={handleLRangeChange}
                   safeRange={[0, 100]}
+                  snapPoints={[0, 100]}
                 />
                 {lClipping && (lClipping.dark > 0 || lClipping.light > 0) ? (
                   <p className="text-[11px] leading-snug text-destructive">
@@ -1094,6 +1101,7 @@ function Editor() {
                   value={cRange}
                   onValueChange={handleCRangeChange}
                   safeRange={[0, 100]}
+                  snapPoints={[0, 100]}
                 />
                 {cClipping && (cClipping.boosted > 0 || cClipping.inverted > 0) ? (
                   <p className="text-[11px] leading-snug text-destructive">
@@ -1121,6 +1129,7 @@ function Editor() {
                     step={1}
                     value={[hue]}
                     onValueChange={(v) => handleHueChange(v[0])}
+                    snapPoints={[-180, -90, 0, 90, 180]}
                   />
                 </div>
               </CardContent>
@@ -1162,10 +1171,21 @@ function Editor() {
                 )}
                 Export {exportFormat === 'jpeg' ? 'JPEG' : 'AVIF'}
               </Button>
+              <div className="flex items-center justify-between pt-1">
+                <Label htmlFor="smaller-file" className="text-xs font-normal text-muted-foreground">
+                  Smaller file size (lower quality)
+                </Label>
+                <Switch
+                  id="smaller-file"
+                  checked={smallerFile}
+                  onCheckedChange={setSmallerFile}
+                />
+              </div>
             </div>
           </div>
         )}
       </aside>
+      </div>
     </div>
   );
 }

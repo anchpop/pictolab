@@ -2,19 +2,54 @@ import * as React from "react"
 import * as SliderPrimitive from "@radix-ui/react-slider"
 import { cn } from "@/lib/utils"
 
+type SliderProps = React.ComponentPropsWithoutRef<typeof SliderPrimitive.Root> & {
+  /** Values that the thumb should magnetize toward when dragged near. */
+  snapPoints?: number[]
+  /** Tolerance in value units. Defaults to 1.5% of (max - min). */
+  snapRadius?: number
+}
+
 const Slider = React.forwardRef<
   React.ElementRef<typeof SliderPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof SliderPrimitive.Root>
->(({ className, value, defaultValue, ...props }, ref) => {
+  SliderProps
+>(({ className, value, defaultValue, snapPoints, snapRadius, onValueChange, min = 0, max = 100, ...props }, ref) => {
   const thumbCount =
     (Array.isArray(value) ? value.length : undefined) ??
     (Array.isArray(defaultValue) ? defaultValue.length : 1)
+
+  const radius = snapRadius ?? (max - min) * 0.015
+  const snap = React.useCallback(
+    (v: number) => {
+      if (!snapPoints || snapPoints.length === 0) return v
+      let best = v
+      let bestD = radius
+      for (const p of snapPoints) {
+        const d = Math.abs(v - p)
+        if (d <= bestD) {
+          best = p
+          bestD = d
+        }
+      }
+      return best
+    },
+    [snapPoints, radius]
+  )
+
+  const handleChange = React.useCallback(
+    (vals: number[]) => {
+      onValueChange?.(snapPoints ? vals.map(snap) : vals)
+    },
+    [onValueChange, snap, snapPoints]
+  )
 
   return (
     <SliderPrimitive.Root
       ref={ref}
       value={value}
       defaultValue={defaultValue}
+      min={min}
+      max={max}
+      onValueChange={handleChange}
       className={cn(
         "relative flex w-full touch-none select-none items-center",
         className

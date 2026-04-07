@@ -9,6 +9,10 @@ interface DualSliderProps {
   onValueChange: (value: [number, number]) => void
   /** Region [a, b] outside of which the track is shaded as a "danger" zone. */
   safeRange?: [number, number]
+  /** Values that thumbs should magnetize toward when dragged near. */
+  snapPoints?: number[]
+  /** Tolerance in value units. Defaults to 1.5% of (max - min). */
+  snapRadius?: number
   className?: string
 }
 
@@ -24,8 +28,24 @@ export function DualSlider({
   value,
   onValueChange,
   safeRange,
+  snapPoints,
+  snapRadius,
   className,
 }: DualSliderProps) {
+  const radius = snapRadius ?? (max - min) * 0.015
+  const snap = (v: number) => {
+    if (!snapPoints || snapPoints.length === 0) return v
+    let best = v
+    let bestD = radius
+    for (const p of snapPoints) {
+      const d = Math.abs(v - p)
+      if (d <= bestD) {
+        best = p
+        bestD = d
+      }
+    }
+    return best
+  }
   const trackRef = React.useRef<HTMLDivElement>(null)
   const activeRef = React.useRef<0 | 1 | null>(null)
 
@@ -39,7 +59,7 @@ export function DualSlider({
     const rect = track.getBoundingClientRect()
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
     const raw = min + ratio * (max - min)
-    return Math.round(raw / step) * step
+    return snap(Math.round(raw / step) * step)
   }
 
   const handlePointerDown = (idx: 0 | 1) => (e: React.PointerEvent) => {
