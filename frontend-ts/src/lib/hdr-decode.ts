@@ -506,7 +506,360 @@ async function decodeHeicViaDisplay(buf: Uint8Array): Promise<HdrDecodeResult | 
   };
 }
 
+// ─── Apple HDR HEIC (gain-mapped) ──────────────────────────────────────
+//
+// iPhone HDR HEICs store HDR as an 8-bit Display P3 SDR primary plus a
+// monochrome auxiliary "gain map" image, with two scalar parameters in
+// the Apple MakerNotes EXIF block. The composition formula is:
+//
+//   SDR_lin   = sRGB^-1(SDR_p3)
+//   gain_lin  = sRGB^-1(gain_8bit)
+//   HDR_lin   = SDR_lin * (1 + (headroom - 1) * gain_lin)
+//
+// where `headroom` is derived from MakerNotes tags 33 (HDRHeadroom) and
+// 48 (HDRGain) per Apple's published formula. Algorithm ported from the
+// `apple-hdr-heic` Python project (johncf/apple-hdr-heic).
+
+const APPLE_GAINMAP_AUX_TYPE = 'urn:com:apple:photo:2020:aux:hdrgainmap';
+
+function appleHeadroomFromMakerNote(maker33: number, maker48: number): number {
+  let stops: number;
+  if (maker33 < 1.0) {
+    stops = maker48 <= 0.01 ? -20.0 * maker48 + 1.8 : -0.101 * maker48 + 1.601;
+  } else {
+    stops = maker48 <= 0.01 ? -70.0 * maker48 + 3.0 : -0.303 * maker48 + 2.303;
+  }
+  return Math.pow(2.0, Math.max(stops, 0.0));
+}
+
+// Pull the EXIF metadata block out of an HEIF image handle as raw bytes,
+// stripping the leading "Exif offset" and the "Exif\0\0" signature so the
+// returned slice starts at the TIFF header (which is what exifr wants).
+function readExifBlock(M: any, handle: number, errPtr: number): Uint8Array | null {
+  const numMeta = M._heif_image_handle_get_number_of_metadata_blocks(handle, 0);
+  if (numMeta <= 0) return null;
+  const idsPtr = M._malloc(numMeta * 4);
+  try {
+    M._heif_image_handle_get_list_of_metadata_block_IDs(handle, 0, idsPtr, numMeta);
+    for (let i = 0; i < numMeta; i++) {
+      const id = M.HEAPU32[(idsPtr >>> 2) + i];
+      const typePtr = M._heif_image_handle_get_metadata_type(handle, id);
+      let type = '';
+      for (let j = 0; j < 32; j++) {
+        const c = M.HEAPU8[typePtr + j];
+        if (!c) break;
+        type += String.fromCharCode(c);
+      }
+      if (type !== 'Exif') continue;
+      const sz = M._heif_image_handle_get_metadata_size(handle, id);
+      if (sz <= 4) return null;
+      const dataPtr = M._malloc(sz);
+      M._heif_image_handle_get_metadata(errPtr, handle, id, dataPtr);
+      const blob = new Uint8Array(M.HEAPU8.subarray(dataPtr, dataPtr + sz)).slice();
+      M._free(dataPtr);
+      // First 4 bytes are a u32 (BE) "TIFF offset" measured from the
+      // start of the buffer. Typically 6 — points just past "Exif\0\0".
+      const tiffOff =
+        ((blob[0] << 24) | (blob[1] << 16) | (blob[2] << 8) | blob[3]) + 4;
+      return blob.subarray(tiffOff);
+    }
+    return null;
+  } finally {
+    M._free(idsPtr);
+  }
+}
+
+// Decode an aux image as 8-bit interleaved RGB(A). Used for the gain map.
+function decodeHeifAuxAsU8(
+  M: any,
+  errPtr: number,
+  auxHandle: number
+): { data: Uint8Array; width: number; height: number; channels: number } | null {
+  const optsPtr = M._heif_decoding_options_alloc();
+  const imgPtrPtr = M._malloc(4);
+  try {
+    M._heif_decode_image(
+      errPtr,
+      auxHandle,
+      imgPtrPtr,
+      HEIF_COLORSPACE_RGB,
+      HEIF_CHROMA_INTERLEAVED_RGBA,
+      optsPtr
+    );
+    if (M.HEAPU32[errPtr >>> 2] !== 0) return null;
+    const img = M.HEAPU32[imgPtrPtr >>> 2];
+    if (!img) return null;
+    try {
+      const w = M._heif_image_get_width(img, HEIF_CHANNEL_INTERLEAVED);
+      const h = M._heif_image_get_height(img, HEIF_CHANNEL_INTERLEAVED);
+      const stridePtr = M._malloc(4);
+      try {
+        const planePtr = M._heif_image_get_plane_readonly(
+          img,
+          HEIF_CHANNEL_INTERLEAVED,
+          stridePtr
+        );
+        if (!planePtr) return null;
+        const stride = M.HEAPU32[stridePtr >>> 2];
+        const out = new Uint8Array(w * h * 4);
+        for (let y = 0; y < h; y++) {
+          out.set(
+            M.HEAPU8.subarray(planePtr + y * stride, planePtr + y * stride + w * 4),
+            y * w * 4
+          );
+        }
+        return { data: out, width: w, height: h, channels: 4 };
+      } finally {
+        M._free(stridePtr);
+      }
+    } finally {
+      M._heif_image_release(img);
+    }
+  } finally {
+    M._heif_decoding_options_free(optsPtr);
+    M._free(imgPtrPtr);
+  }
+}
+
+// Bilinear-upsample a single-channel u8 image to (newW, newH).
+function bilinearUpsampleU8(
+  src: Uint8Array,
+  srcW: number,
+  srcH: number,
+  newW: number,
+  newH: number
+): Float32Array {
+  const out = new Float32Array(newW * newH);
+  const sx = (srcW - 1) / Math.max(newW - 1, 1);
+  const sy = (srcH - 1) / Math.max(newH - 1, 1);
+  for (let y = 0; y < newH; y++) {
+    const fy = y * sy;
+    const y0 = Math.floor(fy);
+    const y1 = Math.min(y0 + 1, srcH - 1);
+    const wy = fy - y0;
+    for (let x = 0; x < newW; x++) {
+      const fx = x * sx;
+      const x0 = Math.floor(fx);
+      const x1 = Math.min(x0 + 1, srcW - 1);
+      const wx = fx - x0;
+      const a = src[y0 * srcW + x0];
+      const b = src[y0 * srcW + x1];
+      const c = src[y1 * srcW + x0];
+      const d = src[y1 * srcW + x1];
+      const top = a * (1 - wx) + b * wx;
+      const bot = c * (1 - wx) + d * wx;
+      out[y * newW + x] = (top * (1 - wy) + bot * wy) / 255;
+    }
+  }
+  return out;
+}
+
+// Apple gain-mapped HDR HEIC composition. Returns null if the file
+// doesn't actually have an Apple HDR gain map, so the caller can fall
+// back to the plain decode path.
+async function decodeAppleHdrHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  const libheif: any = await getLibheif();
+  const M: any = libheif.Module ?? libheif;
+  if (typeof M._heif_context_alloc !== 'function') return null;
+
+  let inPtr = 0,
+    errPtr = 0,
+    ctx = 0,
+    handlePtrPtr = 0,
+    handle = 0,
+    auxHandlePtrPtr = 0,
+    auxHandle = 0;
+
+  try {
+    inPtr = M._malloc(buf.length);
+    if (!inPtr) return null;
+    M.HEAPU8.set(buf, inPtr);
+    ctx = M._heif_context_alloc();
+    errPtr = M._malloc(12);
+
+    M._heif_context_read_from_memory_without_copy(errPtr, ctx, inPtr, buf.length, 0);
+    if (M.HEAPU32[errPtr >>> 2] !== 0) return null;
+
+    handlePtrPtr = M._malloc(4);
+    M._heif_context_get_primary_image_handle(errPtr, ctx, handlePtrPtr);
+    if (M.HEAPU32[errPtr >>> 2] !== 0) return null;
+    handle = M.HEAPU32[handlePtrPtr >>> 2];
+
+    // Find the auxiliary image with the Apple HDR gain map type.
+    const numAux = M._heif_image_handle_get_number_of_auxiliary_images(handle, 0);
+    if (numAux <= 0) return null;
+    const auxIdsPtr = M._malloc(numAux * 4);
+    let gainmapAuxId = 0;
+    try {
+      M._heif_image_handle_get_list_of_auxiliary_image_IDs(handle, 0, auxIdsPtr, numAux);
+      for (let i = 0; i < numAux; i++) {
+        const id = M.HEAPU32[(auxIdsPtr >>> 2) + i];
+        const tmpHandlePtrPtr = M._malloc(4);
+        M._heif_image_handle_get_auxiliary_image_handle(errPtr, handle, id, tmpHandlePtrPtr);
+        if (M.HEAPU32[errPtr >>> 2] !== 0) {
+          M._free(tmpHandlePtrPtr);
+          continue;
+        }
+        const tmpHandle = M.HEAPU32[tmpHandlePtrPtr >>> 2];
+        M._free(tmpHandlePtrPtr);
+        const typePtrPtr = M._malloc(4);
+        M.HEAPU32[typePtrPtr >>> 2] = 0;
+        M._heif_image_handle_get_auxiliary_type(errPtr, tmpHandle, typePtrPtr);
+        let typeStr = '';
+        if (M.HEAPU32[errPtr >>> 2] === 0) {
+          const tp = M.HEAPU32[typePtrPtr >>> 2];
+          if (tp) {
+            for (let j = 0; j < 256; j++) {
+              const c = M.HEAPU8[tp + j];
+              if (!c) break;
+              typeStr += String.fromCharCode(c);
+            }
+          }
+        }
+        M._heif_image_handle_release_auxiliary_type(tmpHandle, typePtrPtr);
+        M._free(typePtrPtr);
+        if (typeStr === APPLE_GAINMAP_AUX_TYPE) {
+          gainmapAuxId = id;
+          M._heif_image_handle_release(tmpHandle);
+          break;
+        }
+        M._heif_image_handle_release(tmpHandle);
+      }
+    } finally {
+      M._free(auxIdsPtr);
+    }
+    if (!gainmapAuxId) return null;
+
+    // Pull EXIF + parse Apple MakerNotes for HDRHeadroom + HDRGain.
+    const exifBytes = readExifBlock(M, handle, errPtr);
+    if (!exifBytes) return null;
+    const exifr = await import('exifr');
+    const parsed: any = await exifr
+      .parse(exifBytes, { tiff: true, makerNote: true, mergeOutput: false })
+      .catch(() => null);
+    const mn = parsed?.makerNote;
+    if (!mn) return null;
+    const maker33 = Number(mn[33] ?? mn[0x21] ?? 0);
+    const maker48 = Number(mn[48] ?? mn[0x30] ?? 0);
+    if (!Number.isFinite(maker33) || !Number.isFinite(maker48)) return null;
+    const headroom = appleHeadroomFromMakerNote(maker33, maker48);
+    if (headroom <= 1.0) return null; // not HDR
+
+    // Decode the SDR primary as 8-bit Display P3 RGBA.
+    const sdrDecoded = (() => {
+      const optsPtr = M._heif_decoding_options_alloc();
+      const imgPtrPtr = M._malloc(4);
+      try {
+        M._heif_decode_image(
+          errPtr,
+          handle,
+          imgPtrPtr,
+          HEIF_COLORSPACE_RGB,
+          HEIF_CHROMA_INTERLEAVED_RGBA,
+          optsPtr
+        );
+        if (M.HEAPU32[errPtr >>> 2] !== 0) return null;
+        const img = M.HEAPU32[imgPtrPtr >>> 2];
+        if (!img) return null;
+        try {
+          const w = M._heif_image_get_width(img, HEIF_CHANNEL_INTERLEAVED);
+          const h = M._heif_image_get_height(img, HEIF_CHANNEL_INTERLEAVED);
+          const stridePtr = M._malloc(4);
+          try {
+            const planePtr = M._heif_image_get_plane_readonly(
+              img,
+              HEIF_CHANNEL_INTERLEAVED,
+              stridePtr
+            );
+            if (!planePtr) return null;
+            const stride = M.HEAPU32[stridePtr >>> 2];
+            const data = new Uint8Array(w * h * 4);
+            for (let y = 0; y < h; y++) {
+              data.set(
+                M.HEAPU8.subarray(planePtr + y * stride, planePtr + y * stride + w * 4),
+                y * w * 4
+              );
+            }
+            return { data, width: w, height: h };
+          } finally {
+            M._free(stridePtr);
+          }
+        } finally {
+          M._heif_image_release(img);
+        }
+      } finally {
+        M._heif_decoding_options_free(optsPtr);
+        M._free(imgPtrPtr);
+      }
+    })();
+    if (!sdrDecoded) return null;
+    const { data: sdrData, width, height } = sdrDecoded;
+
+    // Decode the gain map auxiliary as 8-bit RGBA. R==G==B for monochrome.
+    auxHandlePtrPtr = M._malloc(4);
+    M._heif_image_handle_get_auxiliary_image_handle(
+      errPtr,
+      handle,
+      gainmapAuxId,
+      auxHandlePtrPtr
+    );
+    if (M.HEAPU32[errPtr >>> 2] !== 0) return null;
+    auxHandle = M.HEAPU32[auxHandlePtrPtr >>> 2];
+    const gainDecoded = decodeHeifAuxAsU8(M, errPtr, auxHandle);
+    if (!gainDecoded) return null;
+
+    // Extract the luminance channel (R) from the RGBA gain map.
+    const gainLuma = new Uint8Array(gainDecoded.width * gainDecoded.height);
+    for (let i = 0; i < gainLuma.length; i++) gainLuma[i] = gainDecoded.data[i * 4];
+
+    // Bilinear upsample the gain map (and decode sRGB) to the SDR dims.
+    // Apple stores gain map values with the sRGB transfer applied.
+    const gainNorm = bilinearUpsampleU8(gainLuma, gainDecoded.width, gainDecoded.height, width, height);
+    for (let i = 0; i < gainNorm.length; i++) gainNorm[i] = srgbInverse(gainNorm[i]);
+
+    // Compose: HDR_linear = SDR_linear * (1 + (headroom - 1) * gain_linear)
+    const f32 = new Float32Array(width * height * 4);
+    for (let i = 0; i < width * height; i++) {
+      const r8 = sdrData[i * 4] / 255;
+      const g8 = sdrData[i * 4 + 1] / 255;
+      const b8 = sdrData[i * 4 + 2] / 255;
+      const a8 = sdrData[i * 4 + 3] / 255;
+      const lr = srgbInverse(r8);
+      const lg = srgbInverse(g8);
+      const lb = srgbInverse(b8);
+      const scale = 1 + (headroom - 1) * gainNorm[i];
+      f32[i * 4] = lr * scale;
+      f32[i * 4 + 1] = lg * scale;
+      f32[i * 4 + 2] = lb * scale;
+      f32[i * 4 + 3] = a8;
+    }
+
+    return {
+      hdr: true,
+      pixels: packF16(f32),
+      sdrPixels: quantizeToSdrP3(f32),
+      width,
+      height,
+    };
+  } catch (err) {
+    console.warn('Apple HDR HEIC decode failed:', err);
+    return null;
+  } finally {
+    if (auxHandle) M._heif_image_handle_release(auxHandle);
+    if (handle) M._heif_image_handle_release(handle);
+    if (ctx) M._heif_context_free(ctx);
+    if (inPtr) M._free(inPtr);
+    if (errPtr) M._free(errPtr);
+    if (handlePtrPtr) M._free(handlePtrPtr);
+    if (auxHandlePtrPtr) M._free(auxHandlePtrPtr);
+  }
+}
+
 async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  // Try Apple gain-mapped HDR first (iPhone photos). Falls through to
+  // the plain C-API path for non-Apple HEIC and 10-bit BT.2020 PQ.
+  const apple = await decodeAppleHdrHeic(buf);
+  if (apple) return apple;
   const viaC = await decodeHeicViaCApi(buf);
   if (viaC) return viaC;
   return decodeHeicViaDisplay(buf);
