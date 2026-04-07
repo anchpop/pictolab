@@ -12,7 +12,7 @@ type SliderProps = React.ComponentPropsWithoutRef<typeof SliderPrimitive.Root> &
 const Slider = React.forwardRef<
   React.ElementRef<typeof SliderPrimitive.Root>,
   SliderProps
->(({ className, value, defaultValue, snapPoints, snapRadius, onValueChange, min = 0, max = 100, step, disabled, ...props }, ref) => {
+>(({ className, value, defaultValue, snapPoints, snapRadius, onValueChange, onValueCommit, min = 0, max = 100, step, disabled, ...props }, ref) => {
   const thumbCount =
     (Array.isArray(value) ? value.length : undefined) ??
     (Array.isArray(defaultValue) ? defaultValue.length : 1)
@@ -76,6 +76,7 @@ const Slider = React.forwardRef<
       const next = [...value]
       next[nearest] = snapped
       onValueChange?.(next)
+      onValueCommit?.(next)
     }
   }
 

@@ -41,6 +41,131 @@ function bufferHasAlpha(rgba: Uint8Array): boolean {
   return false;
 }
 
+type ExifOrientation = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+
+function normalizeOrientation(value: unknown): ExifOrientation {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 2 && n <= 8 ? (n as ExifOrientation) : 1;
+}
+
+function getOrientedSize(width: number, height: number, orientation: ExifOrientation) {
+  return orientation >= 5 ? { width: height, height: width } : { width, height };
+}
+
+function mapOrientedCoords(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  orientation: ExifOrientation
+): [number, number] {
+  switch (orientation) {
+    case 2: return [width - 1 - x, y];
+    case 3: return [width - 1 - x, height - 1 - y];
+    case 4: return [x, height - 1 - y];
+    case 5: return [y, x];
+    case 6: return [height - 1 - y, x];
+    case 7: return [height - 1 - y, width - 1 - x];
+    case 8: return [y, width - 1 - x];
+    default: return [x, y];
+  }
+}
+
+function orientPackedRgba(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  bytesPerPixel: number,
+  orientation: ExifOrientation
+): { data: Uint8Array; width: number; height: number } {
+  if (orientation === 1) return { data, width, height };
+  const outSize = getOrientedSize(width, height, orientation);
+  const out = new Uint8Array(outSize.width * outSize.height * bytesPerPixel);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const [dx, dy] = mapOrientedCoords(x, y, width, height, orientation);
+      const srcOff = (y * width + x) * bytesPerPixel;
+      const dstOff = (dy * outSize.width + dx) * bytesPerPixel;
+      out.set(data.subarray(srcOff, srcOff + bytesPerPixel), dstOff);
+    }
+  }
+  return {
+    data: out,
+    width: outSize.width,
+    height: outSize.height,
+  };
+}
+
+async function parseOrientation(buf: Uint8Array): Promise<ExifOrientation> {
+  try {
+    const exifr = await import('exifr');
+    const parsed: any = await exifr.parse(buf, ['Orientation']).catch(() => null);
+    return normalizeOrientation(parsed?.Orientation);
+  } catch {
+    return 1;
+  }
+}
+
+function orientHdrDecodeResult<T extends {
+  hdr: boolean;
+  pixels: Uint8Array | null;
+  sdrPixels: Uint8Array;
+  width: number;
+  height: number;
+}>(decoded: T, orientation: ExifOrientation): T {
+  if (orientation === 1) return decoded;
+  const sdr = orientPackedRgba(decoded.sdrPixels, decoded.width, decoded.height, 4, orientation);
+  if (decoded.hdr && decoded.pixels) {
+    const hdr = orientPackedRgba(decoded.pixels, decoded.width, decoded.height, 8, orientation);
+    return {
+      ...decoded,
+      pixels: hdr.data,
+      sdrPixels: sdr.data,
+      width: sdr.width,
+      height: sdr.height,
+    };
+  }
+  return {
+    ...decoded,
+    sdrPixels: sdr.data,
+    width: sdr.width,
+    height: sdr.height,
+  };
+}
+
+function applyCanvasOrientation(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  orientation: ExifOrientation
+) {
+  switch (orientation) {
+    case 2:
+      ctx.setTransform(-1, 0, 0, 1, width, 0);
+      break;
+    case 3:
+      ctx.setTransform(-1, 0, 0, -1, width, height);
+      break;
+    case 4:
+      ctx.setTransform(1, 0, 0, -1, 0, height);
+      break;
+    case 5:
+      ctx.setTransform(0, 1, 1, 0, 0, 0);
+      break;
+    case 6:
+      ctx.setTransform(0, 1, -1, 0, height, 0);
+      break;
+    case 7:
+      ctx.setTransform(0, -1, -1, 0, height, width);
+      break;
+    case 8:
+      ctx.setTransform(0, -1, 1, 0, 0, width);
+      break;
+    default:
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+}
+
 const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
   { value: 'free', label: 'Free' },
   { value: 'lock', label: 'Lock' },
@@ -111,6 +236,8 @@ function Editor() {
   const [showHdr, setShowHdr] = useState(false);
   // null = still detecting, true/false = known result.
   const [gpuAvailable, setGpuAvailable] = useState<boolean | null>(null);
+  const [targetWDraft, setTargetWDraft] = useState<number | null>(null);
+  const [targetHDraft, setTargetHDraft] = useState<number | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -140,6 +267,8 @@ function Editor() {
   const hueRef = useRef(0);
   const showHdrRef = useRef(false);
   const hdrRafRef = useRef<number | null>(null);
+  const lowCoreDevice =
+    typeof navigator !== 'undefined' && navigator.hardwareConcurrency <= 2;
 
   // After the source state is set and React mounts the canvas, init the
   // GPU context (if needed), upload the source, and kick off precompute.
@@ -171,6 +300,8 @@ function Editor() {
       targetHRef.current = src.h;
       setTargetW(src.w);
       setTargetH(src.h);
+      setTargetWDraft(null);
+      setTargetHDraft(null);
       // Carve is the default mode and needs the seam precompute before
       // build_carve_lut works. Show the source at its native size as a
       // first paint (identity Lanczos = the unmodified image, not a
@@ -353,12 +484,14 @@ function Editor() {
       console.error('image fetch failed:', err);
       return;
     }
+    const orientation = await parseOrientation(buf);
 
     // Try the HDR path first. Returns null for SDR / unsupported formats
     // so we can fall through to the canvas path.
     try {
       const { decodeHdr } = await import('@/lib/hdr-decode');
-      const decoded = await decodeHdr(buf);
+      const decodedRaw = await decodeHdr(buf);
+      const decoded = decodedRaw ? orientHdrDecodeResult(decodedRaw, orientation) : null;
       if (decoded) {
         const src: SourceState = {
           url: imageUrl,
@@ -383,14 +516,40 @@ function Editor() {
 
     // SDR path: decode through a 2D canvas in display-p3 space.
     const blob = new Blob([buf as BlobPart]);
-    const img = new Image();
-    img.onload = async () => {
+    let objectUrl: string | null = null;
+    const decodeSource = async (): Promise<ImageBitmap | HTMLImageElement> => {
+      if (typeof createImageBitmap === 'function') {
+        try {
+          return await createImageBitmap(blob, { imageOrientation: 'none' } as ImageBitmapOptions);
+        } catch {
+          // Fall back to <img> below.
+        }
+      }
+      objectUrl = URL.createObjectURL(blob);
+      return await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('image decode failed'));
+        img.src = objectUrl!;
+      });
+    };
+    try {
+      const image = await decodeSource();
+      const isBitmap = typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap;
+      const srcWidth = isBitmap
+        ? image.width
+        : (image as HTMLImageElement).naturalWidth || image.width;
+      const srcHeight = isBitmap
+        ? image.height
+        : (image as HTMLImageElement).naturalHeight || image.height;
+      const outSize = getOrientedSize(srcWidth, srcHeight, orientation);
       const tmp = document.createElement('canvas');
-      tmp.width = img.width;
-      tmp.height = img.height;
+      tmp.width = outSize.width;
+      tmp.height = outSize.height;
       const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
-      ctx.drawImage(img, 0, 0);
-      const data = ctx.getImageData(0, 0, img.width, img.height, {
+      applyCanvasOrientation(ctx, srcWidth, srcHeight, orientation);
+      ctx.drawImage(image, 0, 0);
+      const data = ctx.getImageData(0, 0, outSize.width, outSize.height, {
         colorSpace: 'display-p3',
       });
       const sdrData = new Uint8Array(data.data);
@@ -398,8 +557,8 @@ function Editor() {
         url: imageUrl,
         data: sdrData,
         sdrData,
-        w: img.width,
-        h: img.height,
+        w: outSize.width,
+        h: outSize.height,
         hdr: false,
         hasAlpha: bufferHasAlpha(sdrData),
       };
@@ -408,14 +567,19 @@ function Editor() {
 
       // Compute the L+chroma histogram once so the clipping readouts are live.
       lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
-      URL.revokeObjectURL(img.src);
-    };
-    img.src = URL.createObjectURL(blob);
+      if (isBitmap) image.close();
+    } catch (err) {
+      console.error('SDR decode failed:', err);
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
   };
 
   const handleDirectionChange = (dir: Direction) => {
     setDirection(dir);
     directionRef.current = dir;
+    setTargetWDraft(null);
+    setTargetHDraft(null);
     const src = sourceRef.current;
     if (!src) return;
     // Carve constrains the *other* dimension to the source size — snap
@@ -456,6 +620,8 @@ function Editor() {
     targetHRef.current = h;
     setTargetW(w);
     setTargetH(h);
+    setTargetWDraft(null);
+    setTargetHDraft(null);
   };
 
   // In carve mode an active aspect ratio fully determines (W, H), so a
@@ -540,6 +706,8 @@ function Editor() {
     if (mode === resizeModeRef.current) return;
     setResizeMode(mode);
     resizeModeRef.current = mode;
+    setTargetWDraft(null);
+    setTargetHDraft(null);
     const src = sourceRef.current;
     if (!src) return;
     // Switching to carve constrains the inactive dimension to source.
@@ -708,6 +876,8 @@ function Editor() {
 
   const handleNewImage = () => {
     setSource(null);
+    setTargetWDraft(null);
+    setTargetHDraft(null);
     sourceRef.current = null;
     orderRef.current = null;
     orderDirectionRef.current = null;
@@ -767,6 +937,9 @@ function Editor() {
   })();
 
   const gpuMissing = gpuAvailable === false;
+  const deferCarveSliderUpdates = lowCoreDevice && resizeMode === 'carve';
+  const widthSliderValue = deferCarveSliderUpdates ? (targetWDraft ?? targetW) : targetW;
+  const heightSliderValue = deferCarveSliderUpdates ? (targetHDraft ?? targetH) : targetH;
 
   return (
     <div className="flex h-full min-h-screen flex-col bg-background text-foreground">
@@ -993,9 +1166,15 @@ function Editor() {
                           min={1}
                           max={source.w}
                           step={1}
-                          value={[targetW]}
+                          value={[widthSliderValue]}
                           disabled={isPrecomputing}
-                          onValueChange={(v) => handleTargetWChange(v[0])}
+                          onValueChange={(v) => {
+                            if (deferCarveSliderUpdates) setTargetWDraft(v[0]);
+                            else handleTargetWChange(v[0]);
+                          }}
+                          onValueCommit={(v) => {
+                            if (deferCarveSliderUpdates) handleTargetWChange(v[0]);
+                          }}
                         />
                       </div>
                     )}
@@ -1019,9 +1198,15 @@ function Editor() {
                           min={1}
                           max={source.h}
                           step={1}
-                          value={[targetH]}
+                          value={[heightSliderValue]}
                           disabled={isPrecomputing}
-                          onValueChange={(v) => handleTargetHChange(v[0])}
+                          onValueChange={(v) => {
+                            if (deferCarveSliderUpdates) setTargetHDraft(v[0]);
+                            else handleTargetHChange(v[0]);
+                          }}
+                          onValueCommit={(v) => {
+                            if (deferCarveSliderUpdates) handleTargetHChange(v[0]);
+                          }}
                         />
                       </div>
                     )}
