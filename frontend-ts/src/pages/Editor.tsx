@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { DualSlider } from '@/components/ui/dual-slider';
 import { Segmented } from '@/components/ui/segmented';
+import { Collapsible } from '@/components/ui/collapsible';
 
 type Direction = 'width' | 'height';
 type ResizeMode = 'squish' | 'carve';
@@ -767,9 +768,17 @@ function Editor() {
                   ]}
                 />
 
-                <div>
-                  <Label className="text-xs">Aspect ratio</Label>
-                  <div className="mt-1 flex flex-wrap gap-1">
+                <Collapsible
+                  label="Aspect ratio"
+                  meta={
+                    aspect !== 'free' && (
+                      <span className="font-mono text-[10px] text-foreground">
+                        {ASPECT_OPTIONS.find((o) => o.value === aspect)?.label}
+                      </span>
+                    )
+                  }
+                >
+                  <div className="flex flex-wrap gap-1">
                     {ASPECT_OPTIONS.filter((opt) => {
                       // Lock is meaningless in carve mode — the only ratio
                       // that preserves source aspect is the source itself.
@@ -802,7 +811,7 @@ function Editor() {
                       </Button>
                     ))}
                   </div>
-                </div>
+                </Collapsible>
                 {resizeMode === 'carve' && (
                   <Segmented<Direction>
                     value={direction}
@@ -822,7 +831,14 @@ function Editor() {
                       <div className="space-y-2">
                         <div className="flex items-center justify-between">
                           <Label>Width</Label>
-                          <span className="text-xs text-muted-foreground">{targetW}px</span>
+                          <Input
+                            type="number"
+                            value={targetW}
+                            min={1}
+                            max={source.w}
+                            onChange={(e) => handleTargetWChange(Number(e.target.value))}
+                            className="h-6 w-16 px-1.5 py-0 text-right font-mono text-xs"
+                          />
                         </div>
                         <Slider
                           min={1}
@@ -839,7 +855,14 @@ function Editor() {
                       <div className="space-y-2">
                         <div className="flex items-center justify-between">
                           <Label>Height</Label>
-                          <span className="text-xs text-muted-foreground">{targetH}px</span>
+                          <Input
+                            type="number"
+                            value={targetH}
+                            min={1}
+                            max={source.h}
+                            onChange={(e) => handleTargetHChange(Number(e.target.value))}
+                            className="h-6 w-16 px-1.5 py-0 text-right font-mono text-xs"
+                          />
                         </div>
                         <Slider
                           min={1}
@@ -850,31 +873,6 @@ function Editor() {
                         />
                       </div>
                     )}
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <Label className="text-xs">W</Label>
-                        <Input
-                          type="number"
-                          value={outW}
-                          min={1}
-                          max={source.w}
-                          disabled={resizeMode === 'carve' && direction !== 'width'}
-                          onChange={(e) => handleTargetWChange(Number(e.target.value))}
-                        />
-                      </div>
-                      <div>
-                        <Label className="text-xs">H</Label>
-                        <Input
-                          type="number"
-                          value={outH}
-                          min={1}
-                          max={source.h}
-                          disabled={resizeMode === 'carve' && direction !== 'height'}
-                          onChange={(e) => handleTargetHChange(Number(e.target.value))}
-                        />
-                      </div>
-                    </div>
                   </>
                 )}
                 {resizeMode === 'carve' && (
@@ -895,7 +893,7 @@ function Editor() {
 
             <Card>
               <CardHeader>
-                <CardTitle>Lightness Remap</CardTitle>
+                <CardTitle>Lightness</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
                 <div className="flex items-center justify-between">
@@ -954,7 +952,7 @@ function Editor() {
 
             <Card>
               <CardHeader>
-                <CardTitle>Chroma Remap</CardTitle>
+                <CardTitle>Chroma</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
                 <Label className="text-xs">Range</Label>

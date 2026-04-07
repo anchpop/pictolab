@@ -27,6 +27,12 @@ export default defineConfig({
   // Vendored emscripten encoder ships its own .wasm next to the JS glue;
   // we need to keep it out of Vite's depopt and let it serve the wasm asset.
   assetsInclude: ['**/avif_enc.wasm'],
+  build: {
+    // The vendored emscripten glue uses modern destructuring that esbuild
+    // can't always lower to vite's default baseline target. Bump to es2022
+    // — well within what we already require (WebGPU, Float16Array, etc).
+    target: 'es2022',
+  },
   resolve: {
     alias: {
       'frontend-rs': path.resolve(__dirname, '../frontend-rs/pkg'),
