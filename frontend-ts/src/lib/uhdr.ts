@@ -20,6 +20,11 @@ export interface EncodeOptions {
   colorGamut: number;
   colorTransfer: number;
   multiChannelGainmap: number;
+  // Target display peak brightness in nits, written into the gain map
+  // metadata. 0 = leave libultrahdr's default (10000 for linear/PQ).
+  // Should normally be set to the actual content peak so decoders don't
+  // misapply the gain map.
+  targetDisplayPeakNits: number;
 }
 
 const defaultOptions: EncodeOptions = {
@@ -28,6 +33,7 @@ const defaultOptions: EncodeOptions = {
   colorGamut: CG_DISPLAY_P3,
   colorTransfer: CT_LINEAR,
   multiChannelGainmap: 1,
+  targetDisplayPeakNits: 0,
 };
 
 import uhdrWasmUrl from '../../vendor/uhdr-enc/uhdr_enc.wasm?url';

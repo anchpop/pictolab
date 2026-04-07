@@ -608,8 +608,36 @@ function Editor() {
         // Linear extended Display P3 half-floats → Ultra HDR JPEG.
         // libultrahdr derives the SDR base + gain map from the HDR input.
         const f16 = await wasm.gpu_readback_linear_f16();
+        // Scan the buffer for the actual peak linear value so we can
+        // tell libultrahdr what hdr_capacity_max should be. Without this
+        // the encoder writes the default 10000-nit headroom into the
+        // metadata regardless of content; decoders then under-apply the
+        // gain map and the JPEG looks dim. f16 layout: 2 bytes per
+        // channel, 4 channels per pixel; only RGB matter.
+        let peak = 1.0;
+        for (let i = 0; i < f16.length; i += 8) {
+          for (let c = 0; c < 3; c++) {
+            const lo = f16[i + c * 2];
+            const hi = f16[i + c * 2 + 1];
+            const h = lo | (hi << 8);
+            const sign = (h & 0x8000) >>> 15;
+            const exp = (h & 0x7c00) >>> 10;
+            const frac = h & 0x3ff;
+            let v: number;
+            if (exp === 0) v = (frac / 1024) * Math.pow(2, -14);
+            else if (exp === 31) continue;
+            else v = (1 + frac / 1024) * Math.pow(2, exp - 15);
+            if (sign) v = -v;
+            if (v > peak) peak = v;
+          }
+        }
+        // 1.0 in linear extended Display P3 = SDR diffuse white = 203 nits
+        // per BT.2408. Clamp to libultrahdr's accepted [203, 10000] range.
+        const peakNits = Math.max(203, Math.min(10000, peak * 203));
         const { encodeUhdr } = await import('@/lib/uhdr');
-        const jpeg = await encodeUhdr(f16, outW, outH);
+        const jpeg = await encodeUhdr(f16, outW, outH, {
+          targetDisplayPeakNits: peakNits,
+        });
         blob = new Blob([new Uint8Array(jpeg)], { type: 'image/jpeg' });
         filename = 'pictolab.jpg';
       } else {

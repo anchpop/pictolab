@@ -25,6 +25,13 @@ struct UhdrOptions {
   int colorTransfer;
   // 1 = use a 3-channel gain map (better fidelity), 0 = monochrome
   int multiChannelGainmap;
+  // Target display peak brightness in nits, written into the gain map
+  // metadata (hdr_capacity_max). Determines the weight by which decoders
+  // scale the gain map. Pass 0 to leave the libultrahdr default
+  // (10000 nits for CT_LINEAR/CT_PQ, 1000 nits for CT_HLG). Should be
+  // set to the actual content peak for this image — anything else makes
+  // decoders under- or over-apply the gain map.
+  float targetDisplayPeakNits;
 };
 
 thread_local const val Uint8Array = val::global("Uint8Array");
@@ -79,6 +86,14 @@ val encode(std::string buffer, int width, int height, UhdrOptions options) {
   if (err.error_code != UHDR_CODEC_OK) {
     uhdr_release_encoder(enc);
     return val::null();
+  }
+
+  if (options.targetDisplayPeakNits > 0.0f) {
+    err = uhdr_enc_set_target_display_peak_brightness(enc, options.targetDisplayPeakNits);
+    if (err.error_code != UHDR_CODEC_OK) {
+      uhdr_release_encoder(enc);
+      return val::null();
+    }
   }
 
   err = uhdr_encode(enc);
@@ -192,7 +207,8 @@ EMSCRIPTEN_BINDINGS(uhdr_module) {
       .field("gainMapQuality", &UhdrOptions::gainMapQuality)
       .field("colorGamut", &UhdrOptions::colorGamut)
       .field("colorTransfer", &UhdrOptions::colorTransfer)
-      .field("multiChannelGainmap", &UhdrOptions::multiChannelGainmap);
+      .field("multiChannelGainmap", &UhdrOptions::multiChannelGainmap)
+      .field("targetDisplayPeakNits", &UhdrOptions::targetDisplayPeakNits);
 
   function("encode", &encode);
   function("decode", &decode);
