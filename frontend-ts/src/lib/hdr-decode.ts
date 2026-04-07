@@ -74,12 +74,16 @@ function isJpeg(bytes: Uint8Array): boolean {
   return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
 }
 
+// Shared scratch for f32→f16 reinterpretation. Hot loops call this
+// millions of times; allocating a fresh Float32Array each call shows
+// up clearly on profiles.
+const f32ToF16Scratch = new Float32Array(1);
+const f32ToF16ScratchU32 = new Uint32Array(f32ToF16Scratch.buffer);
+
 // f32 → IEEE 754 half (round-to-nearest-even, with infinity/NaN handling).
 function f32ToF16(val: number): number {
-  const f32 = new Float32Array(1);
-  const u32 = new Uint32Array(f32.buffer);
-  f32[0] = val;
-  const x = u32[0];
+  f32ToF16Scratch[0] = val;
+  const x = f32ToF16ScratchU32[0];
   const sign = (x >>> 16) & 0x8000;
   let exp = ((x >>> 23) & 0xff) - 127 + 15;
   const frac = x & 0x7fffff;
@@ -96,6 +100,17 @@ function f32ToF16(val: number): number {
   }
   return sign | (exp << 10) | ((frac + 0x1000) >>> 13);
 }
+
+// Precomputed sRGB → linear LUT for u8 inputs. Eliminates millions of
+// Math.pow calls in the HEIC gain-map composition path.
+const SRGB_U8_TO_LINEAR = (() => {
+  const lut = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const e = i / 255;
+    lut[i] = e <= 0.04045 ? e / 12.92 : Math.pow((e + 0.055) / 1.055, 2.4);
+  }
+  return lut;
+})();
 
 // Quantize a linear extended Display P3 f32 RGBA buffer down to 8-bit
 // Display P3 RGBA. Highlights >1 are softened with a Reinhard-ish curve
@@ -621,38 +636,8 @@ function decodeHeifAuxAsU8(
   }
 }
 
-// Bilinear-upsample a single-channel u8 image to (newW, newH).
-function bilinearUpsampleU8(
-  src: Uint8Array,
-  srcW: number,
-  srcH: number,
-  newW: number,
-  newH: number
-): Float32Array {
-  const out = new Float32Array(newW * newH);
-  const sx = (srcW - 1) / Math.max(newW - 1, 1);
-  const sy = (srcH - 1) / Math.max(newH - 1, 1);
-  for (let y = 0; y < newH; y++) {
-    const fy = y * sy;
-    const y0 = Math.floor(fy);
-    const y1 = Math.min(y0 + 1, srcH - 1);
-    const wy = fy - y0;
-    for (let x = 0; x < newW; x++) {
-      const fx = x * sx;
-      const x0 = Math.floor(fx);
-      const x1 = Math.min(x0 + 1, srcW - 1);
-      const wx = fx - x0;
-      const a = src[y0 * srcW + x0];
-      const b = src[y0 * srcW + x1];
-      const c = src[y1 * srcW + x0];
-      const d = src[y1 * srcW + x1];
-      const top = a * (1 - wx) + b * wx;
-      const bot = c * (1 - wx) + d * wx;
-      out[y * newW + x] = (top * (1 - wy) + bot * wy) / 255;
-    }
-  }
-  return out;
-}
+// (Bilinear gain-map sampling is folded into the composition loop in
+// decodeAppleHdrHeic so we only walk the destination pixels once.)
 
 // Apple gain-mapped HDR HEIC composition. Returns null if the file
 // doesn't actually have an Apple HDR gain map, so the caller can fall
@@ -808,30 +793,55 @@ async function decodeAppleHdrHeic(buf: Uint8Array): Promise<HdrDecodeResult | nu
     const gainDecoded = decodeHeifAuxAsU8(M, errPtr, auxHandle);
     if (!gainDecoded) return null;
 
-    // Extract the luminance channel (R) from the RGBA gain map.
-    const gainLuma = new Uint8Array(gainDecoded.width * gainDecoded.height);
-    for (let i = 0; i < gainLuma.length; i++) gainLuma[i] = gainDecoded.data[i * 4];
-
-    // Bilinear upsample the gain map (and decode sRGB) to the SDR dims.
-    // Apple stores gain map values with the sRGB transfer applied.
-    const gainNorm = bilinearUpsampleU8(gainLuma, gainDecoded.width, gainDecoded.height, width, height);
-    for (let i = 0; i < gainNorm.length; i++) gainNorm[i] = srgbInverse(gainNorm[i]);
+    // Extract the R channel of the RGBA gain map (R==G==B for monochrome).
+    const gainW = gainDecoded.width;
+    const gainH = gainDecoded.height;
+    const gainSrc = gainDecoded.data;
+    const gainLuma = new Uint8Array(gainW * gainH);
+    for (let i = 0; i < gainLuma.length; i++) gainLuma[i] = gainSrc[i * 4];
 
     // Compose: HDR_linear = SDR_linear * (1 + (headroom - 1) * gain_linear)
+    // Bilinear-sample the gain map directly per output pixel so we only
+    // touch each destination pixel once. sRGB → linear via 256-entry LUT
+    // for the SDR side; the gain map is bilerped in encoded space then
+    // pushed through srgbInverse on its post-bilerp value (still cheap
+    // because it's one Math.pow per pixel, not 21M).
+    const headroomMinusOne = headroom - 1;
+    const sx = (gainW - 1) / Math.max(width - 1, 1);
+    const sy = (gainH - 1) / Math.max(height - 1, 1);
     const f32 = new Float32Array(width * height * 4);
-    for (let i = 0; i < width * height; i++) {
-      const r8 = sdrData[i * 4] / 255;
-      const g8 = sdrData[i * 4 + 1] / 255;
-      const b8 = sdrData[i * 4 + 2] / 255;
-      const a8 = sdrData[i * 4 + 3] / 255;
-      const lr = srgbInverse(r8);
-      const lg = srgbInverse(g8);
-      const lb = srgbInverse(b8);
-      const scale = 1 + (headroom - 1) * gainNorm[i];
-      f32[i * 4] = lr * scale;
-      f32[i * 4 + 1] = lg * scale;
-      f32[i * 4 + 2] = lb * scale;
-      f32[i * 4 + 3] = a8;
+    for (let y = 0; y < height; y++) {
+      const fy = y * sy;
+      const y0 = Math.floor(fy);
+      const y1 = y0 + 1 < gainH ? y0 + 1 : gainH - 1;
+      const wy = fy - y0;
+      const rowOff = y * width;
+      for (let x = 0; x < width; x++) {
+        const fx = x * sx;
+        const x0 = Math.floor(fx);
+        const x1 = x0 + 1 < gainW ? x0 + 1 : gainW - 1;
+        const wx = fx - x0;
+        const ga = gainLuma[y0 * gainW + x0];
+        const gb = gainLuma[y0 * gainW + x1];
+        const gc = gainLuma[y1 * gainW + x0];
+        const gd = gainLuma[y1 * gainW + x1];
+        const gtop = ga * (1 - wx) + gb * wx;
+        const gbot = gc * (1 - wx) + gd * wx;
+        const gainEncoded = (gtop * (1 - wy) + gbot * wy) / 255;
+        const gainLin =
+          gainEncoded <= 0.04045
+            ? gainEncoded / 12.92
+            : Math.pow((gainEncoded + 0.055) / 1.055, 2.4);
+        const scale = 1 + headroomMinusOne * gainLin;
+        const i = rowOff + x;
+        const lr = SRGB_U8_TO_LINEAR[sdrData[i * 4]];
+        const lg = SRGB_U8_TO_LINEAR[sdrData[i * 4 + 1]];
+        const lb = SRGB_U8_TO_LINEAR[sdrData[i * 4 + 2]];
+        f32[i * 4] = lr * scale;
+        f32[i * 4 + 1] = lg * scale;
+        f32[i * 4 + 2] = lb * scale;
+        f32[i * 4 + 3] = sdrData[i * 4 + 3] / 255;
+      }
     }
 
     return {
