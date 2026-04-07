@@ -1106,7 +1106,8 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
             &js_obj(&[("bindGroupLayouts", layouts.into())]),
         )?
     };
-    let resample_pipeline = create_pipeline(&device, &resample_pl_layout, &resample_module, "main")?;
+    let resample_pipeline =
+        create_pipeline(&device, &resample_pl_layout, &resample_module, "main")?;
 
     // ── Render pipeline ─────────────────────────────────────────────────
     let render_module = create_shader(&device, render_shader())?;
@@ -1257,11 +1258,7 @@ pub fn gpu_set_source(image_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> 
 // `hdr_source_buf` as `array<vec4f>`. The remap shader picks this buffer
 // when `is_hdr_source != 0`, skipping the 8-bit unpack + sRGB decode.
 #[wasm_bindgen]
-pub fn gpu_set_source_linear_f16(
-    f16_data: &[u8],
-    w: u32,
-    h: u32,
-) -> Result<(), JsValue> {
+pub fn gpu_set_source_linear_f16(f16_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
     GPU_CTX.with(|c| -> Result<(), JsValue> {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
@@ -1314,9 +1311,8 @@ pub fn gpu_set_source_linear_f16(
             )?;
         }
 
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(f32_buf.as_ptr() as *const u8, f32_buf.len() * 4)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(f32_buf.as_ptr() as *const u8, f32_buf.len() * 4) };
         write_buffer_u8(&ctx.queue, &ctx.hdr_source_buf, bytes)?;
         ctx.is_hdr_source = 1;
         Ok(())
@@ -1343,7 +1339,10 @@ fn ensure_output_tex(ctx: &mut GpuCtx, target_w: u32, target_h: u32) -> Result<(
     let tex_desc = js_obj(&[
         ("size", size.into()),
         ("format", "rgba16float".into()),
-        ("usage", (TEX_BINDING | TEX_STORAGE | 1 /* COPY_SRC */).into()),
+        (
+            "usage",
+            (TEX_BINDING | TEX_STORAGE | 1/* COPY_SRC */).into(),
+        ),
     ]);
     let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
     let view = js_call1(&tex, "createView", &Object::new())?;
@@ -1377,12 +1376,8 @@ pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<()
         ensure_output_tex(ctx, target_w, target_h)?;
 
         // (Re)allocate the LUT buffer if it doesn't fit the new target.
-        let need_new_lut = ctx
-            .lut_buf
-            .as_ref()
-            .map(|_| false)
-            .unwrap_or(true)
-            || ctx.carve_bind_group.is_none();
+        let need_new_lut =
+            ctx.lut_buf.as_ref().map(|_| false).unwrap_or(true) || ctx.carve_bind_group.is_none();
         if need_new_lut {
             if let Some(old) = ctx.lut_buf.take() {
                 let _ = js_call0(&old, "destroy");
@@ -1429,7 +1424,10 @@ pub fn gpu_set_squish_dims(target_w: u32, target_h: u32) -> Result<(), JsValue> 
             let entries = Array::new();
             entries.push(&js_obj(&[
                 ("binding", 0u32.into()),
-                ("resource", js_obj(&[("buffer", ctx.remap_buf.clone())]).into()),
+                (
+                    "resource",
+                    js_obj(&[("buffer", ctx.remap_buf.clone())]).into(),
+                ),
             ]));
             entries.push(&js_obj(&[
                 ("binding", 1u32.into()),
