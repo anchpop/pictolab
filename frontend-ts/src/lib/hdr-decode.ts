@@ -525,18 +525,32 @@ async function decodeHeicViaDisplay(buf: Uint8Array): Promise<HdrDecodeResult | 
 //
 // iPhone HDR HEICs store HDR as an 8-bit Display P3 SDR primary plus a
 // monochrome auxiliary "gain map" image, with two scalar parameters in
-// the Apple MakerNotes EXIF block. The composition formula is:
+// the Apple MakerNotes EXIF block. libheif does NOT auto-apply the gain
+// map, so we have to do the composition ourselves. The formula is:
 //
 //   SDR_lin   = sRGB^-1(SDR_p3)
 //   gain_lin  = sRGB^-1(gain_8bit)
 //   HDR_lin   = SDR_lin * (1 + (headroom - 1) * gain_lin)
 //
 // where `headroom` is derived from MakerNotes tags 33 (HDRHeadroom) and
-// 48 (HDRGain) per Apple's published formula. Algorithm ported from the
-// `apple-hdr-heic` Python project (johncf/apple-hdr-heic).
+// 48 (HDRGain) via Apple's piecewise formula (see appleHeadroomFromMakerNote
+// below).
+//
+// Algorithm and the headroom branches are ported from the apple-hdr-heic
+// Python project: https://github.com/johncf/apple-hdr-heic
+//   - lib.py::apply_hdrgainmap        — composition formula
+//   - metadata.py::compute_headroom   — headroom branches
+// which in turn cites Apple's developer documentation:
+//   https://developer.apple.com/documentation/appkit/applying-apple-hdr-effect-to-your-photos
+//
+// Everything else here (libheif C-API plumbing, EXIF block extraction,
+// exifr-based MakerNote parsing, fused bilinear-upsample + composition
+// loop) is original to this project.
 
 const APPLE_GAINMAP_AUX_TYPE = 'urn:com:apple:photo:2020:aux:hdrgainmap';
 
+// Ported verbatim from johncf/apple-hdr-heic's metadata.py::compute_headroom,
+// which itself follows Apple's published HDR effect documentation.
 function appleHeadroomFromMakerNote(maker33: number, maker48: number): number {
   let stops: number;
   if (maker33 < 1.0) {
