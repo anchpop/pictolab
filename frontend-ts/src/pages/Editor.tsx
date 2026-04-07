@@ -618,11 +618,18 @@ function Editor() {
         const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL } = await import('@/lib/avif-hdr');
         const avif = await encodeAvif(rgba16, outW, outH, {
           bitDepth: 10,
-          quality: 60,
+          // Higher than the libavif default (~60) — for HDR master output
+          // we want chroma transitions in saturated highlights to stay
+          // clean, and 60 leaves visible banding/blocking on bright sky.
+          quality: 80,
           cicpColorPrimaries: CP_BT2020,
           cicpTransferCharacteristics: TC_PQ,
           cicpMatrixCoefficients: MC_BT2020_NCL,
-          fullRange: false,
+          // gpu_readback_hdr_pq_u16 quantizes [0,1] linearly to the full
+          // 0..(2^depth-1) code-point range, so the AVIF must declare
+          // full range too. Telling libavif "limited" here would make
+          // decoders re-expand the data and brighten everything.
+          fullRange: true,
         });
         blob = new Blob([new Uint8Array(avif)], { type: 'image/avif' });
         filename = 'pictolab.avif';
