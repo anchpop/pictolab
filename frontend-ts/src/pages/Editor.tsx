@@ -294,6 +294,8 @@ function Editor() {
     handleLRangeChange(snapped);
   };
 
+  type ExportFormat = 'jpeg' | 'avif';
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('jpeg');
   const [downloading, setDownloading] = useState(false);
 
   const handleDownload = async () => {
@@ -313,22 +315,35 @@ function Editor() {
       const outW = dir === 'width' ? target : src.w;
       const outH = dir === 'height' ? target : src.h;
 
-      // 10-bit BT.2020 PQ readback for HDR AVIF.
-      const rgba16 = await wasm.gpu_readback_hdr_pq_u16(10);
-      const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL } = await import('@/lib/avif-hdr');
-      const avif = await encodeAvif(rgba16, outW, outH, {
-        bitDepth: 10,
-        quality: 60,
-        cicpColorPrimaries: CP_BT2020,
-        cicpTransferCharacteristics: TC_PQ,
-        cicpMatrixCoefficients: MC_BT2020_NCL,
-        fullRange: false,
-      });
-      const blob = new Blob([new Uint8Array(avif)], { type: 'image/avif' });
+      let blob: Blob;
+      let filename: string;
+      if (exportFormat === 'jpeg') {
+        // Linear extended Display P3 half-floats → Ultra HDR JPEG.
+        // libultrahdr derives the SDR base + gain map from the HDR input.
+        const f16 = await wasm.gpu_readback_linear_f16();
+        const { encodeUhdr } = await import('@/lib/uhdr');
+        const jpeg = await encodeUhdr(f16, outW, outH);
+        blob = new Blob([new Uint8Array(jpeg)], { type: 'image/jpeg' });
+        filename = 'pictolab.jpg';
+      } else {
+        // 10-bit BT.2020 PQ readback for HDR AVIF.
+        const rgba16 = await wasm.gpu_readback_hdr_pq_u16(10);
+        const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL } = await import('@/lib/avif-hdr');
+        const avif = await encodeAvif(rgba16, outW, outH, {
+          bitDepth: 10,
+          quality: 60,
+          cicpColorPrimaries: CP_BT2020,
+          cicpTransferCharacteristics: TC_PQ,
+          cicpMatrixCoefficients: MC_BT2020_NCL,
+          fullRange: false,
+        });
+        blob = new Blob([new Uint8Array(avif)], { type: 'image/avif' });
+        filename = 'pictolab.avif';
+      }
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = 'pictolab.avif';
+      link.download = filename;
       link.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -411,28 +426,6 @@ function Editor() {
           </div>
           {source && (
             <div className="flex items-center gap-2">
-              <Button
-                variant={showHdr ? 'default' : 'outline'}
-                size="sm"
-                onClick={handleHdrToggle}
-                title="Highlight pixels that exceed SDR (will clip on standard displays)"
-              >
-                <Eye className="mr-1 h-4 w-4" />
-                HDR view
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleDownload}
-                disabled={!ready || downloading}
-              >
-                {downloading ? (
-                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                ) : (
-                  <Download className="mr-1 h-4 w-4" />
-                )}
-                Export AVIF
-              </Button>
               <Button variant="outline" size="sm" onClick={handleNewImage}>
                 <ImagePlus className="mr-1 h-4 w-4" />
                 New image
@@ -494,6 +487,17 @@ function Editor() {
           </div>
         ) : (
           <div className="space-y-4">
+            <Button
+              variant={showHdr ? 'default' : 'outline'}
+              size="sm"
+              className="w-full"
+              onClick={handleHdrToggle}
+              title="Highlight pixels that exceed SDR (will clip on standard displays)"
+            >
+              <Eye className="mr-1 h-4 w-4" />
+              HDR view
+            </Button>
+
             <Card>
               <CardHeader>
                 <CardTitle>Resize</CardTitle>
@@ -673,6 +677,38 @@ function Editor() {
               </CardContent>
             </Card>
 
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  variant={exportFormat === 'jpeg' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setExportFormat('jpeg')}
+                  title="Ultra HDR JPEG (SDR base + gain map). Widely supported."
+                >
+                  JPEG
+                </Button>
+                <Button
+                  variant={exportFormat === 'avif' ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setExportFormat('avif')}
+                  title="10-bit BT.2020 PQ AVIF. Smaller, real HDR."
+                >
+                  AVIF
+                </Button>
+              </div>
+              <Button
+                className="w-full"
+                onClick={handleDownload}
+                disabled={!ready || downloading}
+              >
+                {downloading ? (
+                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="mr-1 h-4 w-4" />
+                )}
+                Export {exportFormat === 'jpeg' ? 'JPEG' : 'AVIF'}
+              </Button>
+            </div>
           </div>
         )}
       </aside>

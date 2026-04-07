@@ -1407,6 +1407,122 @@ fn pq_encode(y: f32) -> f32 {
     ((C1 + C2 * yp) / (1.0 + C3 * yp)).powf(M2)
 }
 
+// Pack a single f32 value back to IEEE 754 half-precision (f16) bits.
+// Round-to-nearest-even, with overflow → ±Inf and subnormal flush-to-zero.
+fn f32_to_f16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+    if exp == 0xFF {
+        // NaN or Inf
+        let m = if mant != 0 { 0x200 } else { 0 };
+        return sign | 0x7C00 | m;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return sign | 0x7C00; // overflow → Inf
+    }
+    if new_exp <= 0 {
+        return sign; // underflow → 0
+    }
+    let mant16 = (mant >> 13) as u16;
+    // round-to-nearest-even on the dropped bits
+    let round_bit = (mant >> 12) & 1;
+    let sticky = (mant & 0xFFF) != 0;
+    let mut out = sign | ((new_exp as u16) << 10) | mant16;
+    if round_bit != 0 && (sticky || (mant16 & 1) != 0) {
+        out = out.wrapping_add(1);
+    }
+    out
+}
+
+// Read back the output texture as raw linear extended Display P3 half-floats
+// (f16 RGBA). Used for the Ultra HDR JPEG export — libultrahdr accepts
+// rgba16float input directly so we just need to undo the sRGB transfer
+// curve we applied in the shader and hand the bytes over verbatim.
+#[wasm_bindgen]
+pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
+    let (device, queue, output_tex, target_w, target_h) =
+        GPU_CTX.with(|c| -> Result<_, JsValue> {
+            let c = c.borrow();
+            let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+            let tex = ctx
+                .output_tex
+                .as_ref()
+                .ok_or_else(|| JsValue::from("no output texture"))?;
+            Ok((
+                ctx.device.clone(),
+                ctx.queue.clone(),
+                tex.clone(),
+                ctx.target_w,
+                ctx.target_h,
+            ))
+        })?;
+
+    let bpp = 8u32;
+    let bytes_per_row_unpadded = target_w * bpp;
+    let bytes_per_row = bytes_per_row_unpadded.div_ceil(256) * 256;
+    let buf_size = bytes_per_row * target_h;
+
+    let staging = create_buffer(&device, buf_size, BUF_MAP_READ | BUF_COPY_DST)?;
+
+    let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
+    let src = js_obj(&[("texture", output_tex)]);
+    let dst = js_obj(&[
+        ("buffer", staging.clone()),
+        ("bytesPerRow", bytes_per_row.into()),
+        ("rowsPerImage", target_h.into()),
+    ]);
+    let extent = js_obj(&[
+        ("width", target_w.into()),
+        ("height", target_h.into()),
+        ("depthOrArrayLayers", 1u32.into()),
+    ]);
+    let copy_fn: Function = js_get(&enc, "copyTextureToBuffer")?.dyn_into()?;
+    Reflect::apply(
+        &copy_fn,
+        &enc,
+        &Array::of3(&src.into(), &dst.into(), &extent.into()),
+    )?;
+    let cmd = js_call0(&enc, "finish")?;
+    js_call1(&queue, "submit", &Array::of1(&cmd))?;
+
+    let map_promise = js_call1(&staging, "mapAsync", &1u32.into())?;
+    js_await(map_promise).await?;
+
+    let mapped = js_call0(&staging, "getMappedRange")?;
+    let raw_view = Uint8Array::new(&mapped);
+    let mut raw = vec![0u8; buf_size as usize];
+    raw_view.copy_to(&mut raw[..]);
+
+    let n = (target_w * target_h) as usize;
+    let mut out = vec![0u8; n * 8]; // f16 RGBA, tight packing
+    for y in 0..target_h {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..target_w {
+            let pix_off = row_start + (x * bpp) as usize;
+            let out_pix = ((y * target_w + x) as usize) * 8;
+            for i in 0..4 {
+                let off = pix_off + i * 2;
+                let h = (raw[off] as u16) | ((raw[off + 1] as u16) << 8);
+                let f = f16_to_f32(h);
+                // Channels 0..2 are RGB — undo sRGB encoding to recover
+                // linear extended Display P3. Alpha is already linear.
+                let lin = if i < 3 { srgb_decode(f) } else { f };
+                let h2 = f32_to_f16(lin);
+                out[out_pix + i * 2] = (h2 & 0xFF) as u8;
+                out[out_pix + i * 2 + 1] = (h2 >> 8) as u8;
+            }
+        }
+    }
+
+    let _ = js_call0(&staging, "unmap");
+    let _ = js_call0(&staging, "destroy");
+
+    Ok(Uint8Array::from(&out[..]))
+}
+
 // Read back the output texture as PQ-encoded BT.2020 16-bit RGB. Used for
 // the HDR AVIF export path. The texture currently stores sRGB-encoded
 // extended-range Display P3 values; we undo the sRGB transfer, convert

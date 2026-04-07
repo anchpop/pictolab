@@ -71,6 +71,8 @@ declare module 'frontend-rs' {
 
   export function gpu_readback_hdr_pq_u16(depth: number): Promise<Uint16Array>;
 
+  export function gpu_readback_linear_f16(): Promise<Uint8Array>;
+
   export function build_carve_lut(
     order: Uint32Array,
     orig_width: number,
