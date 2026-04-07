@@ -160,12 +160,16 @@ function Editor() {
       setTargetW(src.w);
       setTargetH(src.h);
       // Carve is the default mode and needs the seam precompute before
-      // build_carve_lut works. Wait for it instead of showing a squish
-      // first paint — the user explicitly opted into content-aware.
+      // build_carve_lut works. Show the source at its native size as a
+      // first paint (identity Lanczos = the unmodified image, not a
+      // resize fallback) so the canvas isn't blank while we wait. All
+      // resize controls are gated on isPrecomputing.
       if (resizeModeRef.current === 'carve') {
+        wasm.gpu_set_squish_dims(src.w, src.h);
+        setReady(true);
+        requestAnimationFrame(render);
         runPrecompute(src, directionRef.current, () => {
           applyResize();
-          setReady(true);
           render();
         });
       } else {
@@ -903,6 +907,7 @@ function Editor() {
                             value={targetW}
                             min={1}
                             max={source.w}
+                            disabled={isPrecomputing}
                             onChange={(e) => handleTargetWChange(Number(e.target.value))}
                             className="h-6 w-16 px-1.5 py-0 text-right font-mono text-xs"
                           />
@@ -912,6 +917,7 @@ function Editor() {
                           max={source.w}
                           step={1}
                           value={[targetW]}
+                          disabled={isPrecomputing}
                           onValueChange={(v) => handleTargetWChange(v[0])}
                         />
                       </div>
@@ -927,6 +933,7 @@ function Editor() {
                             value={targetH}
                             min={1}
                             max={source.h}
+                            disabled={isPrecomputing}
                             onChange={(e) => handleTargetHChange(Number(e.target.value))}
                             className="h-6 w-16 px-1.5 py-0 text-right font-mono text-xs"
                           />
@@ -936,6 +943,7 @@ function Editor() {
                           max={source.h}
                           step={1}
                           value={[targetH]}
+                          disabled={isPrecomputing}
                           onValueChange={(v) => handleTargetHChange(v[0])}
                         />
                       </div>
