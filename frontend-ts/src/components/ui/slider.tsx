@@ -50,9 +50,13 @@ const Slider = React.forwardRef<
   // tiny. Wrapping in a 36px-tall hit area fixes that.
   const handleWrapPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (disabled) return
-    // If the click landed on the thumb itself, let Radix handle it (drag).
-    const target = e.target as HTMLElement
-    if (target.closest('[role="slider"]')) return
+    // Only handle clicks that land in the empty padding area of the
+    // wrapper — where Radix's own slider doesn't reach. Any click that
+    // hits the Radix Root, track, or thumb has e.target deeper than the
+    // wrap div, and Radix already handles those (and fires onValueChange
+    // + onValueCommit). Manual-handling them too would double-fire and
+    // partially undo the deferred-carve Safari workaround.
+    if (e.target !== e.currentTarget) return
     const w = wrapRef.current
     if (!w) return
     const rect = w.getBoundingClientRect()

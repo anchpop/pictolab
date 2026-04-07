@@ -85,7 +85,10 @@ function orientPackedRgba(
   // Fast paths via typed-array element copies (one indexed assignment per
   // pixel instead of subarray + set, ~5x faster on a 12MP photo). bpp=4 →
   // Uint32 (one element per pixel); bpp=8 → two Uint32 copies per pixel.
-  if (bytesPerPixel === 4 || bytesPerPixel === 8) {
+  // Skip when the source byteOffset isn't 4-aligned: a subarray()-backed
+  // Uint8Array can land on an odd offset, and aliasing it as Uint32Array
+  // would throw. The generic byte loop below handles that case correctly.
+  if ((bytesPerPixel === 4 || bytesPerPixel === 8) && data.byteOffset % 4 === 0) {
     // Vertical flip is just reversed-row-order; pure subarray copies.
     if (orientation === 4) {
       const rowBytes = width * bytesPerPixel;
