@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
 import wasm from "vite-plugin-wasm";
@@ -13,6 +14,7 @@ export default defineConfig({
         plugins: [['babel-plugin-react-compiler']],
       },
     }),
+    tailwindcss(),
     wasm(),
     topLevelAwait(),
   ],
@@ -25,6 +27,7 @@ export default defineConfig({
   resolve: {
     alias: {
       'frontend-rs': path.resolve(__dirname, '../frontend-rs/pkg'),
+      '@': path.resolve(__dirname, './src'),
     },
   },
 })

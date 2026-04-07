@@ -1,8 +1,112 @@
 mod gpu;
 mod utils;
 
-use palette::{IntoColor, Lab, Srgb};
 use wasm_bindgen::prelude::*;
+
+// ── Color space conversion math ─────────────────────────────────────────────
+//
+// All pixel data flowing through the wasm boundary is interpreted as
+// Display P3. The editor reads source pixels via getImageData with
+// `{ colorSpace: 'display-p3' }` and renders the same way.
+//
+// Our perceptual working space is **OKLab** (Björn Ottosson, 2020), which
+// has substantially better hue uniformity than CIELAB — particularly
+// across blues, where CIELAB famously drifts toward purple as L changes.
+//
+// To keep the user-facing slider numbers familiar (L still 0..100, chroma
+// magnitudes around 0..160 like before), we scale OKLab values:
+//   L_scaled = OKLab L * 100
+//   a_scaled = OKLab a * 400
+//   b_scaled = OKLab b * 400
+// so chroma magnitudes line up with the previous CIELAB-shaped pipeline.
+
+const L_SCALE: f32 = 100.0;
+const AB_SCALE: f32 = 400.0;
+
+// Linear Display P3 → LMS, precomputed as M_xyz_to_lms · M_p3_to_xyz.
+const M_P3_TO_LMS: [[f32; 3]; 3] = [
+    [0.4813371, 0.4620734, 0.0565038],
+    [0.2288498, 0.6532486, 0.1179665],
+    [0.0839833, 0.2242765, 0.6922382],
+];
+
+// LMS → linear Display P3, precomputed as M_xyz_to_p3 · M_lms_to_xyz.
+const M_LMS_TO_P3: [[f32; 3]; 3] = [
+    [3.1280366, -2.2571161, 0.1292834],
+    [-1.0911312, 2.4133403, -0.3221775],
+    [-0.0260093, -0.5080364, 1.5332833],
+];
+
+#[inline]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Convert a single Display P3 RGB byte triple to scaled OKLab
+/// (L*100, a*400, b*400).
+fn rgb_bytes_to_lab(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let lr = srgb_to_linear(r as f32 / 255.0);
+    let lg = srgb_to_linear(g as f32 / 255.0);
+    let lb = srgb_to_linear(b as f32 / 255.0);
+
+    // Linear P3 → LMS
+    let l = M_P3_TO_LMS[0][0] * lr + M_P3_TO_LMS[0][1] * lg + M_P3_TO_LMS[0][2] * lb;
+    let m = M_P3_TO_LMS[1][0] * lr + M_P3_TO_LMS[1][1] * lg + M_P3_TO_LMS[1][2] * lb;
+    let s = M_P3_TO_LMS[2][0] * lr + M_P3_TO_LMS[2][1] * lg + M_P3_TO_LMS[2][2] * lb;
+
+    // Nonlinear LMS' (cube root)
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
+
+    // LMS' → OKLab
+    let big_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    let aa = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    let bb = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+
+    (big_l * L_SCALE, aa * AB_SCALE, bb * AB_SCALE)
+}
+
+/// Convert scaled OKLab back to a clamped 8-bit Display P3 RGB triple.
+fn lab_to_rgb_bytes(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
+    let big_l = l / L_SCALE;
+    let aa = a / AB_SCALE;
+    let bb = b / AB_SCALE;
+
+    // OKLab → LMS'
+    let l_ = big_l + 0.3963377774 * aa + 0.2158037573 * bb;
+    let m_ = big_l - 0.1055613458 * aa - 0.0638541728 * bb;
+    let s_ = big_l - 0.0894841775 * aa - 1.2914855480 * bb;
+
+    // LMS (cube)
+    let lin_l = l_ * l_ * l_;
+    let lin_m = m_ * m_ * m_;
+    let lin_s = s_ * s_ * s_;
+
+    // LMS → linear P3
+    let lr = M_LMS_TO_P3[0][0] * lin_l + M_LMS_TO_P3[0][1] * lin_m + M_LMS_TO_P3[0][2] * lin_s;
+    let lg = M_LMS_TO_P3[1][0] * lin_l + M_LMS_TO_P3[1][1] * lin_m + M_LMS_TO_P3[1][2] * lin_s;
+    let lb = M_LMS_TO_P3[2][0] * lin_l + M_LMS_TO_P3[2][1] * lin_m + M_LMS_TO_P3[2][2] * lin_s;
+
+    (
+        (linear_to_srgb(lr.clamp(0.0, 1.0)) * 255.0).round() as u8,
+        (linear_to_srgb(lg.clamp(0.0, 1.0)) * 255.0).round() as u8,
+        (linear_to_srgb(lb.clamp(0.0, 1.0)) * 255.0).round() as u8,
+    )
+}
 
 /// Precompute seam removal order using forward energy in LAB color space.
 /// Returns a u32 array of size width*height where each value is the step at which
@@ -47,15 +151,19 @@ pub fn precompute_seam_order(
 
 fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> {
     // Convert to LAB, row-based for efficient removal
-    let mut rows: Vec<Vec<Lab>> = Vec::with_capacity(h);
+    // Convert each pixel to scaled OKLab once. OKLab gives a much
+    // better perceptual distance for the energy function — particularly
+    // around blues, where CIELAB drifts in hue.
+    let mut rows: Vec<Vec<(f32, f32, f32)>> = Vec::with_capacity(h);
     for y in 0..h {
         let mut row = Vec::with_capacity(w);
         for x in 0..w {
             let i = (y * w + x) * 4;
-            let r = image_data[i] as f32 / 255.0;
-            let g = image_data[i + 1] as f32 / 255.0;
-            let b = image_data[i + 2] as f32 / 255.0;
-            row.push(Srgb::new(r, g, b).into_color());
+            row.push(rgb_bytes_to_lab(
+                image_data[i],
+                image_data[i + 1],
+                image_data[i + 2],
+            ));
         }
         rows.push(row);
     }
@@ -78,15 +186,15 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
 
         // Helper: compute C_U(x, y) = D[(x-1, y), (x+1, y)]
         // At boundaries, replace out-of-bounds pixel with current pixel
-        let compute_c_u = |row: &[Lab], x: usize, w: usize| -> f32 {
+        let compute_c_u = |row: &[(f32, f32, f32)], x: usize, w: usize| -> f32 {
             if w <= 1 {
                 0.0
             } else if x > 0 && x < w - 1 {
-                lab_dist(&row[x - 1], &row[x + 1])
+                lab_dist(row[x - 1], row[x + 1])
             } else if x == 0 {
-                lab_dist(&row[0], &row[1])
+                lab_dist(row[0], row[1])
             } else {
-                lab_dist(&row[w - 2], &row[w - 1])
+                lab_dist(row[w - 2], row[w - 1])
             }
         };
 
@@ -101,14 +209,14 @@ fn precompute_vertical_order(image_data: &[u8], w: usize, h: usize) -> Vec<u32> 
 
                 // C_L(x, y) = C_U(x, y) + D[(x, y-1), (x-1, y)]
                 let c_l = if x > 0 {
-                    c_u + lab_dist(&rows[y - 1][x], &rows[y][x - 1])
+                    c_u + lab_dist(rows[y - 1][x], rows[y][x - 1])
                 } else {
                     f32::MAX / 2.0
                 };
 
                 // C_R(x, y) = C_U(x, y) + D[(x, y-1), (x+1, y)]
                 let c_r = if x < cur_w - 1 {
-                    c_u + lab_dist(&rows[y - 1][x], &rows[y][x + 1])
+                    c_u + lab_dist(rows[y - 1][x], rows[y][x + 1])
                 } else {
                     f32::MAX / 2.0
                 };
@@ -243,199 +351,162 @@ pub fn render_seam_carved(
     }
 }
 
-/// Euclidean distance between two LAB colors
-fn lab_dist(a: &Lab, b: &Lab) -> f32 {
-    let dl = a.l - b.l;
-    let da = a.a - b.a;
-    let db = a.b - b.b;
+/// Euclidean distance between two scaled OKLab colors
+fn lab_dist(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let dl = a.0 - b.0;
+    let da = a.1 - b.1;
+    let db = a.2 - b.2;
     (dl * dl + da * da + db * db).sqrt()
 }
 
+/// Encode an RGBA byte buffer as a PNG with the Display P3 ICC profile
+/// embedded via an iCCP chunk so that color-managed viewers render the
+/// pixels in the wide gamut they were authored in. Pixels are written
+/// as-is — no color conversion happens here, since the buffer is already
+/// in the target working space.
 #[wasm_bindgen]
-pub fn invert_lightness_lab(image_data: &[u8], _width: u32, _height: u32) -> Vec<u8> {
-    // Initialize panic hook for better error messages in console
+pub fn encode_png(image_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsValue> {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
 
-    let mut output = Vec::with_capacity(image_data.len());
+    // Display P3 ICC profile shipped with macOS. Copied verbatim from
+    // /System/Library/ColorSync/Profiles/Display P3.icc.
+    const P3_ICC: &[u8] = include_bytes!("display_p3.icc");
 
-    // Process each pixel
-    for i in (0..image_data.len()).step_by(4) {
-        let r = image_data[i] as f32 / 255.0;
-        let g = image_data[i + 1] as f32 / 255.0;
-        let b = image_data[i + 2] as f32 / 255.0;
-        let a = image_data[i + 3];
-
-        // Convert RGB to LAB
-        let rgb = Srgb::new(r, g, b);
-        let mut lab: Lab = rgb.into_color();
-
-        // Invert the lightness channel (L ranges from 0 to 100)
-        lab.l = 100.0 - lab.l;
-
-        // Convert back to RGB
-        let rgb_out: Srgb = lab.into_color();
-
-        // Clamp and convert back to u8
-        output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push(a); // Keep alpha unchanged
+    // Build the iCCP chunk content per PNG spec:
+    //   profile name (Latin-1, 1..=79 bytes) + 0x00 + compression method (0)
+    //   + zlib-compressed profile.
+    let mut iccp = Vec::with_capacity(P3_ICC.len() + 16);
+    iccp.extend_from_slice(b"Display P3");
+    iccp.push(0); // null terminator after the profile name
+    iccp.push(0); // compression method: zlib
+    {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        let mut z = ZlibEncoder::new(&mut iccp, Compression::default());
+        z.write_all(P3_ICC)
+            .map_err(|e| JsValue::from_str(&format!("zlib: {e}")))?;
+        z.finish()
+            .map_err(|e| JsValue::from_str(&format!("zlib finish: {e}")))?;
     }
 
-    output
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| JsValue::from_str(&format!("png header: {e}")))?;
+        // iCCP must come before IDAT — write_chunk inserts at the current
+        // position, which after write_header is right before the first IDAT.
+        writer
+            .write_chunk(png::chunk::iCCP, &iccp)
+            .map_err(|e| JsValue::from_str(&format!("png iccp chunk: {e}")))?;
+        writer
+            .write_image_data(image_data)
+            .map_err(|e| JsValue::from_str(&format!("png data: {e}")))?;
+    }
+    Ok(buf)
+}
+
+/// Linearly remap LAB lightness and chroma in a single pass.
+///
+/// - Lightness: input L in [0, 100] is mapped linearly to [l_min, l_max].
+///   Defaults of (0, 100) are identity. (100, 0) inverts. (avg, avg) flattens.
+/// - Chroma: input chroma magnitude (sqrt(a² + b²)) is rescaled by a factor
+///   that linearly interpolates between c_min/100 (at chroma=0) and c_max/100
+///   (at chroma=128, the practical sRGB max). Defaults of (0, 100) are identity
+///   in the sense that c_max=100 means "100% of original" — the c_min knob lets
+///   you bias the rescale toward desaturating darker chromas independently.
+///   To desaturate fully use (0, 0); to boost use (0, 200); etc.
+/// Build a 101-bin histogram of L* values across the image (one bin per
+/// integer L from 0 to 100) and a 161-bin histogram of chroma magnitudes
+/// (sqrt(a² + b²)) clamped into 0..160. Returned as one flat array of
+/// length 262 (101 + 161); the L bins come first, then the C bins.
+///
+/// The chroma range goes to 160 instead of 128 because Display P3's
+/// gamut reaches further into Lab chroma than sRGB does (the most
+/// saturated P3 reds/greens land around c≈140–150).
+#[wasm_bindgen]
+pub fn compute_lc_histogram(image_data: &[u8]) -> Vec<u32> {
+    #[cfg(feature = "console_error_panic_hook")]
+    console_error_panic_hook::set_once();
+
+    let mut hist = vec![0u32; 101 + 161];
+    for i in (0..image_data.len()).step_by(4) {
+        let (l, a, b) = rgb_bytes_to_lab(image_data[i], image_data[i + 1], image_data[i + 2]);
+        let l_bin = l.round().clamp(0.0, 100.0) as usize;
+        let chroma = (a * a + b * b).sqrt();
+        let c_bin = chroma.round().clamp(0.0, 160.0) as usize;
+        hist[l_bin] += 1;
+        hist[101 + c_bin] += 1;
+    }
+    hist
 }
 
 #[wasm_bindgen]
-pub fn equalize_lightness_lab(image_data: &[u8], _width: u32, _height: u32) -> Vec<u8> {
-    // Initialize panic hook for better error messages in console
+pub fn remap_lab(
+    image_data: &[u8],
+    _width: u32,
+    _height: u32,
+    l_min: f32,
+    l_max: f32,
+    c_min: f32,
+    c_max: f32,
+    hue_deg: f32,
+) -> Vec<u8> {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
 
-    // First pass: compute average lightness
-    let mut total_lightness = 0.0;
-    let pixel_count = image_data.len() / 4;
+    let l_scale = (l_max - l_min) / 100.0;
+    let c_min_n = c_min / 100.0;
+    let c_max_n = c_max / 100.0;
+    let c_diff_n = c_max_n - c_min_n;
+    // Reference chroma magnitude for "100% chroma" — chosen to match
+    // Display P3's practical maximum in our scaled OKLab units.
+    const C_REF: f32 = 160.0;
 
-    for i in (0..image_data.len()).step_by(4) {
-        let r = image_data[i] as f32 / 255.0;
-        let g = image_data[i + 1] as f32 / 255.0;
-        let b = image_data[i + 2] as f32 / 255.0;
+    let hue_rad = hue_deg.to_radians();
+    let cos_h = hue_rad.cos();
+    let sin_h = hue_rad.sin();
 
-        let rgb = Srgb::new(r, g, b);
-        let lab: Lab = rgb.into_color();
-        total_lightness += lab.l;
-    }
-
-    let avg_lightness = total_lightness / pixel_count as f32;
-
-    // Second pass: set all pixels to average lightness
     let mut output = Vec::with_capacity(image_data.len());
 
     for i in (0..image_data.len()).step_by(4) {
-        let r = image_data[i] as f32 / 255.0;
-        let g = image_data[i + 1] as f32 / 255.0;
-        let b = image_data[i + 2] as f32 / 255.0;
-        let a = image_data[i + 3];
+        let (mut l, mut a, mut b) =
+            rgb_bytes_to_lab(image_data[i], image_data[i + 1], image_data[i + 2]);
+        let alpha = image_data[i + 3];
 
-        // Convert RGB to LAB
-        let rgb = Srgb::new(r, g, b);
-        let mut lab: Lab = rgb.into_color();
+        // Lightness remap.
+        l = l_min + l * l_scale;
 
-        // Set lightness to average
-        lab.l = avg_lightness;
-
-        // Convert back to RGB
-        let rgb_out: Srgb = lab.into_color();
-
-        // Clamp and convert back to u8
-        output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push(a); // Keep alpha unchanged
-    }
-
-    output
-}
-
-#[wasm_bindgen]
-pub fn laberation(image_data: &[u8], width: u32, height: u32, offset: i32) -> Vec<u8> {
-    // Initialize panic hook for better error messages in console
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
-
-    let width = width as usize;
-    let height = height as usize;
-
-    // First pass: convert all pixels to LAB and store in separate channel arrays
-    let mut l_channel = vec![0.0_f32; width * height];
-    let mut a_channel = vec![0.0_f32; width * height];
-    let mut b_channel = vec![0.0_f32; width * height];
-    let mut alpha_channel = vec![0_u8; width * height];
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) * 4;
-            let pixel_idx = y * width + x;
-
-            let r = image_data[idx] as f32 / 255.0;
-            let g = image_data[idx + 1] as f32 / 255.0;
-            let b = image_data[idx + 2] as f32 / 255.0;
-
-            let rgb = Srgb::new(r, g, b);
-            let lab: Lab = rgb.into_color();
-
-            l_channel[pixel_idx] = lab.l;
-            a_channel[pixel_idx] = lab.a;
-            b_channel[pixel_idx] = lab.b;
-            alpha_channel[pixel_idx] = image_data[idx + 3];
+        // Chroma remap — parallel to L: input chroma magnitude (treated
+        // as 0..1 against C_REF) is mapped linearly to [c_min_n, c_max_n],
+        // and a/b are scaled so the resulting magnitude matches.
+        // Skip near-zero chromas where the hue direction is undefined.
+        let chroma = (a * a + b * b).sqrt();
+        if chroma > 0.5 {
+            let chroma_norm = chroma / C_REF;
+            let out_chroma_norm = c_min_n + c_diff_n * chroma_norm;
+            let factor = (out_chroma_norm * C_REF) / chroma;
+            a *= factor;
+            b *= factor;
         }
-    }
 
-    // Second pass: reconstruct image with offset channels
-    let mut output = Vec::with_capacity(image_data.len());
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel_idx = y * width + x;
-
-            // Sample L channel offset directly down
-            let l_y = ((y as i32 + offset).max(0).min(height as i32 - 1)) as usize;
-            let l_idx = l_y * width + x;
-            let l = l_channel[l_idx];
-
-            // Sample A channel offset up and to the right
-            let a_x = ((x as i32 + offset).max(0).min(width as i32 - 1)) as usize;
-            let a_y = ((y as i32 - offset).max(0).min(height as i32 - 1)) as usize;
-            let a_idx = a_y * width + a_x;
-            let a = a_channel[a_idx];
-
-            // Sample B channel offset up and to the left
-            let b_x = ((x as i32 - offset).max(0).min(width as i32 - 1)) as usize;
-            let b_y = ((y as i32 - offset).max(0).min(height as i32 - 1)) as usize;
-            let b_idx = b_y * width + b_x;
-            let b = b_channel[b_idx];
-
-            // Reconstruct LAB color
-            let lab = Lab::new(l, a, b);
-            let rgb_out: Srgb = lab.into_color();
-
-            // Clamp and convert back to u8
-            output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
-            output.push(alpha_channel[pixel_idx]);
+        // Hue rotation — rotate the (a, b) vector by hue_deg around origin.
+        if hue_deg != 0.0 {
+            let new_a = a * cos_h - b * sin_h;
+            let new_b = a * sin_h + b * cos_h;
+            a = new_a;
+            b = new_b;
         }
-    }
 
-    output
-}
-
-#[wasm_bindgen]
-pub fn boost_chroma_lab(image_data: &[u8], _width: u32, _height: u32, factor: f32) -> Vec<u8> {
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
-
-    let mut output = Vec::with_capacity(image_data.len());
-
-    for i in (0..image_data.len()).step_by(4) {
-        let r = image_data[i] as f32 / 255.0;
-        let g = image_data[i + 1] as f32 / 255.0;
-        let b = image_data[i + 2] as f32 / 255.0;
-        let a = image_data[i + 3];
-
-        let rgb = Srgb::new(r, g, b);
-        let mut lab: Lab = rgb.into_color();
-
-        // Scale the A and B channels to boost chroma
-        lab.a *= factor;
-        lab.b *= factor;
-
-        let rgb_out: Srgb = lab.into_color();
-
-        output.push((rgb_out.red.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.green.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push((rgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8);
-        output.push(a);
+        let (r, g, b8) = lab_to_rgb_bytes(l, a, b);
+        output.push(r);
+        output.push(g);
+        output.push(b8);
+        output.push(alpha);
     }
 
     output

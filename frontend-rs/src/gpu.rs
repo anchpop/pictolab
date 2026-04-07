@@ -1,4 +1,5 @@
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint32Array, Uint8Array};
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -170,9 +171,8 @@ fn srgb_to_linear(c: f32) -> f32 {{
   return pow((c + 0.055) / 1.055, 2.4);
 }}
 
-fn lab_f(t: f32) -> f32 {{
-  if (t > 216.0 / 24389.0) {{ return pow(t, 1.0 / 3.0); }}
-  return (24389.0 / 27.0 * t + 16.0) / 116.0;
+fn cbrt_signed(x: f32) -> f32 {{
+  return sign(x) * pow(abs(x), 1.0 / 3.0);
 }}
 
 @compute @workgroup_size(256)
@@ -183,11 +183,22 @@ fn convert(@builtin(global_invocation_id) gid: vec3u) {{
   let lr = srgb_to_linear(f32(p & 0xFFu) / 255.0);
   let lg = srgb_to_linear(f32((p >> 8u) & 0xFFu) / 255.0);
   let lb = srgb_to_linear(f32((p >> 16u) & 0xFFu) / 255.0);
-  let x = 0.4124564*lr + 0.3575761*lg + 0.1804375*lb;
-  let y = 0.2126729*lr + 0.7151522*lg + 0.0721750*lb;
-  let z = 0.0193339*lr + 0.1191920*lg + 0.9503041*lb;
-  let fx = lab_f(x / 0.95047); let fy = lab_f(y); let fz = lab_f(z / 1.08883);
-  lab_out[idx] = vec4f(116.0*fy - 16.0, 500.0*(fx - fy), 200.0*(fy - fz), 0.0);
+
+  // Linear Display P3 → LMS (precomputed M_xyz_to_lms · M_p3_to_xyz).
+  let lms_l = 0.4813371*lr + 0.4620734*lg + 0.0565038*lb;
+  let lms_m = 0.2288498*lr + 0.6532486*lg + 0.1179665*lb;
+  let lms_s = 0.0839833*lr + 0.2242765*lg + 0.6922382*lb;
+
+  let l_ = cbrt_signed(lms_l);
+  let m_ = cbrt_signed(lms_m);
+  let s_ = cbrt_signed(lms_s);
+
+  // OKLab, scaled to (L*100, a*400, b*400) so distances line up with
+  // the historical CIELAB-shaped energy magnitudes.
+  let big_l = (0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_) * 100.0;
+  let aa    = (1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_) * 400.0;
+  let bb    = (0.0259040371*l_ + 0.7827717662*m_ - 0.8086757660*s_) * 400.0;
+  lab_out[idx] = vec4f(big_l, aa, bb, 0.0);
 }}
 "#
     )
@@ -511,4 +522,341 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     }
 
     Ok(order)
+}
+
+// ── GPU LAB remap ───────────────────────────────────────────────────────────
+//
+// A persistent compute context kept across calls so that L/C slider drags
+// only need to upload 16 bytes of params + dispatch + read back, instead of
+// recreating the device/pipeline each time. The source RGBA is uploaded once
+// per image via `remap_lab_gpu_set_source`.
+
+const BUF_UNIFORM: u32 = 64;
+
+struct RemapCtx {
+    device: JsValue,
+    queue: JsValue,
+    pipeline: JsValue,
+    in_buf: JsValue,
+    out_buf: JsValue,
+    params_buf: JsValue,
+    read_buf: JsValue,
+    bind_group: JsValue,
+    w: u32,
+    h: u32,
+    n: u32,
+}
+
+thread_local! {
+    static REMAP_CTX: RefCell<Option<RemapCtx>> = const { RefCell::new(None) };
+}
+
+fn remap_shader() -> &'static str {
+    r#"
+struct Params {
+  l_min: f32,
+  l_max: f32,
+  c_min: f32,
+  c_max: f32,
+  hue_cos: f32,
+  hue_sin: f32,
+  _pad0: f32,
+  _pad1: f32,
+}
+
+@group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
+@group(0) @binding(1) var<storage, read_write> rgba_out: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn srgb_to_linear(c: f32) -> f32 {
+  if (c <= 0.04045) { return c / 12.92; }
+  return pow((c + 0.055) / 1.055, 2.4);
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+  if (c <= 0.0031308) { return 12.92 * c; }
+  return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// Cube root that preserves sign for negative inputs (which can occur for
+// out-of-gamut LMS values when extrapolating boosts).
+fn cbrt_signed(x: f32) -> f32 {
+  return sign(x) * pow(abs(x), 1.0 / 3.0);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  let n = arrayLength(&rgba_in);
+  if (idx >= n) { return; }
+
+  let p = rgba_in[idx];
+  let r8 = f32(p & 0xFFu) / 255.0;
+  let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
+  let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
+  let a8 = (p >> 24u) & 0xFFu;
+
+  let lr = srgb_to_linear(r8);
+  let lg = srgb_to_linear(g8);
+  let lb = srgb_to_linear(b8);
+
+  // Linear Display P3 → LMS (precomputed M_xyz_to_lms · M_p3_to_xyz).
+  let lms_l = 0.4813371 * lr + 0.4620734 * lg + 0.0565038 * lb;
+  let lms_m = 0.2288498 * lr + 0.6532486 * lg + 0.1179665 * lb;
+  let lms_s = 0.0839833 * lr + 0.2242765 * lg + 0.6922382 * lb;
+
+  // Nonlinear LMS' (cube root)
+  let l_ = cbrt_signed(lms_l);
+  let m_ = cbrt_signed(lms_m);
+  let s_ = cbrt_signed(lms_s);
+
+  // LMS' → OKLab, then scale to match the historical 0..100 / 0..160 ranges.
+  var L = (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_) * 100.0;
+  var A = (1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_) * 400.0;
+  var B = (0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_) * 400.0;
+
+  let l_scale = (params.l_max - params.l_min) / 100.0;
+  L = params.l_min + L * l_scale;
+
+  let chroma = sqrt(A * A + B * B);
+  if (chroma > 0.5) {
+    let chroma_norm = chroma / 160.0;
+    let c_min_n = params.c_min / 100.0;
+    let c_max_n = params.c_max / 100.0;
+    let out_chroma_norm = c_min_n + (c_max_n - c_min_n) * chroma_norm;
+    let factor = (out_chroma_norm * 160.0) / chroma;
+    A = A * factor;
+    B = B * factor;
+  }
+
+  // Hue rotation: rotate (A, B) by the precomputed cos/sin pair.
+  let new_a = A * params.hue_cos - B * params.hue_sin;
+  let new_b = A * params.hue_sin + B * params.hue_cos;
+  A = new_a;
+  B = new_b;
+
+  // Unscale and invert OKLab.
+  let big_l = L / 100.0;
+  let aa = A / 400.0;
+  let bb = B / 400.0;
+  let l2_ = big_l + 0.3963377774 * aa + 0.2158037573 * bb;
+  let m2_ = big_l - 0.1055613458 * aa - 0.0638541728 * bb;
+  let s2_ = big_l - 0.0894841775 * aa - 1.2914855480 * bb;
+
+  let lin_l = l2_ * l2_ * l2_;
+  let lin_m = m2_ * m2_ * m2_;
+  let lin_s = s2_ * s2_ * s2_;
+
+  // LMS → linear Display P3 (precomputed M_xyz_to_p3 · M_lms_to_xyz).
+  let lr2 =  3.1280366 * lin_l - 2.2571161 * lin_m + 0.1292834 * lin_s;
+  let lg2 = -1.0911312 * lin_l + 2.4133403 * lin_m - 0.3221775 * lin_s;
+  let lb2 = -0.0260093 * lin_l - 0.5080364 * lin_m + 1.5332833 * lin_s;
+
+  let r2 = u32(clamp(linear_to_srgb(lr2), 0.0, 1.0) * 255.0 + 0.5);
+  let g2 = u32(clamp(linear_to_srgb(lg2), 0.0, 1.0) * 255.0 + 0.5);
+  let b2 = u32(clamp(linear_to_srgb(lb2), 0.0, 1.0) * 255.0 + 0.5);
+
+  rgba_out[idx] = r2 | (g2 << 8u) | (b2 << 16u) | (a8 << 24u);
+}
+"#
+}
+
+async fn create_remap_ctx(w: u32, h: u32) -> Result<RemapCtx, JsValue> {
+    let n = w * h;
+
+    let nav = js_get(&js_sys::global(), "navigator")?;
+    let gpu = js_get(&nav, "gpu")?;
+    if gpu.is_undefined() || gpu.is_null() {
+        return Err("WebGPU not available".into());
+    }
+    let adapter = js_await(js_call0(&gpu, "requestAdapter")?).await?;
+    if adapter.is_null() || adapter.is_undefined() {
+        return Err("No GPU adapter".into());
+    }
+    let max_storage = js_get(&js_get(&adapter, "limits")?, "maxStorageBufferBindingSize")?
+        .as_f64()
+        .unwrap_or(134217728.0);
+    let required_limits = js_obj(&[(
+        "maxStorageBufferBindingSize",
+        JsValue::from_f64(max_storage),
+    )]);
+    let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
+    let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
+    let queue = js_get(&device, "queue")?;
+
+    let shader = create_shader(&device, remap_shader())?;
+
+    // Bind group layout: in (read-only storage), out (storage), params (uniform)
+    let bgl = {
+        let entries = Array::new();
+        // binding 0: read-only storage
+        entries.push(&js_obj(&[
+            ("binding", 0u32.into()),
+            ("visibility", SHADER_COMPUTE.into()),
+            (
+                "buffer",
+                js_obj(&[("type", "read-only-storage".into())]).into(),
+            ),
+        ]));
+        // binding 1: storage
+        entries.push(&js_obj(&[
+            ("binding", 1u32.into()),
+            ("visibility", SHADER_COMPUTE.into()),
+            ("buffer", js_obj(&[("type", "storage".into())]).into()),
+        ]));
+        // binding 2: uniform
+        entries.push(&js_obj(&[
+            ("binding", 2u32.into()),
+            ("visibility", SHADER_COMPUTE.into()),
+            ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+        ]));
+        js_call1(
+            &device,
+            "createBindGroupLayout",
+            &js_obj(&[("entries", entries.into())]),
+        )?
+    };
+
+    let pl_layout = {
+        let layouts = Array::of1(&bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let pipeline = create_pipeline(&device, &pl_layout, &shader, "main")?;
+
+    let in_buf = create_buffer(&device, n * 4, BUF_STORAGE | BUF_COPY_DST)?;
+    let out_buf = create_buffer(&device, n * 4, BUF_STORAGE | BUF_COPY_SRC)?;
+    // 8 f32 params (l_min, l_max, c_min, c_max, hue_cos, hue_sin, _pad, _pad)
+    // = 32 bytes. Padded to 32 because WGSL uniform structs have 16-byte
+    // alignment requirements that this lines up with naturally.
+    let params_buf = create_buffer(&device, 32, BUF_UNIFORM | BUF_COPY_DST)?;
+    let read_buf = create_buffer(&device, n * 4, BUF_MAP_READ | BUF_COPY_DST)?;
+
+    let bind_group = create_bind_group(&device, &bgl, &[&in_buf, &out_buf, &params_buf])?;
+
+    Ok(RemapCtx {
+        device,
+        queue,
+        pipeline,
+        in_buf,
+        out_buf,
+        params_buf,
+        read_buf,
+        bind_group,
+        w,
+        h,
+        n,
+    })
+}
+
+fn destroy_ctx(ctx: &RemapCtx) {
+    for buf in [
+        &ctx.in_buf,
+        &ctx.out_buf,
+        &ctx.params_buf,
+        &ctx.read_buf,
+    ] {
+        let _ = js_call0(buf, "destroy");
+    }
+}
+
+#[wasm_bindgen]
+pub async fn remap_lab_gpu_set_source(
+    image_data: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<(), JsValue> {
+    let needs_recreate = REMAP_CTX.with(|c| match &*c.borrow() {
+        Some(ctx) => ctx.w != w || ctx.h != h,
+        None => true,
+    });
+    if needs_recreate {
+        REMAP_CTX.with(|c| {
+            if let Some(old) = c.borrow_mut().take() {
+                destroy_ctx(&old);
+            }
+        });
+        let ctx = create_remap_ctx(w, h).await?;
+        REMAP_CTX.with(|c| *c.borrow_mut() = Some(ctx));
+    }
+
+    let (queue, in_buf) = REMAP_CTX.with(|c| -> Result<(JsValue, JsValue), JsValue> {
+        let c = c.borrow();
+        let ctx = c.as_ref().ok_or_else(|| JsValue::from("no remap ctx"))?;
+        Ok((ctx.queue.clone(), ctx.in_buf.clone()))
+    })?;
+    write_buffer_u8(&queue, &in_buf, image_data)?;
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub async fn remap_lab_gpu_apply(
+    l_min: f32,
+    l_max: f32,
+    c_min: f32,
+    c_max: f32,
+    hue_deg: f32,
+) -> Result<Vec<u8>, JsValue> {
+    let (device, queue, pipeline, params_buf, bind_group, out_buf, read_buf, n) =
+        REMAP_CTX.with(|c| -> Result<_, JsValue> {
+            let c = c.borrow();
+            let ctx = c.as_ref().ok_or_else(|| JsValue::from("no remap ctx"))?;
+            Ok((
+                ctx.device.clone(),
+                ctx.queue.clone(),
+                ctx.pipeline.clone(),
+                ctx.params_buf.clone(),
+                ctx.bind_group.clone(),
+                ctx.out_buf.clone(),
+                ctx.read_buf.clone(),
+                ctx.n,
+            ))
+        })?;
+
+    // Write 8 f32 params (32 bytes) — l/c min/max, then precomputed
+    // cos/sin of the hue rotation, then two padding floats so the struct
+    // is a clean two-vec4 layout.
+    let hue_rad = hue_deg.to_radians();
+    let params = [
+        l_min,
+        l_max,
+        c_min,
+        c_max,
+        hue_rad.cos(),
+        hue_rad.sin(),
+        0.0,
+        0.0,
+    ];
+    let params_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 32) };
+    write_buffer_u8(&queue, &params_buf, params_bytes)?;
+
+    // Encode + dispatch + copy out → read.
+    let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
+    dispatch(&enc, &pipeline, &bind_group, n.div_ceil(256))?;
+    let copy_fn: Function = js_get(&enc, "copyBufferToBuffer")?.dyn_into()?;
+    let args = Array::of5(&out_buf, &0.into(), &read_buf, &0.into(), &(n * 4).into());
+    Reflect::apply(&copy_fn, &enc, &args)?;
+    let cmd = js_call0(&enc, "finish")?;
+    js_call1(&queue, "submit", &Array::of1(&cmd))?;
+
+    js_await(js_call1(&read_buf, "mapAsync", &1.into())?).await?;
+    let mapped = js_call0(&read_buf, "getMappedRange")?;
+    let arr = Uint8Array::new(&mapped);
+    let result: Vec<u8> = arr.to_vec();
+    js_call0(&read_buf, "unmap")?;
+
+    Ok(result)
+}
+
+#[wasm_bindgen]
+pub fn remap_lab_gpu_dispose() {
+    REMAP_CTX.with(|c| {
+        if let Some(old) = c.borrow_mut().take() {
+            destroy_ctx(&old);
+        }
+    });
 }

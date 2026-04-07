@@ -1,21 +1,21 @@
 declare module 'frontend-rs' {
-  export function invert_lightness_lab(
+  export function compute_lc_histogram(image_data: Uint8Array): Uint32Array;
+
+  export function encode_png(
     image_data: Uint8Array,
     width: number,
     height: number
   ): Uint8Array;
 
-  export function equalize_lightness_lab(
-    image_data: Uint8Array,
-    width: number,
-    height: number
-  ): Uint8Array;
-
-  export function laberation(
+  export function remap_lab(
     image_data: Uint8Array,
     width: number,
     height: number,
-    offset: number
+    l_min: number,
+    l_max: number,
+    c_min: number,
+    c_max: number,
+    hue_deg: number
   ): Uint8Array;
 
   export function precompute_seam_order(
@@ -34,19 +34,28 @@ declare module 'frontend-rs' {
     direction: number
   ): Uint8Array;
 
-  export function boost_chroma_lab(
-    image_data: Uint8Array,
-    width: number,
-    height: number,
-    factor: number
-  ): Uint8Array;
-
   export function precompute_seam_order_gpu(
     image_data: Uint8Array,
     width: number,
     height: number,
     direction: number
   ): Promise<Uint32Array>;
+
+  export function remap_lab_gpu_set_source(
+    image_data: Uint8Array,
+    width: number,
+    height: number
+  ): Promise<void>;
+
+  export function remap_lab_gpu_apply(
+    l_min: number,
+    l_max: number,
+    c_min: number,
+    c_max: number,
+    hue_deg: number
+  ): Promise<Uint8Array>;
+
+  export function remap_lab_gpu_dispose(): void;
 
   export function is_webgpu_available(): boolean;
 }
