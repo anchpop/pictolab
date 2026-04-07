@@ -820,10 +820,18 @@ function Editor() {
                 </div>
               )}
               <div
-                className="relative max-h-[75vh] rounded-lg border border-border bg-card shadow-sm"
+                className="relative max-h-[75vh] overflow-hidden rounded-lg border border-border shadow-sm"
                 style={{
                   aspectRatio: `${source.w} / ${source.h}`,
                   height: 'min(75vh, 80vw)',
+                  // Checkerboard so transparent pixels are obvious as
+                  // such instead of getting blended with the (white)
+                  // card background.
+                  backgroundColor: '#ffffff',
+                  backgroundImage:
+                    'linear-gradient(45deg, #d8d8d8 25%, transparent 25%), linear-gradient(-45deg, #d8d8d8 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #d8d8d8 75%), linear-gradient(-45deg, transparent 75%, #d8d8d8 75%)',
+                  backgroundSize: '16px 16px',
+                  backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0',
                 }}
               >
                 <canvas
@@ -1136,7 +1144,7 @@ function Editor() {
                 ]}
               />
               {exportFormat === 'jpeg' && source.hasAlpha && (
-                <p className="text-[11px] leading-snug text-amber-500">
+                <p className="rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900">
                   This image has transparency, which JPEG can't store —
                   transparent pixels will be flattened to a background
                   color. Use AVIF to preserve alpha.
