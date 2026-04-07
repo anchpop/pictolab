@@ -264,6 +264,18 @@ function Editor() {
     const [cMin, cMax] = cRangeRef.current;
     const t = performance.now() / 1000;
     wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
+    // Sync the canvas CSS box imperatively in the same tick as the GPU
+    // submit. React state for targetW/H also drives this percentage on
+    // commit, but for large sources the React commit can land a frame
+    // after the GPU update — producing a visible "stretched then snap"
+    // during slider drags. Updating the style ref directly here keeps
+    // GPU output and CSS sizing in lockstep regardless.
+    const c = canvasRef.current;
+    const src = sourceRef.current;
+    if (c && src) {
+      c.style.width = `${(targetWRef.current / src.w) * 100}%`;
+      c.style.height = `${(targetHRef.current / src.h) * 100}%`;
+    }
   };
 
   // Animation loop for HDR view: re-renders every frame so the marker
