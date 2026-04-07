@@ -67,6 +67,8 @@ declare module 'frontend-rs' {
 
   export function gpu_dispose(): void;
 
+  export function gpu_readback_rgba8(): Promise<Uint8Array>;
+
   export function build_carve_lut(
     order: Uint32Array,
     orig_width: number,

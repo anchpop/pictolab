@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeftRight, Eye, ImagePlus, Loader2, Minus, Plus } from 'lucide-react';
+import { ArrowLeftRight, Download, Eye, ImagePlus, Loader2, Minus, Plus } from 'lucide-react';
 import ImageDropZone from '@/components/ImageDropZone';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -294,6 +294,50 @@ function Editor() {
     handleLRangeChange(snapped);
   };
 
+  const [downloading, setDownloading] = useState(false);
+
+  const handleDownload = async () => {
+    const wasm = wasmRef.current;
+    const src = sourceRef.current;
+    if (!wasm || !src) return;
+    setDownloading(true);
+    try {
+      // Make sure the texture has the latest params (and turn off the
+      // HDR-view marker pixels for the export).
+      const [lMin, lMax] = lRangeRef.current;
+      const [cMin, cMax] = cRangeRef.current;
+      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0);
+
+      const rgba = await wasm.gpu_readback_rgba8();
+      const dir = directionRef.current;
+      const target = targetSizeRef.current;
+      const outW = dir === 'width' ? target : src.w;
+      const outH = dir === 'height' ? target : src.h;
+
+      const { default: encode } = await import('@jsquash/avif/encode');
+      const imageData: ImageData = {
+        data: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
+        width: outW,
+        height: outH,
+        colorSpace: 'display-p3',
+      } as ImageData;
+      const avif = await encode(imageData);
+      const blob = new Blob([avif], { type: 'image/avif' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'pictolab.avif';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('export failed:', err);
+    } finally {
+      setDownloading(false);
+      // Restore the HDR view if it was on.
+      if (showHdrRef.current) render();
+    }
+  };
+
   const handleNewImage = () => {
     setSource(null);
     sourceRef.current = null;
@@ -373,6 +417,19 @@ function Editor() {
               >
                 <Eye className="mr-1 h-4 w-4" />
                 HDR view
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownload}
+                disabled={!ready || downloading}
+              >
+                {downloading ? (
+                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="mr-1 h-4 w-4" />
+                )}
+                Export AVIF
               </Button>
               <Button variant="outline" size="sm" onClick={handleNewImage}>
                 <ImagePlus className="mr-1 h-4 w-4" />

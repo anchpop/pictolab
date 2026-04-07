@@ -24,6 +24,9 @@ export default defineConfig({
       wasm(),
     ],
   },
+  optimizeDeps: {
+    exclude: ['@jsquash/avif'],
+  },
   resolve: {
     alias: {
       'frontend-rs': path.resolve(__dirname, '../frontend-rs/pkg'),
