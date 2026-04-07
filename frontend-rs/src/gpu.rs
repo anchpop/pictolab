@@ -524,31 +524,72 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     Ok(order)
 }
 
-// ── GPU LAB remap ───────────────────────────────────────────────────────────
+// ── Persistent WebGPU rendering context ─────────────────────────────────────
 //
-// A persistent compute context kept across calls so that L/C slider drags
-// only need to upload 16 bytes of params + dispatch + read back, instead of
-// recreating the device/pipeline each time. The source RGBA is uploaded once
-// per image via `remap_lab_gpu_set_source`.
+// Owns the entire live-edit pipeline: source upload → remap compute →
+// carve compute → render to a WebGPU canvas. Lives across all editing
+// operations so slider drags only touch GPU (no JS↔wasm pixel readback).
+//
+// Pipeline:
+//   1. Source RGBA (u32-packed bytes) lives in `source_buf`, uploaded once
+//      per image via `gpu_set_source`.
+//   2. The remap compute shader reads source_buf + uniform params, writes
+//      vec4f remapped pixels into `remap_buf`. Slider drags hit this.
+//   3. The carve compute shader reads remap_buf + the carve LUT, writes
+//      rgba16float pixels into `output_tex`. The LUT is rebuilt CPU-side
+//      whenever target dimensions change.
+//   4. A trivial render pipeline (fullscreen triangle + textureSample)
+//      samples output_tex into the WebGPU canvas current texture.
+//
+// The download path is the only consumer that reads pixels back to CPU.
 
 const BUF_UNIFORM: u32 = 64;
+const TEX_BINDING: u32 = 4;
+const TEX_STORAGE: u32 = 8;
 
-struct RemapCtx {
+struct GpuCtx {
     device: JsValue,
     queue: JsValue,
-    pipeline: JsValue,
-    in_buf: JsValue,
-    out_buf: JsValue,
+
+    // Source buffer (u32-packed RGBA) and its dimensions.
+    source_buf: JsValue,
+    src_w: u32,
+    src_h: u32,
+    src_n: u32,
+
+    // Remap compute pipeline + intermediate vec4f buffer.
+    remap_pipeline: JsValue,
+    remap_bind_group: JsValue,
+    remap_buf: JsValue, // vec4f, src_n entries
+
+    // Carve compute pipeline + LUT buffer + output storage texture.
+    carve_pipeline: JsValue,
+    carve_bind_group: Option<JsValue>,
+    carve_dims_buf: JsValue, // uniform: target_w, target_h
+    lut_buf: Option<JsValue>,
+    output_tex: Option<JsValue>,
+    output_tex_view: Option<JsValue>,
+    target_w: u32,
+    target_h: u32,
+
+    // Render pipeline + canvas context.
+    render_pipeline: JsValue,
+    render_bgl: JsValue,
+    render_bind_group: Option<JsValue>,
+    sampler: JsValue,
+    canvas_ctx: JsValue,
+    canvas_format: String,
+
+    // Shared params uniform (l/c min/max, hue cos/sin).
     params_buf: JsValue,
-    read_buf: JsValue,
-    bind_group: JsValue,
-    w: u32,
-    h: u32,
-    n: u32,
+
+    // Optional readback buffer for the download path. Created lazily on
+    // first download since downloads are infrequent.
+    read_buf: RefCell<Option<JsValue>>,
 }
 
 thread_local! {
-    static REMAP_CTX: RefCell<Option<RemapCtx>> = const { RefCell::new(None) };
+    static GPU_CTX: RefCell<Option<GpuCtx>> = const { RefCell::new(None) };
 }
 
 fn remap_shader() -> &'static str {
@@ -560,22 +601,21 @@ struct Params {
   c_max: f32,
   hue_cos: f32,
   hue_sin: f32,
+  show_hdr: f32,
+  time: f32,
   _pad0: f32,
   _pad1: f32,
+  _pad2: f32,
+  _pad3: f32,
 }
 
 @group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
-@group(0) @binding(1) var<storage, read_write> rgba_out: array<u32>;
+@group(0) @binding(1) var<storage, read_write> linp3_out: array<vec4f>;
 @group(0) @binding(2) var<uniform> params: Params;
 
 fn srgb_to_linear(c: f32) -> f32 {
   if (c <= 0.04045) { return c / 12.92; }
   return pow((c + 0.055) / 1.055, 2.4);
-}
-
-fn linear_to_srgb(c: f32) -> f32 {
-  if (c <= 0.0031308) { return 12.92 * c; }
-  return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
 // Cube root that preserves sign for negative inputs (which can occur for
@@ -594,7 +634,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let r8 = f32(p & 0xFFu) / 255.0;
   let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
   let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
-  let a8 = (p >> 24u) & 0xFFu;
+  let a8 = f32((p >> 24u) & 0xFFu) / 255.0;
 
   let lr = srgb_to_linear(r8);
   let lg = srgb_to_linear(g8);
@@ -652,18 +692,194 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let lg2 = -1.0911312 * lin_l + 2.4133403 * lin_m - 0.3221775 * lin_s;
   let lb2 = -0.0260093 * lin_l - 0.5080364 * lin_m + 1.5332833 * lin_s;
 
-  let r2 = u32(clamp(linear_to_srgb(lr2), 0.0, 1.0) * 255.0 + 0.5);
-  let g2 = u32(clamp(linear_to_srgb(lg2), 0.0, 1.0) * 255.0 + 0.5);
-  let b2 = u32(clamp(linear_to_srgb(lb2), 0.0, 1.0) * 255.0 + 0.5);
+  // HDR view: any channel above 1.0 in linear extended P3 will clip on
+  // SDR displays. Mark those pixels with a color that oscillates between
+  // red and green based on `time` so they pop visually.
+  if (params.show_hdr > 0.5) {
+    let max_ch = max(max(lr2, lg2), lb2);
+    if (max_ch > 1.0) {
+      let t = 0.5 + 0.5 * sin(params.time * 4.0);
+      linp3_out[idx] = vec4f(t, 1.0 - t, 0.0, a8);
+      return;
+    }
+  }
 
-  rgba_out[idx] = r2 | (g2 << 8u) | (b2 << 16u) | (a8 << 24u);
+  // Apply the Display P3 (= sRGB) transfer function. Chrome treats values
+  // written to an rgba16float canvas as already encoded in the configured
+  // color space, so we need to encode here. Sign-preserving for HDR-ready
+  // extended-range values that may go negative or above 1.
+  let er = sign(lr2) * select(1.055 * pow(abs(lr2), 1.0 / 2.4) - 0.055, 12.92 * abs(lr2), abs(lr2) <= 0.0031308);
+  let eg = sign(lg2) * select(1.055 * pow(abs(lg2), 1.0 / 2.4) - 0.055, 12.92 * abs(lg2), abs(lg2) <= 0.0031308);
+  let eb = sign(lb2) * select(1.055 * pow(abs(lb2), 1.0 / 2.4) - 0.055, 12.92 * abs(lb2), abs(lb2) <= 0.0031308);
+
+  linp3_out[idx] = vec4f(er, eg, eb, a8);
 }
 "#
 }
 
-async fn create_remap_ctx(w: u32, h: u32) -> Result<RemapCtx, JsValue> {
-    let n = w * h;
+fn carve_shader() -> &'static str {
+    r#"
+@group(0) @binding(0) var<storage, read> linp3_in: array<vec4f>;
+@group(0) @binding(1) var<storage, read> lut: array<u32>;
+@group(0) @binding(2) var output_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var<uniform> dims: vec4u; // target_w, target_h, _, _
 
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let tw = dims.x;
+  let th = dims.y;
+  if (gid.x >= tw || gid.y >= th) { return; }
+  let out_idx = gid.y * tw + gid.x;
+  let src_idx = lut[out_idx];
+  let pixel = linp3_in[src_idx];
+  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), pixel);
+}
+"#
+}
+
+fn render_shader() -> &'static str {
+    r#"
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_smp: sampler;
+
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+  // Fullscreen triangle (covers the viewport with 3 vertices).
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  var out: VsOut;
+  out.pos = vec4f(pos[vid], 0.0, 1.0);
+  // Map clip-space (-1..1) to uv (0..1) and flip y.
+  out.uv = (pos[vid] + vec2f(1.0)) * 0.5;
+  out.uv.y = 1.0 - out.uv.y;
+  return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  return textureSample(src_tex, src_smp, in.uv);
+}
+"#
+}
+
+// ── Bind group layout helpers (specific to the new context) ─────────────────
+
+fn make_remap_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "buffer",
+            js_obj(&[("type", "read-only-storage".into())]).into(),
+        ),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "storage".into())]).into()),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
+fn make_carve_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    // 0: linp3_in (read-only storage)
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "buffer",
+            js_obj(&[("type", "read-only-storage".into())]).into(),
+        ),
+    ]));
+    // 1: lut (read-only storage)
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "buffer",
+            js_obj(&[("type", "read-only-storage".into())]).into(),
+        ),
+    ]));
+    // 2: output_tex (storage texture, write-only)
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "storageTexture",
+            js_obj(&[
+                ("access", "write-only".into()),
+                ("format", "rgba16float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 3: dims uniform
+    entries.push(&js_obj(&[
+        ("binding", 3u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
+const SHADER_VERTEX: u32 = 1;
+const SHADER_FRAGMENT: u32 = 2;
+
+fn make_render_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    // 0: source texture (sampled)
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_FRAGMENT.into()),
+        (
+            "texture",
+            js_obj(&[
+                ("sampleType", "float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 1: sampler
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_FRAGMENT.into()),
+        ("sampler", js_obj(&[("type", "filtering".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
+// ── Context creation ────────────────────────────────────────────────────────
+
+async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     let nav = js_get(&js_sys::global(), "navigator")?;
     let gpu = js_get(&nav, "gpu")?;
     if gpu.is_undefined() || gpu.is_null() {
@@ -684,179 +900,395 @@ async fn create_remap_ctx(w: u32, h: u32) -> Result<RemapCtx, JsValue> {
     let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
     let queue = js_get(&device, "queue")?;
 
-    let shader = create_shader(&device, remap_shader())?;
+    // ── Configure the canvas WebGPU context ─────────────────────────────
+    let canvas_ctx = js_call1(canvas, "getContext", &"webgpu".into())?;
+    if canvas_ctx.is_null() || canvas_ctx.is_undefined() {
+        return Err("canvas getContext('webgpu') returned null".into());
+    }
+    // rgba16float lets us carry extended-range Display P3 values for HDR.
+    // toneMapping: 'extended' tells the compositor to use the display's
+    // headroom for values above 1.0 on HDR displays; SDR displays clip.
+    let canvas_format = "rgba16float".to_string();
+    let tone_mapping = js_obj(&[("mode", "extended".into())]);
+    let configure_desc = js_obj(&[
+        ("device", device.clone()),
+        ("format", canvas_format.as_str().into()),
+        ("colorSpace", "display-p3".into()),
+        ("toneMapping", tone_mapping.into()),
+        ("alphaMode", "premultiplied".into()),
+    ]);
+    js_call1(&canvas_ctx, "configure", &configure_desc)?;
 
-    // Bind group layout: in (read-only storage), out (storage), params (uniform)
-    let bgl = {
-        let entries = Array::new();
-        // binding 0: read-only storage
-        entries.push(&js_obj(&[
-            ("binding", 0u32.into()),
-            ("visibility", SHADER_COMPUTE.into()),
-            (
-                "buffer",
-                js_obj(&[("type", "read-only-storage".into())]).into(),
-            ),
-        ]));
-        // binding 1: storage
-        entries.push(&js_obj(&[
-            ("binding", 1u32.into()),
-            ("visibility", SHADER_COMPUTE.into()),
-            ("buffer", js_obj(&[("type", "storage".into())]).into()),
-        ]));
-        // binding 2: uniform
-        entries.push(&js_obj(&[
-            ("binding", 2u32.into()),
-            ("visibility", SHADER_COMPUTE.into()),
-            ("buffer", js_obj(&[("type", "uniform".into())]).into()),
-        ]));
-        js_call1(
-            &device,
-            "createBindGroupLayout",
-            &js_obj(&[("entries", entries.into())]),
-        )?
-    };
-
-    let pl_layout = {
-        let layouts = Array::of1(&bgl);
+    // ── Remap pipeline ──────────────────────────────────────────────────
+    let remap_module = create_shader(&device, remap_shader())?;
+    let remap_bgl = make_remap_bgl(&device)?;
+    let remap_pl_layout = {
+        let layouts = Array::of1(&remap_bgl);
         js_call1(
             &device,
             "createPipelineLayout",
             &js_obj(&[("bindGroupLayouts", layouts.into())]),
         )?
     };
-    let pipeline = create_pipeline(&device, &pl_layout, &shader, "main")?;
+    let remap_pipeline = create_pipeline(&device, &remap_pl_layout, &remap_module, "main")?;
 
-    let in_buf = create_buffer(&device, n * 4, BUF_STORAGE | BUF_COPY_DST)?;
-    let out_buf = create_buffer(&device, n * 4, BUF_STORAGE | BUF_COPY_SRC)?;
-    // 8 f32 params (l_min, l_max, c_min, c_max, hue_cos, hue_sin, _pad, _pad)
-    // = 32 bytes. Padded to 32 because WGSL uniform structs have 16-byte
-    // alignment requirements that this lines up with naturally.
-    let params_buf = create_buffer(&device, 32, BUF_UNIFORM | BUF_COPY_DST)?;
-    let read_buf = create_buffer(&device, n * 4, BUF_MAP_READ | BUF_COPY_DST)?;
+    // ── Carve pipeline ──────────────────────────────────────────────────
+    let carve_module = create_shader(&device, carve_shader())?;
+    let carve_bgl = make_carve_bgl(&device)?;
+    let carve_pl_layout = {
+        let layouts = Array::of1(&carve_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let carve_pipeline = create_pipeline(&device, &carve_pl_layout, &carve_module, "main")?;
 
-    let bind_group = create_bind_group(&device, &bgl, &[&in_buf, &out_buf, &params_buf])?;
+    // ── Render pipeline ─────────────────────────────────────────────────
+    let render_module = create_shader(&device, render_shader())?;
+    let render_bgl = make_render_bgl(&device)?;
+    let render_pl_layout = {
+        let layouts = Array::of1(&render_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let render_pipeline = {
+        let vertex = js_obj(&[
+            ("module", render_module.clone()),
+            ("entryPoint", "vs_main".into()),
+        ]);
+        let target = js_obj(&[("format", canvas_format.as_str().into())]);
+        let targets = Array::of1(&target);
+        let fragment = js_obj(&[
+            ("module", render_module.clone()),
+            ("entryPoint", "fs_main".into()),
+            ("targets", targets.into()),
+        ]);
+        let primitive = js_obj(&[("topology", "triangle-list".into())]);
+        let desc = js_obj(&[
+            ("layout", render_pl_layout),
+            ("vertex", vertex.into()),
+            ("fragment", fragment.into()),
+            ("primitive", primitive.into()),
+        ]);
+        js_call1(&device, "createRenderPipeline", &desc)?
+    };
 
-    Ok(RemapCtx {
+    // ── Sampler + persistent params/dims buffers ────────────────────────
+    let sampler = js_call1(
+        &device,
+        "createSampler",
+        &js_obj(&[
+            ("magFilter", "linear".into()),
+            ("minFilter", "linear".into()),
+        ]),
+    )?;
+
+    // 12 f32 params (48 bytes) — uniform alignment
+    let params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
+    // 4 u32 dims (16 bytes) for the carve shader
+    let carve_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
+
+    // Source/remap buffers and textures are created lazily by gpu_set_source
+    // and gpu_set_carve_lut once the dimensions are known.
+    Ok(GpuCtx {
         device,
         queue,
-        pipeline,
-        in_buf,
-        out_buf,
+        source_buf: JsValue::null(),
+        src_w: 0,
+        src_h: 0,
+        src_n: 0,
+        remap_pipeline,
+        remap_bind_group: JsValue::null(),
+        remap_buf: JsValue::null(),
+        carve_pipeline,
+        carve_bind_group: None,
+        carve_dims_buf,
+        lut_buf: None,
+        output_tex: None,
+        output_tex_view: None,
+        target_w: 0,
+        target_h: 0,
+        render_pipeline,
+        render_bgl,
+        render_bind_group: None,
+        sampler,
+        canvas_ctx,
+        canvas_format,
         params_buf,
-        read_buf,
-        bind_group,
-        w,
-        h,
-        n,
+        read_buf: RefCell::new(None),
     })
 }
 
-fn destroy_ctx(ctx: &RemapCtx) {
-    for buf in [
-        &ctx.in_buf,
-        &ctx.out_buf,
-        &ctx.params_buf,
-        &ctx.read_buf,
-    ] {
-        let _ = js_call0(buf, "destroy");
-    }
-}
-
 #[wasm_bindgen]
-pub async fn remap_lab_gpu_set_source(
-    image_data: &[u8],
-    w: u32,
-    h: u32,
-) -> Result<(), JsValue> {
-    let needs_recreate = REMAP_CTX.with(|c| match &*c.borrow() {
-        Some(ctx) => ctx.w != w || ctx.h != h,
-        None => true,
-    });
-    if needs_recreate {
-        REMAP_CTX.with(|c| {
-            if let Some(old) = c.borrow_mut().take() {
-                destroy_ctx(&old);
-            }
-        });
-        let ctx = create_remap_ctx(w, h).await?;
-        REMAP_CTX.with(|c| *c.borrow_mut() = Some(ctx));
-    }
+pub async fn gpu_init(canvas: JsValue) -> Result<(), JsValue> {
+    #[cfg(feature = "console_error_panic_hook")]
+    console_error_panic_hook::set_once();
 
-    let (queue, in_buf) = REMAP_CTX.with(|c| -> Result<(JsValue, JsValue), JsValue> {
-        let c = c.borrow();
-        let ctx = c.as_ref().ok_or_else(|| JsValue::from("no remap ctx"))?;
-        Ok((ctx.queue.clone(), ctx.in_buf.clone()))
-    })?;
-    write_buffer_u8(&queue, &in_buf, image_data)?;
+    let ctx = create_gpu_ctx(&canvas).await?;
+    GPU_CTX.with(|c| *c.borrow_mut() = Some(ctx));
     Ok(())
 }
 
 #[wasm_bindgen]
-pub async fn remap_lab_gpu_apply(
+pub fn gpu_set_source(image_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        let n = w * h;
+
+        // (Re)allocate source + remap buffers if the dimensions changed.
+        if ctx.src_w != w || ctx.src_h != h {
+            if !ctx.source_buf.is_null() {
+                let _ = js_call0(&ctx.source_buf, "destroy");
+            }
+            if !ctx.remap_buf.is_null() {
+                let _ = js_call0(&ctx.remap_buf, "destroy");
+            }
+            ctx.source_buf = create_buffer(&ctx.device, n * 4, BUF_STORAGE | BUF_COPY_DST)?;
+            // remap_buf holds vec4f per pixel = 16 bytes
+            ctx.remap_buf = create_buffer(&ctx.device, n * 16, BUF_STORAGE)?;
+            ctx.src_w = w;
+            ctx.src_h = h;
+            ctx.src_n = n;
+
+            // Recreate the remap bind group against the new buffers.
+            let bgl = make_remap_bgl(&ctx.device)?;
+            ctx.remap_bind_group = create_bind_group(
+                &ctx.device,
+                &bgl,
+                &[&ctx.source_buf, &ctx.remap_buf, &ctx.params_buf],
+            )?;
+        }
+
+        write_buffer_u8(&ctx.queue, &ctx.source_buf, image_data)?;
+        Ok(())
+    })
+}
+
+#[wasm_bindgen]
+pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        let count = (target_w * target_h) as usize;
+        if lut.len() != count {
+            return Err(format!("lut len {} != target_w*target_h {count}", lut.len()).into());
+        }
+
+        // (Re)allocate the LUT buffer + output texture if dimensions changed.
+        let dims_changed = ctx.target_w != target_w || ctx.target_h != target_h;
+        if dims_changed {
+            if let Some(old) = ctx.lut_buf.take() {
+                let _ = js_call0(&old, "destroy");
+            }
+            if let Some(old) = ctx.output_tex.take() {
+                let _ = js_call0(&old, "destroy");
+            }
+            ctx.output_tex_view = None;
+
+            let lut_buf =
+                create_buffer(&ctx.device, (count * 4) as u32, BUF_STORAGE | BUF_COPY_DST)?;
+            ctx.lut_buf = Some(lut_buf);
+
+            // Storage texture for the carved+remapped result.
+            let size = js_obj(&[
+                ("width", target_w.into()),
+                ("height", target_h.into()),
+                ("depthOrArrayLayers", 1u32.into()),
+            ]);
+            let tex_desc = js_obj(&[
+                ("size", size.into()),
+                ("format", "rgba16float".into()),
+                ("usage", (TEX_BINDING | TEX_STORAGE | 1 /* COPY_SRC */).into()),
+            ]);
+            let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
+            let view = js_call1(&tex, "createView", &Object::new())?;
+            ctx.output_tex = Some(tex);
+            ctx.output_tex_view = Some(view);
+
+            ctx.target_w = target_w;
+            ctx.target_h = target_h;
+
+            // Recreate carve + render bind groups against the new resources.
+            let carve_bgl = make_carve_bgl(&ctx.device)?;
+            ctx.carve_bind_group = Some(make_carve_bind_group(
+                &ctx.device,
+                &carve_bgl,
+                ctx.remap_buf.clone(),
+                ctx.lut_buf.as_ref().unwrap().clone(),
+                ctx.output_tex_view.as_ref().unwrap().clone(),
+                ctx.carve_dims_buf.clone(),
+            )?);
+
+            ctx.render_bind_group = Some(make_render_bind_group(
+                &ctx.device,
+                &ctx.render_bgl,
+                ctx.output_tex_view.as_ref().unwrap().clone(),
+                ctx.sampler.clone(),
+            )?);
+
+            // Update the carve dims uniform.
+            let dims = [target_w, target_h, 0u32, 0u32];
+            let dims_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
+            write_buffer_u8(&ctx.queue, &ctx.carve_dims_buf, dims_bytes)?;
+        }
+
+        write_buffer_u32(&ctx.queue, ctx.lut_buf.as_ref().unwrap(), lut)?;
+        Ok(())
+    })
+}
+
+fn make_carve_bind_group(
+    device: &JsValue,
+    layout: &JsValue,
+    linp3: JsValue,
+    lut: JsValue,
+    tex_view: JsValue,
+    dims_buf: JsValue,
+) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("resource", js_obj(&[("buffer", linp3)]).into()),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("resource", js_obj(&[("buffer", lut)]).into()),
+    ]));
+    entries.push(&js_obj(&[("binding", 2u32.into()), ("resource", tex_view)]));
+    entries.push(&js_obj(&[
+        ("binding", 3u32.into()),
+        ("resource", js_obj(&[("buffer", dims_buf)]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroup",
+        &js_obj(&[("layout", layout.clone()), ("entries", entries.into())]),
+    )
+}
+
+fn make_render_bind_group(
+    device: &JsValue,
+    layout: &JsValue,
+    tex_view: JsValue,
+    sampler: JsValue,
+) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    entries.push(&js_obj(&[("binding", 0u32.into()), ("resource", tex_view)]));
+    entries.push(&js_obj(&[("binding", 1u32.into()), ("resource", sampler)]));
+    js_call1(
+        device,
+        "createBindGroup",
+        &js_obj(&[("layout", layout.clone()), ("entries", entries.into())]),
+    )
+}
+
+#[wasm_bindgen]
+pub fn gpu_render(
     l_min: f32,
     l_max: f32,
     c_min: f32,
     c_max: f32,
     hue_deg: f32,
-) -> Result<Vec<u8>, JsValue> {
-    let (device, queue, pipeline, params_buf, bind_group, out_buf, read_buf, n) =
-        REMAP_CTX.with(|c| -> Result<_, JsValue> {
-            let c = c.borrow();
-            let ctx = c.as_ref().ok_or_else(|| JsValue::from("no remap ctx"))?;
-            Ok((
-                ctx.device.clone(),
-                ctx.queue.clone(),
-                ctx.pipeline.clone(),
-                ctx.params_buf.clone(),
-                ctx.bind_group.clone(),
-                ctx.out_buf.clone(),
-                ctx.read_buf.clone(),
-                ctx.n,
-            ))
-        })?;
+    show_hdr: f32,
+    time: f32,
+) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let c = c.borrow();
+        let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        if ctx.lut_buf.is_none() || ctx.output_tex_view.is_none() {
+            return Err("gpu_render called before gpu_set_carve_lut".into());
+        }
 
-    // Write 8 f32 params (32 bytes) — l/c min/max, then precomputed
-    // cos/sin of the hue rotation, then two padding floats so the struct
-    // is a clean two-vec4 layout.
-    let hue_rad = hue_deg.to_radians();
-    let params = [
-        l_min,
-        l_max,
-        c_min,
-        c_max,
-        hue_rad.cos(),
-        hue_rad.sin(),
-        0.0,
-        0.0,
-    ];
-    let params_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 32) };
-    write_buffer_u8(&queue, &params_buf, params_bytes)?;
+        // Upload params.
+        let hue_rad = hue_deg.to_radians();
+        let params = [
+            l_min,
+            l_max,
+            c_min,
+            c_max,
+            hue_rad.cos(),
+            hue_rad.sin(),
+            show_hdr,
+            time,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        let params_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 48) };
+        write_buffer_u8(&ctx.queue, &ctx.params_buf, params_bytes)?;
 
-    // Encode + dispatch + copy out → read.
-    let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
-    dispatch(&enc, &pipeline, &bind_group, n.div_ceil(256))?;
-    let copy_fn: Function = js_get(&enc, "copyBufferToBuffer")?.dyn_into()?;
-    let args = Array::of5(&out_buf, &0.into(), &read_buf, &0.into(), &(n * 4).into());
-    Reflect::apply(&copy_fn, &enc, &args)?;
-    let cmd = js_call0(&enc, "finish")?;
-    js_call1(&queue, "submit", &Array::of1(&cmd))?;
+        // Encode all three passes into one command buffer.
+        let enc = js_call1(&ctx.device, "createCommandEncoder", &Object::new())?;
 
-    js_await(js_call1(&read_buf, "mapAsync", &1.into())?).await?;
-    let mapped = js_call0(&read_buf, "getMappedRange")?;
-    let arr = Uint8Array::new(&mapped);
-    let result: Vec<u8> = arr.to_vec();
-    js_call0(&read_buf, "unmap")?;
+        // Pass 1: remap compute → remap_buf
+        dispatch(
+            &enc,
+            &ctx.remap_pipeline,
+            &ctx.remap_bind_group,
+            ctx.src_n.div_ceil(256),
+        )?;
 
-    Ok(result)
+        // Pass 2: carve compute → output_tex
+        let carve_x = ctx.target_w.div_ceil(8);
+        let carve_y = ctx.target_h.div_ceil(8);
+        let carve_bg = ctx.carve_bind_group.as_ref().unwrap();
+        let pass = js_call1(&enc, "beginComputePass", &Object::new())?;
+        js_call1(&pass, "setPipeline", &ctx.carve_pipeline)?;
+        js_call2(&pass, "setBindGroup", &0.into(), carve_bg)?;
+        let dispatch_fn: Function = js_get(&pass, "dispatchWorkgroups")?.dyn_into()?;
+        Reflect::apply(
+            &dispatch_fn,
+            &pass,
+            &Array::of2(&carve_x.into(), &carve_y.into()),
+        )?;
+        js_call0(&pass, "end")?;
+
+        // Pass 3: render output_tex → canvas
+        let canvas_tex = js_call0(&ctx.canvas_ctx, "getCurrentTexture")?;
+        let canvas_view = js_call1(&canvas_tex, "createView", &Object::new())?;
+        let color_attachment = js_obj(&[
+            ("view", canvas_view),
+            ("loadOp", "clear".into()),
+            ("storeOp", "store".into()),
+            (
+                "clearValue",
+                js_obj(&[
+                    ("r", 0.0.into()),
+                    ("g", 0.0.into()),
+                    ("b", 0.0.into()),
+                    ("a", 1.0.into()),
+                ])
+                .into(),
+            ),
+        ]);
+        let attachments = Array::of1(&color_attachment);
+        let render_desc = js_obj(&[("colorAttachments", attachments.into())]);
+        let rpass = js_call1(&enc, "beginRenderPass", &render_desc)?;
+        js_call1(&rpass, "setPipeline", &ctx.render_pipeline)?;
+        let render_bg = ctx.render_bind_group.as_ref().unwrap();
+        js_call2(&rpass, "setBindGroup", &0.into(), render_bg)?;
+        let draw_fn: Function = js_get(&rpass, "draw")?.dyn_into()?;
+        draw_fn.call1(&rpass, &3.into())?; // 3 vertices, fullscreen triangle
+        js_call0(&rpass, "end")?;
+
+        let cmd = js_call0(&enc, "finish")?;
+        js_call1(&ctx.queue, "submit", &Array::of1(&cmd))?;
+        Ok(())
+    })
 }
 
 #[wasm_bindgen]
-pub fn remap_lab_gpu_dispose() {
-    REMAP_CTX.with(|c| {
-        if let Some(old) = c.borrow_mut().take() {
-            destroy_ctx(&old);
-        }
+pub fn gpu_dispose() {
+    GPU_CTX.with(|c| {
+        c.borrow_mut().take();
     });
 }

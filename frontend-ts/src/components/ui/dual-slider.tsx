@@ -80,7 +80,7 @@ export function DualSlider({
   return (
     <div
       className={cn(
-        "relative flex h-5 w-full touch-none select-none items-center",
+        "relative flex h-9 w-full touch-none select-none items-center",
         className
       )}
       onPointerMove={handlePointerMove}
@@ -118,9 +118,24 @@ export function DualSlider({
           aria-valuenow={value[i as 0 | 1]}
           tabIndex={0}
           onPointerDown={handlePointerDown(i as 0 | 1)}
-          className="absolute h-4 w-4 -translate-x-1/2 cursor-grab rounded-full border-2 border-primary bg-background shadow ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 active:cursor-grabbing"
-          style={{ left: `${pct(value[i as 0 | 1])}%` }}
+          className={cn(
+            "absolute h-4 w-4 -translate-x-1/2 cursor-grab rounded-full border-2 border-primary shadow ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 active:cursor-grabbing",
+            // First handle filled, second handle hollow — gives a clear
+            // visual cue to which endpoint is "low" vs "high" so an
+            // inversion (swapped order) is obvious at a glance.
+            i === 0 ? "bg-primary" : "bg-background"
+          )}
+          style={{ left: `${pct(value[i as 0 | 1])}%`, top: 'calc(50% - 8px)' }}
         />
+      ))}
+      {[0, 1].map((i) => (
+        <div
+          key={`label-${i}`}
+          className="pointer-events-none absolute -translate-x-1/2 font-mono text-[10px] text-muted-foreground"
+          style={{ left: `${pct(value[i as 0 | 1])}%`, top: 'calc(50% + 10px)' }}
+        >
+          {value[i as 0 | 1]}
+        </div>
       ))}
     </div>
   )

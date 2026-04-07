@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Download, ImagePlus, Loader2, Minus, Plus, Zap } from 'lucide-react';
+import { ArrowLeftRight, Eye, ImagePlus, Loader2, Minus, Plus } from 'lucide-react';
 import ImageDropZone from '@/components/ImageDropZone';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -7,7 +7,6 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Slider } from '@/components/ui/slider';
 import { DualSlider } from '@/components/ui/dual-slider';
-import { Switch } from '@/components/ui/switch';
 
 type Direction = 'width' | 'height';
 
@@ -27,38 +26,60 @@ function Editor() {
   const [lRange, setLRange] = useState<[number, number]>([0, 100]);
   const [cRange, setCRange] = useState<[number, number]>([0, 100]);
   const [hue, setHue] = useState(0);
+  const [showHdr, setShowHdr] = useState(false);
   // null = still detecting, true/false = known result.
   const [gpuAvailable, setGpuAvailable] = useState<boolean | null>(null);
-  const [useGPU, setUseGPU] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
-  const remapReqIdRef = useRef(0);
-  // Serializes GPU remap apply calls — the persistent context has a single
-  // read buffer, so concurrent mapAsync calls would race on it.
-  const gpuApplyChainRef = useRef<Promise<unknown>>(Promise.resolve());
-  const useGPURef = useRef(false);
-  // Tracks whether the persistent GPU remap context has been seeded with
-  // the current source. Reset on new image or when WebGPU is toggled off.
-  const gpuSourceReadyRef = useRef(false);
+  // Tracks whether the persistent GPU context has been initialized against
+  // the current canvas element.
+  const gpuInitedRef = useRef(false);
 
   // Cached pieces of the pipeline.
   const wasmRef = useRef<typeof import('frontend-rs') | null>(null);
   const orderRef = useRef<Uint32Array | null>(null);
-  // Source pixels with the current L/C remap baked in. Recomputed only when
-  // the L or C ranges change, so resize-drag is just a seam-carve render.
-  const remappedSourceRef = useRef<Uint8Array | null>(null);
   const sourceRef = useRef<SourceState | null>(null);
-  // Combined L (101 bins) + chroma (129 bins) histogram for the current
-  // source, packed as one Uint32Array of length 230. Used to display how
-  // many pixels would clip under the current L/C remap settings.
+  // Combined L (101 bins) + chroma (161 bins) histogram for the current
+  // source. Used to display how many pixels would clip under the current
+  // L/C remap settings.
   const lcHistRef = useRef<Uint32Array | null>(null);
   const directionRef = useRef<Direction>('width');
   const targetSizeRef = useRef(0);
   const lRangeRef = useRef<[number, number]>([0, 100]);
   const cRangeRef = useRef<[number, number]>([0, 100]);
   const hueRef = useRef(0);
+  const showHdrRef = useRef(false);
+  const hdrRafRef = useRef<number | null>(null);
+
+  // After the source state is set and React mounts the canvas, init the
+  // GPU context (if needed), upload the source, and kick off precompute.
+  useEffect(() => {
+    const wasm = wasmRef.current;
+    const src = source;
+    const c = canvasRef.current;
+    if (!wasm || !src || !c) return;
+    let cancelled = false;
+    (async () => {
+      c.width = src.w;
+      c.height = src.h;
+      try {
+        if (!gpuInitedRef.current) {
+          await wasm.gpu_init(c);
+          gpuInitedRef.current = true;
+        }
+        if (cancelled) return;
+        wasm.gpu_set_source(src.data, src.w, src.h);
+      } catch (err) {
+        console.error('GPU init/upload failed:', err);
+        return;
+      }
+      runPrecompute(src, directionRef.current);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source]);
 
   // Detect WebGPU + load wasm.
   useEffect(() => {
@@ -69,11 +90,7 @@ function Editor() {
       try {
         if (wasm.is_webgpu_available()) {
           const adapter = await navigator.gpu?.requestAdapter();
-          if (adapter) {
-            available = true;
-            setUseGPU(true);
-            useGPURef.current = true;
-          }
+          if (adapter) available = true;
         }
       } catch {
         /* no gpu */
@@ -82,6 +99,11 @@ function Editor() {
     })();
     return () => {
       workerRef.current?.terminate();
+      try {
+        wasmRef.current?.gpu_dispose();
+      } catch {
+        /* ignore */
+      }
     };
   }, []);
 
@@ -95,115 +117,63 @@ function Editor() {
     return workerRef.current;
   };
 
-  // Ensure the persistent GPU remap context has the current source uploaded.
-  // No-op when GPU is disabled or already seeded.
-  const ensureGpuSource = async () => {
-    const wasm = wasmRef.current;
-    const src = sourceRef.current;
-    if (!wasm || !src) return;
-    if (!useGPURef.current || gpuSourceReadyRef.current) return;
-    try {
-      await wasm.remap_lab_gpu_set_source(src.data, src.w, src.h);
-      gpuSourceReadyRef.current = true;
-    } catch (err) {
-      console.warn('GPU remap set_source failed, falling back to CPU:', err);
-      gpuSourceReadyRef.current = false;
-    }
-  };
-
-  // Recompute the remapped-source cache. Cheap when ranges are identity
-  // (we just point at the original source data). Called when the source
-  // loads or when the L/C ranges change. Uses GPU when available; otherwise
-  // falls back to the CPU `remap_lab` path. Stale results are dropped via
-  // a request id so out-of-order GPU promises can't clobber a newer state.
-  const refreshRemappedSource = async () => {
-    const wasm = wasmRef.current;
-    const src = sourceRef.current;
-    if (!wasm || !src) return;
-    const [lMin, lMax] = lRangeRef.current;
-    const [cMin, cMax] = cRangeRef.current;
-    const hueDeg = hueRef.current;
-
-    const id = ++remapReqIdRef.current;
-
-    if (lMin === 0 && lMax === 100 && cMin === 0 && cMax === 100 && hueDeg === 0) {
-      if (id !== remapReqIdRef.current) return;
-      remappedSourceRef.current = src.data;
-      return;
-    }
-
-    if (useGPURef.current && gpuSourceReadyRef.current) {
-      // Wait for any in-flight apply to finish before starting a new one,
-      // since the GPU context's read buffer can only be mapped once at a time.
-      const prev = gpuApplyChainRef.current;
-      const next = (async () => {
-        try {
-          await prev;
-        } catch {
-          /* don't propagate previous failures */
-        }
-        // A newer request may have arrived while we were waiting — bail.
-        if (id !== remapReqIdRef.current) return null;
-        return wasm.remap_lab_gpu_apply(lMin, lMax, cMin, cMax, hueDeg);
-      })();
-      gpuApplyChainRef.current = next;
-
-      try {
-        const result = await next;
-        if (id !== remapReqIdRef.current) return;
-        if (result) {
-          remappedSourceRef.current = result;
-          return;
-        }
-      } catch (err) {
-        console.warn('GPU remap apply failed, falling back to CPU:', err);
-        gpuSourceReadyRef.current = false;
-      }
-    }
-
-    const result = wasm.remap_lab(src.data, src.w, src.h, lMin, lMax, cMin, cMax, hueDeg);
-    if (id !== remapReqIdRef.current) return;
-    remappedSourceRef.current = result;
-  };
-
-  // Re-render the carved image (using the cached remapped source) to
-  // the canvas. Safe to call from any callback — pulls everything from refs.
-  const renderPreview = () => {
+  // Push the current LUT (carve mapping) into the GPU context based on the
+  // active seam order, source dims, target size, and direction.
+  const refreshLut = () => {
     const wasm = wasmRef.current;
     const src = sourceRef.current;
     const order = orderRef.current;
-    const remapped = remappedSourceRef.current;
-    const canvas = canvasRef.current;
-    if (!wasm || !src || !order || !remapped || !canvas) return;
-
+    if (!wasm || !src || !order) return;
     const dir = directionRef.current;
-    const target = targetSizeRef.current;
     const dirNum = dir === 'width' ? 0 : 1;
+    const target = targetSizeRef.current;
+    const targetW = dir === 'width' ? target : src.w;
+    const targetH = dir === 'height' ? target : src.h;
+    const lut = wasm.build_carve_lut(order, src.w, src.h, target, dirNum);
+    wasm.gpu_set_carve_lut(lut, targetW, targetH);
+  };
 
-    const carved = wasm.render_seam_carved(
-      remapped,
-      order,
-      src.w,
-      src.h,
-      target,
-      dirNum
-    );
-    const outW = dir === 'width' ? target : src.w;
-    const outH = dir === 'height' ? target : src.h;
+  // Issue a render with the current L/C/hue params. Cheap; safe to call
+  // from any callback.
+  const render = () => {
+    const wasm = wasmRef.current;
+    if (!wasm || !gpuInitedRef.current) return;
+    const [lMin, lMax] = lRangeRef.current;
+    const [cMin, cMax] = cRangeRef.current;
+    const t = performance.now() / 1000;
+    wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
+  };
 
-    canvas.width = outW;
-    canvas.height = outH;
-    // The canvas itself must be tagged as Display P3 so the bytes we
-    // putImageData below are interpreted in the wide gamut.
-    const ctx = canvas.getContext('2d', { colorSpace: 'display-p3' });
-    if (!ctx) return;
-    ctx.putImageData(
-      new ImageData(new Uint8ClampedArray(carved), outW, outH, {
-        colorSpace: 'display-p3',
-      }),
-      0,
-      0
-    );
+  // Animation loop for HDR view: re-renders every frame so the marker
+  // color oscillates. Started/stopped by handleHdrToggle.
+  const startHdrLoop = () => {
+    if (hdrRafRef.current !== null) return;
+    const tick = () => {
+      if (!showHdrRef.current) {
+        hdrRafRef.current = null;
+        return;
+      }
+      render();
+      hdrRafRef.current = requestAnimationFrame(tick);
+    };
+    hdrRafRef.current = requestAnimationFrame(tick);
+  };
+  const stopHdrLoop = () => {
+    if (hdrRafRef.current !== null) {
+      cancelAnimationFrame(hdrRafRef.current);
+      hdrRafRef.current = null;
+    }
+  };
+
+  const handleHdrToggle = () => {
+    const next = !showHdrRef.current;
+    showHdrRef.current = next;
+    setShowHdr(next);
+    if (next) startHdrLoop();
+    else {
+      stopHdrLoop();
+      render();
+    }
   };
 
   // Run seam-order precompute via worker.
@@ -215,7 +185,7 @@ function Editor() {
     const dirNum = dir === 'width' ? 0 : 1;
 
     const worker = getWorker();
-    worker.onmessage = async (e: MessageEvent) => {
+    worker.onmessage = (e: MessageEvent) => {
       const { order, requestId } = e.data;
       if (requestId !== requestIdRef.current) return;
 
@@ -226,9 +196,8 @@ function Editor() {
       setTargetSize(max);
       setIsPrecomputing(false);
       setReady(true);
-      await ensureGpuSource();
-      await refreshRemappedSource();
-      requestAnimationFrame(renderPreview);
+      refreshLut();
+      requestAnimationFrame(render);
     };
 
     worker.postMessage({
@@ -237,13 +206,16 @@ function Editor() {
       height: src.h,
       direction: dirNum,
       requestId: id,
-      useGPU: useGPURef.current,
+      useGPU: true,
     });
   };
 
   const handleImageSelect = (imageUrl: string) => {
+    const wasm = wasmRef.current;
+    if (!wasm) return;
+
     const img = new Image();
-    img.onload = () => {
+    img.onload = async () => {
       const tmp = document.createElement('canvas');
       tmp.width = img.width;
       tmp.height = img.height;
@@ -262,13 +234,15 @@ function Editor() {
       };
       setSource(src);
       sourceRef.current = src;
-      // New image → GPU context needs to re-upload source.
-      gpuSourceReadyRef.current = false;
+
       // Compute the L+chroma histogram once so the clipping readouts are live.
-      if (wasmRef.current) {
-        lcHistRef.current = wasmRef.current.compute_lc_histogram(src.data);
-      }
-      runPrecompute(src, directionRef.current);
+      lcHistRef.current = wasm.compute_lc_histogram(src.data);
+
+      // Initialize GPU context against the canvas (once) and upload source.
+      // The canvas element only mounts after `source` is set, so we wait a
+      // frame for React to commit before grabbing it.
+      // GPU init + precompute kicks off from a useEffect once the canvas
+      // element is actually mounted (see below).
     };
     img.src = imageUrl;
   };
@@ -287,31 +261,26 @@ function Editor() {
     const clamped = Math.max(1, Math.min(max, Math.round(size)));
     setTargetSize(clamped);
     targetSizeRef.current = clamped;
-    renderPreview();
+    refreshLut();
+    render();
   };
 
   const handleLRangeChange = (next: [number, number]) => {
     setLRange(next);
     lRangeRef.current = next;
-    if (ready) {
-      refreshRemappedSource().then(renderPreview);
-    }
+    if (ready) render();
   };
 
   const handleCRangeChange = (next: [number, number]) => {
     setCRange(next);
     cRangeRef.current = next;
-    if (ready) {
-      refreshRemappedSource().then(renderPreview);
-    }
+    if (ready) render();
   };
 
   const handleHueChange = (next: number) => {
     setHue(next);
     hueRef.current = next;
-    if (ready) {
-      refreshRemappedSource().then(renderPreview);
-    }
+    if (ready) render();
   };
 
   // Bump exposure by N stops. Composes with the current L transform:
@@ -321,68 +290,15 @@ function Editor() {
   const adjustExposure = (stops: number) => {
     const k = Math.pow(2, stops / 3);
     const next: [number, number] = [lRangeRef.current[0] * k, lRangeRef.current[1] * k];
-    // Snap to integer values to keep the slider readout tidy.
     const snapped: [number, number] = [Math.round(next[0]), Math.round(next[1])];
     handleLRangeChange(snapped);
-  };
-
-  const handleGpuToggle = async (next: boolean) => {
-    setUseGPU(next);
-    useGPURef.current = next;
-    if (next) {
-      // Newly enabled: seed source then refresh.
-      gpuSourceReadyRef.current = false;
-      await ensureGpuSource();
-    } else {
-      // Disable: drop the GPU context entirely so resources are freed.
-      gpuSourceReadyRef.current = false;
-      try {
-        wasmRef.current?.remap_lab_gpu_dispose();
-      } catch {
-        /* ignore */
-      }
-    }
-    if (ready) {
-      await refreshRemappedSource();
-      renderPreview();
-    }
-  };
-
-  const handleDownload = () => {
-    const wasm = wasmRef.current;
-    const canvas = canvasRef.current;
-    if (!wasm || !canvas) return;
-    // Pull pixels back out of the canvas in P3 and hand them to the wasm
-    // PNG encoder, which embeds the Display P3 ICC profile so other
-    // viewers render the same wide-gamut colors.
-    const ctx = canvas.getContext('2d', { colorSpace: 'display-p3' });
-    if (!ctx) return;
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height, {
-      colorSpace: 'display-p3',
-    });
-    const png = wasm.encode_png(
-      new Uint8Array(imageData.data),
-      canvas.width,
-      canvas.height
-    );
-    // Copy into a fresh ArrayBuffer so the Blob owns its bytes (avoids
-    // referencing wasm linear memory directly).
-    const blob = new Blob([new Uint8Array(png)], { type: 'image/png' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'pictolab.png';
-    link.click();
-    URL.revokeObjectURL(url);
   };
 
   const handleNewImage = () => {
     setSource(null);
     sourceRef.current = null;
     orderRef.current = null;
-    remappedSourceRef.current = null;
     lcHistRef.current = null;
-    gpuSourceReadyRef.current = false;
     setReady(false);
     setLRange([0, 100]);
     setCRange([0, 100]);
@@ -396,8 +312,7 @@ function Editor() {
   const outH = direction === 'height' ? targetSize : source?.h ?? 0;
   const maxSize = direction === 'width' ? source?.w ?? 1 : source?.h ?? 1;
 
-  // Live clipping percentages for the current L remap. Iterates the 101-bin
-  // L histogram and tallies bins whose remapped value falls outside [0, 100].
+  // Live clipping percentages for the current L remap.
   const lClipping = (() => {
     const hist = lcHistRef.current;
     if (!hist || !source) return null;
@@ -414,15 +329,7 @@ function Editor() {
     return { dark: (dark / total) * 100, light: (light / total) * 100 };
   })();
 
-  // Approximate chroma clipping. Iterates the 161-bin chroma histogram,
-  // applies the same per-pixel mapping as `remap_lab` (input chroma 0..160
-  // → output c_min..c_max as a percentage of the 160-unit reference) and
-  // counts pixels whose absolute output chroma exceeds 160 — a rough
-  // Display P3 practical ceiling. The exact gamut boundary varies with
-  // L and hue, so this under-counts in dark/light regions but is a good
-  // directional indicator. Also tracks pixels whose output chroma goes
-  // negative (hue inversion), which is a perceptually significant
-  // boundary even though it isn't strictly "clipping".
+  // Approximate chroma clipping. Mirrors the per-pixel mapping in remap_lab.
   const cClipping = (() => {
     const hist = lcHistRef.current;
     if (!hist || !source) return null;
@@ -443,6 +350,8 @@ function Editor() {
     };
   })();
 
+  const gpuMissing = gpuAvailable === false;
+
   return (
     <div className="flex h-full min-h-screen bg-background text-foreground">
       {/* ── Main preview area ──────────────────────────────────────── */}
@@ -451,19 +360,36 @@ function Editor() {
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
             <p className="text-xs text-muted-foreground">
-              Content-aware resize · LAB color remap
+              Content-aware resize · OKLab color remap · WebGPU
             </p>
           </div>
           {source && (
-            <Button variant="outline" size="sm" onClick={handleNewImage}>
-              <ImagePlus className="mr-1 h-4 w-4" />
-              New image
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant={showHdr ? 'default' : 'outline'}
+                size="sm"
+                onClick={handleHdrToggle}
+                title="Highlight pixels that exceed SDR (will clip on standard displays)"
+              >
+                <Eye className="mr-1 h-4 w-4" />
+                HDR view
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleNewImage}>
+                <ImagePlus className="mr-1 h-4 w-4" />
+                New image
+              </Button>
+            </div>
           )}
         </header>
 
         <div className="flex flex-1 items-center justify-center overflow-auto p-8">
-          {!source ? (
+          {gpuMissing ? (
+            <div className="max-w-md text-center text-sm text-muted-foreground">
+              WebGPU is required but unavailable on this device. Pictolab needs a
+              browser with WebGPU enabled (recent Chrome, Edge, or Safari Technology
+              Preview).
+            </div>
+          ) : !source ? (
             <div className="w-full max-w-2xl">
               <ImageDropZone onImageSelect={handleImageSelect} />
             </div>
@@ -479,7 +405,6 @@ function Editor() {
                 className="relative max-h-[75vh] rounded-lg border border-border bg-card shadow-sm"
                 style={{
                   aspectRatio: `${source.w} / ${source.h}`,
-                  // Cap by viewport height while preserving original aspect.
                   height: 'min(75vh, 80vw)',
                 }}
               >
@@ -502,33 +427,10 @@ function Editor() {
 
       {/* ── Right sidebar ──────────────────────────────────────────── */}
       <aside className="w-80 shrink-0 overflow-y-auto border-l border-border bg-card p-4">
-        <div
-          className={`mb-4 flex items-center justify-between rounded-md border px-3 py-2 ${
-            gpuAvailable === false ? 'bg-muted opacity-60' : 'bg-background'
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            <Zap
-              className={`h-4 w-4 ${
-                gpuAvailable && useGPU ? 'text-primary' : 'text-muted-foreground'
-              }`}
-            />
-            <Label htmlFor="gpu-toggle" className="text-sm font-medium">
-              WebGPU acceleration
-            </Label>
-          </div>
-          <Switch
-            id="gpu-toggle"
-            checked={useGPU}
-            onCheckedChange={handleGpuToggle}
-            disabled={gpuAvailable !== true || isPrecomputing}
-          />
-        </div>
-
         {!source ? (
           <div className="text-sm text-muted-foreground">
-            {gpuAvailable === false
-              ? 'WebGPU is unavailable on this device — falling back to CPU. Drop an image to start.'
+            {gpuMissing
+              ? 'WebGPU unavailable.'
               : 'Drop an image to start editing.'}
           </div>
         ) : (
@@ -603,7 +505,6 @@ function Editor() {
                         />
                       </div>
                     </div>
-
                   </>
                 )}
               </CardContent>
@@ -617,6 +518,15 @@ function Editor() {
                 <div className="flex items-center justify-between">
                   <Label className="text-xs">Range</Label>
                   <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-2"
+                      onClick={() => handleLRangeChange([lRangeRef.current[1], lRangeRef.current[0]])}
+                      title="Invert (swap handles)"
+                    >
+                      <ArrowLeftRight className="h-3 w-3" />
+                    </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -637,9 +547,6 @@ function Editor() {
                       <Plus className="h-3 w-3" />
                       ½ EV
                     </Button>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      {lRange[0]} → {lRange[1]}
-                    </span>
                   </div>
                 </div>
                 <DualSlider
@@ -656,7 +563,7 @@ function Editor() {
                   </p>
                 ) : (
                   <p className="text-[11px] leading-snug text-muted-foreground">
-                    L ranges 0–100 by default. Push past either end to boost/reduce exposure (clips at the sRGB gamut). 100 → 0 inverts; collapse for equalize.
+                    L ranges 0–100 by default. Push past either end to boost/reduce exposure. 100 → 0 inverts; collapse for equalize.
                   </p>
                 )}
               </CardContent>
@@ -667,12 +574,7 @@ function Editor() {
                 <CardTitle>Chroma Remap</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs">Range</Label>
-                  <span className="font-mono text-xs text-muted-foreground">
-                    {cRange[0]} → {cRange[1]}
-                  </span>
-                </div>
+                <Label className="text-xs">Range</Label>
                 <DualSlider
                   min={-50}
                   max={150}
@@ -712,17 +614,6 @@ function Editor() {
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Export</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <Button className="w-full" onClick={handleDownload} disabled={!ready}>
-                  <Download className="mr-1 h-4 w-4" />
-                  Download PNG
-                </Button>
-              </CardContent>
-            </Card>
           </div>
         )}
       </aside>

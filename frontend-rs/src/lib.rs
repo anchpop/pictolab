@@ -420,6 +420,62 @@ pub fn encode_png(image_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>,
 ///   in the sense that c_max=100 means "100% of original" — the c_min knob lets
 ///   you bias the rescale toward desaturating darker chromas independently.
 ///   To desaturate fully use (0, 0); to boost use (0, 200); etc.
+/// Build a "carve LUT" — for each output pixel after seam carving, the
+/// linear index into the original source buffer that should appear there.
+/// Used by the WebGPU rendering pipeline so the carve compute shader can
+/// do an indirect lookup instead of recomputing surviving pixels.
+///
+/// Output layout is row-major over the carved dimensions:
+///   length = target_w * target_h
+///   for direction == 0 (reduce width):  target_w = target_size, target_h = orig_h
+///   for direction == 1 (reduce height): target_w = orig_w, target_h = target_size
+#[wasm_bindgen]
+pub fn build_carve_lut(
+    order: &[u32],
+    orig_width: u32,
+    orig_height: u32,
+    target_size: u32,
+    direction: u32,
+) -> Vec<u32> {
+    let w = orig_width as usize;
+    let h = orig_height as usize;
+    let target = target_size as usize;
+
+    if direction == 0 {
+        // Reducing width: keep pixels where order > seams_removed.
+        let seams_removed = w - target;
+        let mut lut = Vec::with_capacity(target * h);
+        for y in 0..h {
+            for x in 0..w {
+                if order[y * w + x] as usize > seams_removed {
+                    lut.push((y * w + x) as u32);
+                }
+            }
+        }
+        lut
+    } else {
+        // Reducing height. Walk each column, keep surviving rows in order,
+        // then transpose into row-major output.
+        let seams_removed = h - target;
+        let mut col_survivors: Vec<Vec<usize>> = vec![Vec::with_capacity(target); w];
+        for x in 0..w {
+            for y in 0..h {
+                if order[y * w + x] as usize > seams_removed {
+                    col_survivors[x].push(y);
+                }
+            }
+        }
+        let mut lut = vec![0u32; w * target];
+        for r in 0..target {
+            for x in 0..w {
+                let orig_y = col_survivors[x][r];
+                lut[r * w + x] = (orig_y * w + x) as u32;
+            }
+        }
+        lut
+    }
+}
+
 /// Build a 101-bin histogram of L* values across the image (one bin per
 /// integer L from 0 to 100) and a 161-bin histogram of chroma magnitudes
 /// (sqrt(a² + b²)) clamped into 0..160. Returned as one flat array of

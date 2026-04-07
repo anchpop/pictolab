@@ -41,21 +41,39 @@ declare module 'frontend-rs' {
     direction: number
   ): Promise<Uint32Array>;
 
-  export function remap_lab_gpu_set_source(
+  export function gpu_init(canvas: HTMLCanvasElement): Promise<void>;
+
+  export function gpu_set_source(
     image_data: Uint8Array,
     width: number,
     height: number
-  ): Promise<void>;
+  ): void;
 
-  export function remap_lab_gpu_apply(
+  export function gpu_set_carve_lut(
+    lut: Uint32Array,
+    target_w: number,
+    target_h: number
+  ): void;
+
+  export function gpu_render(
     l_min: number,
     l_max: number,
     c_min: number,
     c_max: number,
-    hue_deg: number
-  ): Promise<Uint8Array>;
+    hue_deg: number,
+    show_hdr: number,
+    time: number
+  ): void;
 
-  export function remap_lab_gpu_dispose(): void;
+  export function gpu_dispose(): void;
+
+  export function build_carve_lut(
+    order: Uint32Array,
+    orig_width: number,
+    orig_height: number,
+    target_size: number,
+    direction: number
+  ): Uint32Array;
 
   export function is_webgpu_available(): boolean;
 }
