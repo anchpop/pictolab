@@ -333,22 +333,163 @@ async function getLibheif() {
   return libheifPromise;
 }
 
-// Decode an HEIC file via libheif-js. The bundled emscripten build only
-// surfaces 8-bit RGBA through `image.display(...)`, so HDR HEICs are
-// tonemapped to SDR Display P3 inside libheif before we see them. That's
-// fine for the seam carve + edit pipeline; if you want true HDR HEIC,
-// the underlying C API supports 10/12-bit reads (uses heif_decode_image
-// with chroma=interleaved RRGGBBAA_LE).
-async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
-  const libheif = await getLibheif();
+// libheif enum constants we care about (mirror the C header).
+const HEIF_COLORSPACE_RGB = 1;
+const HEIF_CHROMA_INTERLEAVED_RGBA = 11;
+const HEIF_CHROMA_INTERLEAVED_RRGGBBAA_LE = 15;
+const HEIF_CHANNEL_INTERLEAVED = 10;
+
+// Drop into libheif's C API to pull HDR HEIC pixels at full bit depth.
+// `image.display(...)` only ever gives 8-bit sRGB tonemapped output, so
+// for iPhone HDR HEICs we have to do this dance ourselves: ask libheif
+// for 16-bit interleaved RGBA + the source nclx CICP, then run the same
+// PQ/HLG inverse + BT.2020→P3 conversion as the AVIF path.
+async function decodeHeicViaCApi(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  const libheif: any = await getLibheif();
+  const M: any = libheif.Module ?? libheif;
+  if (typeof M._heif_context_alloc !== 'function') return null;
+
+  const readU32 = (ptr: number) => M.HEAPU32[ptr >>> 2];
+  const errOk = (errPtr: number) => readU32(errPtr) === 0;
+
+  // All malloc'd handles to free in finally.
+  let inPtr = 0,
+    errPtr = 0,
+    handlePtrPtr = 0,
+    nclxPtrPtr = 0,
+    imgPtrPtr = 0,
+    stridePtr = 0,
+    optsPtr = 0,
+    ctx = 0,
+    handle = 0,
+    img = 0;
+
+  try {
+    inPtr = M._malloc(buf.length);
+    if (!inPtr) return null;
+    M.HEAPU8.set(buf, inPtr);
+
+    ctx = M._heif_context_alloc();
+    if (!ctx) return null;
+
+    errPtr = M._malloc(12); // sizeof(heif_error)
+
+    M._heif_context_read_from_memory_without_copy(errPtr, ctx, inPtr, buf.length, 0);
+    if (!errOk(errPtr)) return null;
+
+    handlePtrPtr = M._malloc(4);
+    M._heif_context_get_primary_image_handle(errPtr, ctx, handlePtrPtr);
+    if (!errOk(errPtr)) return null;
+    handle = readU32(handlePtrPtr);
+    if (!handle) return null;
+
+    const lumaBits = M._heif_image_handle_get_luma_bits_per_pixel(handle);
+
+    // Pull nclx CICP if present. Defaults match unspecified-but-likely-sRGB.
+    let primaries = CP_BT709;
+    let transfer = TC_SRGB;
+    nclxPtrPtr = M._malloc(4);
+    M.HEAPU32[nclxPtrPtr >>> 2] = 0;
+    M._heif_image_handle_get_nclx_color_profile(errPtr, handle, nclxPtrPtr);
+    if (errOk(errPtr)) {
+      const nclxPtr = readU32(nclxPtrPtr);
+      if (nclxPtr) {
+        // struct heif_color_profile_nclx { uint8_t version; (3pad)
+        //   int color_primaries;            // offset 4
+        //   int transfer_characteristics;   // offset 8
+        //   int matrix_coefficients;        // offset 12
+        //   uint8_t full_range_flag; ... }
+        primaries = readU32(nclxPtr + 4);
+        transfer = readU32(nclxPtr + 8);
+        M._heif_nclx_color_profile_free(nclxPtr);
+      }
+    }
+
+    optsPtr = M._heif_decoding_options_alloc();
+    // libheif's default for `convert_hdr_to_8bit` is false, which is
+    // exactly what we want, so we don't poke at the struct.
+
+    imgPtrPtr = M._malloc(4);
+    const chroma =
+      lumaBits > 8 ? HEIF_CHROMA_INTERLEAVED_RRGGBBAA_LE : HEIF_CHROMA_INTERLEAVED_RGBA;
+    M._heif_decode_image(errPtr, handle, imgPtrPtr, HEIF_COLORSPACE_RGB, chroma, optsPtr);
+    if (!errOk(errPtr)) return null;
+    img = readU32(imgPtrPtr);
+    if (!img) return null;
+
+    const width = M._heif_image_get_width(img, HEIF_CHANNEL_INTERLEAVED);
+    const height = M._heif_image_get_height(img, HEIF_CHANNEL_INTERLEAVED);
+    const bppRange = M._heif_image_get_bits_per_pixel_range(img, HEIF_CHANNEL_INTERLEAVED);
+    stridePtr = M._malloc(4);
+    const planePtr = M._heif_image_get_plane_readonly(img, HEIF_CHANNEL_INTERLEAVED, stridePtr);
+    if (!planePtr) return null;
+    const stride = readU32(stridePtr);
+
+    // Bit depth per channel — 8 for SDR, 10/12 for HDR. libheif aligns
+    // 10/12-bit values into 16-bit slots, value lives in the low bits.
+    const depth = bppRange > 0 ? bppRange : lumaBits;
+
+    // Pull the pixels into a contiguous typed array. The source is row-
+    // padded so we copy a row at a time.
+    let f32: Float32Array;
+    if (depth > 8) {
+      const u16Row = width * 4;
+      const u16 = new Uint16Array(width * height * 4);
+      for (let y = 0; y < height; y++) {
+        const srcOff = (planePtr + y * stride) >>> 1;
+        u16.set(M.HEAPU16.subarray(srcOff, srcOff + u16Row), y * u16Row);
+      }
+      f32 = avifToLinearP3(u16, width, height, depth, primaries, transfer);
+    } else {
+      const u8 = new Uint8Array(width * height * 4);
+      for (let y = 0; y < height; y++) {
+        const srcOff = planePtr + y * stride;
+        u8.set(M.HEAPU8.subarray(srcOff, srcOff + width * 4), y * width * 4);
+      }
+      // Reuse the linearizer by widening 8 → 16 with the right shift so
+      // avifToLinearP3's `/max` math holds.
+      const u16 = new Uint16Array(u8.length);
+      for (let i = 0; i < u8.length; i++) u16[i] = u8[i] << 8;
+      // Treat as 16-bit; primaries/transfer still apply.
+      f32 = avifToLinearP3(u16, width, height, 16, primaries, transfer);
+    }
+
+    return {
+      hdr: depth > 8,
+      pixels: depth > 8 ? packF16(f32) : null,
+      sdrPixels: quantizeToSdrP3(f32),
+      width,
+      height,
+    };
+  } catch (err) {
+    console.warn('HEIC C-API decode failed:', err);
+    return null;
+  } finally {
+    if (img) M._heif_image_release(img);
+    if (handle) M._heif_image_handle_release(handle);
+    if (ctx) M._heif_context_free(ctx);
+    if (optsPtr) M._heif_decoding_options_free(optsPtr);
+    if (inPtr) M._free(inPtr);
+    if (errPtr) M._free(errPtr);
+    if (handlePtrPtr) M._free(handlePtrPtr);
+    if (nclxPtrPtr) M._free(nclxPtrPtr);
+    if (imgPtrPtr) M._free(imgPtrPtr);
+    if (stridePtr) M._free(stridePtr);
+  }
+}
+
+// Last-resort SDR fallback that uses libheif's high-level display() API,
+// which always tonemaps to 8-bit sRGB. We only land here if the C-API
+// path fails for some reason (e.g. an HEIC variant libheif's high-level
+// JS wrapper handles but the C API trips on).
+async function decodeHeicViaDisplay(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  const libheif: any = await getLibheif();
   const decoder = new libheif.HeifDecoder();
-  // libheif-js wants a "file-like" Uint8Array — pass through directly.
   const images = decoder.decode(buf);
   if (!images || images.length === 0) return null;
   const image = images[0];
   const width = image.get_width();
   const height = image.get_height();
-
   const sdrPixels = new Uint8ClampedArray(width * height * 4);
   await new Promise<void>((resolve, reject) => {
     image.display({ data: sdrPixels, width, height }, (out: any) => {
@@ -356,7 +497,6 @@ async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
       else resolve();
     });
   });
-
   return {
     hdr: false,
     pixels: null,
@@ -364,6 +504,12 @@ async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
     width,
     height,
   };
+}
+
+async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  const viaC = await decodeHeicViaCApi(buf);
+  if (viaC) return viaC;
+  return decodeHeicViaDisplay(buf);
 }
 
 // Top-level dispatcher: try every HDR decoder we have. Returns null on
