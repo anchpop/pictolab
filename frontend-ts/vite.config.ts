@@ -4,7 +4,6 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
 import wasm from "vite-plugin-wasm";
-import topLevelAwait from "vite-plugin-top-level-await";
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -16,7 +15,6 @@ export default defineConfig({
     }),
     tailwindcss(),
     wasm(),
-    topLevelAwait(),
   ],
   worker: {
     format: 'es',
@@ -28,9 +26,9 @@ export default defineConfig({
   // we need to keep it out of Vite's depopt and let it serve the wasm asset.
   assetsInclude: ['**/avif_enc.wasm'],
   build: {
-    // The vendored emscripten glue uses modern destructuring that esbuild
-    // can't always lower to vite's default baseline target. Bump to es2022
-    // — well within what we already require (WebGPU, Float16Array, etc).
+    // We require browsers with WebGPU, Float16Array, and top-level await
+    // — es2022 is well within that envelope and lets vite skip the
+    // destructuring lowering that tripped up the vendored emscripten glue.
     target: 'es2022',
   },
   resolve: {

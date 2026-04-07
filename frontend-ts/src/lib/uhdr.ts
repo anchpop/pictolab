@@ -30,14 +30,17 @@ const defaultOptions: EncodeOptions = {
   multiChannelGainmap: 1,
 };
 
+import uhdrWasmUrl from '../../vendor/uhdr-enc/uhdr_enc.wasm?url';
+
 let modulePromise: Promise<any> | null = null;
 
 async function getModule() {
   if (!modulePromise) {
-    const mod: any = await import(
-      /* @vite-ignore */ '../../vendor/uhdr-enc/uhdr_enc.js' as any
-    );
-    modulePromise = mod.default();
+    const mod: any = await import('../../vendor/uhdr-enc/uhdr_enc.js' as any);
+    modulePromise = mod.default({
+      locateFile: (path: string) =>
+        path.endsWith('.wasm') ? uhdrWasmUrl : path,
+    });
   }
   return modulePromise;
 }

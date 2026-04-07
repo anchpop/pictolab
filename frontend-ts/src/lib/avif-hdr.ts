@@ -56,16 +56,21 @@ const defaultOptions: EncodeOptions = {
   fullRange: false,
 };
 
+// Import the wasm as a fingerprinted asset URL so vite emits it into
+// dist/. The emscripten glue's auto-locate logic doesn't survive the
+// bundler reshuffle, so we override locateFile() to point at the URL
+// vite gives us.
+import avifWasmUrl from '../../vendor/avif-enc/enc/avif_enc.wasm?url';
+
 let modulePromise: Promise<any> | null = null;
 
 async function getModule() {
   if (!modulePromise) {
-    // The Vite asset import lets the bundler fingerprint the wasm and
-    // resolve its URL relative to the JS glue.
-    const mod: any = await import(
-      /* @vite-ignore */ '../../vendor/avif-enc/enc/avif_enc.js' as any
-    );
-    modulePromise = mod.default();
+    const mod: any = await import('../../vendor/avif-enc/enc/avif_enc.js' as any);
+    modulePromise = mod.default({
+      locateFile: (path: string) =>
+        path.endsWith('.wasm') ? avifWasmUrl : path,
+    });
   }
   return modulePromise;
 }
