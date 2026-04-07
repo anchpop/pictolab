@@ -159,16 +159,13 @@ function Editor() {
       targetHRef.current = src.h;
       setTargetW(src.w);
       setTargetH(src.h);
-      // Carve is the default mode but needs the seam precompute before
-      // build_carve_lut works. Show the squish output immediately for a
-      // snappy first paint, then swap in the carved result once the
-      // precompute lands.
+      // Carve is the default mode and needs the seam precompute before
+      // build_carve_lut works. Wait for it instead of showing a squish
+      // first paint — the user explicitly opted into content-aware.
       if (resizeModeRef.current === 'carve') {
-        wasmRef.current?.gpu_set_squish_dims(src.w, src.h);
-        setReady(true);
-        requestAnimationFrame(render);
         runPrecompute(src, directionRef.current, () => {
           applyResize();
+          setReady(true);
           render();
         });
       } else {
