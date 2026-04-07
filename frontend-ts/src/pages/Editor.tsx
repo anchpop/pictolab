@@ -421,7 +421,15 @@ function Editor() {
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
             <p className="text-xs text-muted-foreground">
-              Content-aware resize · OKLab color remap · WebGPU
+              <a
+                href="https://avikdas.com/2019/07/29/improved-seam-carving-with-forward-energy.html"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline decoration-dotted hover:text-foreground"
+              >
+                Seam carving with forward energy
+              </a>
+              {' · '}OKLab color remap · WebGPU
             </p>
           </div>
           <div className="flex items-center gap-2">

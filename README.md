@@ -1,3 +1,3 @@
-Random image experiments, mostly involving the LAB color space
-
-Most insteresting experiment is the [seam carving](https://pictolab.io/seam-carving) one
+Random image experiments, mostly involving the OKLab color space, content-aware
+resize via seam carving, and an HDR-aware WebGPU pipeline. Live at
+[pictolab.io](https://pictolab.io).
