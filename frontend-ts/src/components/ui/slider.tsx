@@ -95,6 +95,7 @@ const Slider = React.forwardRef<
       step={step}
       disabled={disabled}
       onValueChange={handleChange}
+      onValueCommit={onValueCommit}
       className={cn(
         "relative flex w-full touch-none select-none items-center",
         className

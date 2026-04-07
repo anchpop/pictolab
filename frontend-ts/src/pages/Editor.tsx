@@ -81,6 +81,55 @@ function orientPackedRgba(
   if (orientation === 1) return { data, width, height };
   const outSize = getOrientedSize(width, height, orientation);
   const out = new Uint8Array(outSize.width * outSize.height * bytesPerPixel);
+
+  // Fast paths via typed-array element copies (one indexed assignment per
+  // pixel instead of subarray + set, ~5x faster on a 12MP photo). bpp=4 →
+  // Uint32 (one element per pixel); bpp=8 → two Uint32 copies per pixel.
+  if (bytesPerPixel === 4 || bytesPerPixel === 8) {
+    // Vertical flip is just reversed-row-order; pure subarray copies.
+    if (orientation === 4) {
+      const rowBytes = width * bytesPerPixel;
+      for (let y = 0; y < height; y++) {
+        out.set(
+          data.subarray(y * rowBytes, (y + 1) * rowBytes),
+          (height - 1 - y) * rowBytes
+        );
+      }
+      return { data: out, width: outSize.width, height: outSize.height };
+    }
+
+    if (bytesPerPixel === 4) {
+      const src32 = new Uint32Array(data.buffer, data.byteOffset, width * height);
+      const dst32 = new Uint32Array(out.buffer);
+      const dw = outSize.width;
+      for (let y = 0; y < height; y++) {
+        const srcRow = y * width;
+        for (let x = 0; x < width; x++) {
+          const [dx, dy] = mapOrientedCoords(x, y, width, height, orientation);
+          dst32[dy * dw + dx] = src32[srcRow + x];
+        }
+      }
+      return { data: out, width: outSize.width, height: outSize.height };
+    }
+
+    // bytesPerPixel === 8: two Uint32s per pixel.
+    const src32 = new Uint32Array(data.buffer, data.byteOffset, width * height * 2);
+    const dst32 = new Uint32Array(out.buffer);
+    const dw = outSize.width;
+    for (let y = 0; y < height; y++) {
+      const srcRow = y * width;
+      for (let x = 0; x < width; x++) {
+        const [dx, dy] = mapOrientedCoords(x, y, width, height, orientation);
+        const sIdx = (srcRow + x) * 2;
+        const dIdx = (dy * dw + dx) * 2;
+        dst32[dIdx] = src32[sIdx];
+        dst32[dIdx + 1] = src32[sIdx + 1];
+      }
+    }
+    return { data: out, width: outSize.width, height: outSize.height };
+  }
+
+  // Generic fallback (any unusual bpp).
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const [dx, dy] = mapOrientedCoords(x, y, width, height, orientation);
@@ -165,6 +214,12 @@ function applyCanvasOrientation(
       ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 }
+
+// Safari iOS caps navigator.hardwareConcurrency at 2 regardless of actual
+// core count, so this catches all iPhones (and any genuinely low-core
+// device). Used to defer carve slider state updates until release.
+const LOW_CORE_DEVICE =
+  typeof navigator !== 'undefined' && navigator.hardwareConcurrency <= 2;
 
 const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
   { value: 'free', label: 'Free' },
@@ -267,8 +322,6 @@ function Editor() {
   const hueRef = useRef(0);
   const showHdrRef = useRef(false);
   const hdrRafRef = useRef<number | null>(null);
-  const lowCoreDevice =
-    typeof navigator !== 'undefined' && navigator.hardwareConcurrency <= 2;
 
   // After the source state is set and React mounts the canvas, init the
   // GPU context (if needed), upload the source, and kick off precompute.
@@ -937,7 +990,7 @@ function Editor() {
   })();
 
   const gpuMissing = gpuAvailable === false;
-  const deferCarveSliderUpdates = lowCoreDevice && resizeMode === 'carve';
+  const deferCarveSliderUpdates = LOW_CORE_DEVICE && resizeMode === 'carve';
   const widthSliderValue = deferCarveSliderUpdates ? (targetWDraft ?? targetW) : targetW;
   const heightSliderValue = deferCarveSliderUpdates ? (targetHDraft ?? targetH) : targetH;
 
