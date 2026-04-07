@@ -57,6 +57,16 @@
 
 .gallery-section {
   margin-bottom: 0.75rem;
+  background: rgba(20, 20, 26, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+.gallery-section .gallery-label {
+  color: #d0d0d0;
 }
 
 .gallery-label {

@@ -681,7 +681,17 @@ function Editor() {
           </div>
         </header>
 
-        <div className="flex flex-1 items-center justify-center overflow-auto p-8">
+        <div
+          className="flex flex-1 items-center justify-center overflow-auto p-8"
+          style={{
+            // Dark canvas with a faint dot grid so the preview area reads
+            // as a workspace, not a flat panel.
+            backgroundColor: '#1a1a1f',
+            backgroundImage:
+              'radial-gradient(circle, rgba(255,255,255,0.12) 1px, transparent 1px)',
+            backgroundSize: '18px 18px',
+          }}
+        >
           {gpuMissing ? (
             <div className="max-w-md text-center text-sm text-muted-foreground">
               WebGPU is required but unavailable on this device. Pictolab needs a
