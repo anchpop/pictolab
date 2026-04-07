@@ -16,9 +16,13 @@ type AspectRatio = 'free' | 'lock' | '1:1' | '4:3' | '3:4' | '16:9' | '9:16';
 
 interface SourceState {
   url: string;
+  // For SDR sources this is 8-bit RGBA in Display P3. For HDR sources
+  // (`hdr: true`) it is tightly packed half-float RGBA in linear extended
+  // Display P3 (8 bytes/pixel), ready for gpu_set_source_linear_f16.
   data: Uint8Array;
   w: number;
   h: number;
+  hdr: boolean;
 }
 
 const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
@@ -79,7 +83,7 @@ function snapCarve(
 function Editor() {
   const [source, setSource] = useState<SourceState | null>(null);
   const [direction, setDirection] = useState<Direction>('width');
-  const [resizeMode, setResizeMode] = useState<ResizeMode>('squish');
+  const [resizeMode, setResizeMode] = useState<ResizeMode>('carve');
   const [aspect, setAspect] = useState<AspectRatio>('free');
   const [targetW, setTargetW] = useState(0);
   const [targetH, setTargetH] = useState(0);
@@ -138,20 +142,43 @@ function Editor() {
           gpuInitedRef.current = true;
         }
         if (cancelled) return;
-        wasm.gpu_set_source(src.data, src.w, src.h);
+        if (src.hdr) {
+          wasm.gpu_set_source_linear_f16(src.data, src.w, src.h);
+        } else {
+          wasm.gpu_set_source(src.data, src.w, src.h);
+        }
       } catch (err) {
         console.error('GPU init/upload failed:', err);
         return;
       }
-      // Default to the squish (Lanczos) path so the editor is interactive
-      // immediately — no need to wait on the seam precompute.
       targetWRef.current = src.w;
       targetHRef.current = src.h;
       setTargetW(src.w);
       setTargetH(src.h);
-      applyResize();
-      setReady(true);
-      requestAnimationFrame(render);
+      // The seam worker still expects 8-bit RGBA for energy compute, so
+      // HDR sources fall back to squish on load. Carve becomes available
+      // again once we add an HDR-aware energy path.
+      if (src.hdr && resizeModeRef.current === 'carve') {
+        resizeModeRef.current = 'squish';
+        setResizeMode('squish');
+      }
+      // Carve is the default mode but needs the seam precompute before
+      // build_carve_lut works. Show the squish output immediately for a
+      // snappy first paint, then swap in the carved result once the
+      // precompute lands.
+      if (resizeModeRef.current === 'carve') {
+        wasmRef.current?.gpu_set_squish_dims(src.w, src.h);
+        setReady(true);
+        requestAnimationFrame(render);
+        runPrecompute(src, directionRef.current, () => {
+          applyResize();
+          render();
+        });
+      } else {
+        applyResize();
+        setReady(true);
+        requestAnimationFrame(render);
+      }
     })();
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -289,17 +316,54 @@ function Editor() {
     });
   };
 
-  const handleImageSelect = (imageUrl: string) => {
+  const handleImageSelect = async (imageUrl: string) => {
     const wasm = wasmRef.current;
     if (!wasm) return;
 
+    // Pull the bytes once so we can both feed the HDR decoder and (on
+    // fallback) hand them to the browser image loader.
+    let buf: Uint8Array;
+    try {
+      const resp = await fetch(imageUrl);
+      buf = new Uint8Array(await resp.arrayBuffer());
+    } catch (err) {
+      console.error('image fetch failed:', err);
+      return;
+    }
+
+    // Try the HDR path first. Returns null for SDR / unsupported formats
+    // so we can fall through to the canvas path.
+    try {
+      const { decodeHdr } = await import('@/lib/hdr-decode');
+      const hdr = await decodeHdr(buf);
+      if (hdr) {
+        const src: SourceState = {
+          url: imageUrl,
+          // Stash the f16 bytes; the GPU upload effect picks the HDR path
+          // when `hdr` is set.
+          data: hdr.pixels,
+          w: hdr.width,
+          h: hdr.height,
+          hdr: true,
+        };
+        setSource(src);
+        sourceRef.current = src;
+        // The histogram path expects 8-bit RGBA; skip it for HDR sources
+        // (clipping readouts will be inert until we add an HDR variant).
+        lcHistRef.current = null;
+        return;
+      }
+    } catch (err) {
+      console.warn('HDR decode threw, falling back to SDR:', err);
+    }
+
+    // SDR path: decode through a 2D canvas in display-p3 space.
+    const blob = new Blob([buf as BlobPart]);
     const img = new Image();
     img.onload = async () => {
       const tmp = document.createElement('canvas');
       tmp.width = img.width;
       tmp.height = img.height;
-      // Decode straight into Display P3 so wide-gamut sources keep their
-      // colors and our pipeline always sees pixels in the same space.
       const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
       ctx.drawImage(img, 0, 0);
       const data = ctx.getImageData(0, 0, img.width, img.height, {
@@ -310,20 +374,16 @@ function Editor() {
         data: new Uint8Array(data.data),
         w: img.width,
         h: img.height,
+        hdr: false,
       };
       setSource(src);
       sourceRef.current = src;
 
       // Compute the L+chroma histogram once so the clipping readouts are live.
       lcHistRef.current = wasm.compute_lc_histogram(src.data);
-
-      // Initialize GPU context against the canvas (once) and upload source.
-      // The canvas element only mounts after `source` is set, so we wait a
-      // frame for React to commit before grabbing it.
-      // GPU init + precompute kicks off from a useEffect once the canvas
-      // element is actually mounted (see below).
+      URL.revokeObjectURL(img.src);
     };
-    img.src = imageUrl;
+    img.src = URL.createObjectURL(blob);
   };
 
   const handleDirectionChange = (dir: Direction) => {

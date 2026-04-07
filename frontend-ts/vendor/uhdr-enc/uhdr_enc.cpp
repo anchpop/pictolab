@@ -103,6 +103,89 @@ val encode(std::string buffer, int width, int height, UhdrOptions options) {
   return owned;
 }
 
+// Quick magic-byte check: "is this an Ultra HDR JPEG?". Mirrors libuhdr's
+// own probe so JS callers can sniff a buffer before paying for a decode.
+bool is_ultra_hdr(std::string buffer) {
+  return is_uhdr_image(const_cast<char*>(buffer.data()), (int)buffer.size()) != 0;
+}
+
+// Decode an Ultra HDR JPEG into linear half-float RGBA pixels (8 bytes per
+// pixel). Color is BT.2100 / Display P3 primaries — the gamut field is
+// returned alongside so the caller can convert if needed. Returns null on
+// failure.
+val decode(std::string buffer) {
+  uhdr_codec_private_t* dec = uhdr_create_decoder();
+  if (!dec) return val::null();
+
+  uhdr_compressed_image_t in{};
+  in.data = const_cast<char*>(buffer.data());
+  in.data_sz = buffer.size();
+  in.capacity = buffer.size();
+  in.cg = UHDR_CG_UNSPECIFIED;
+  in.ct = UHDR_CT_UNSPECIFIED;
+  in.range = UHDR_CR_UNSPECIFIED;
+
+  uhdr_error_info_t err;
+  err = uhdr_dec_set_image(dec, &in);
+  if (err.error_code != UHDR_CODEC_OK) {
+    uhdr_release_decoder(dec);
+    return val::null();
+  }
+
+  // Ask libultrahdr for linear half-float output. Per the API docs,
+  // UHDR_CT_LINEAR must pair with UHDR_IMG_FMT_64bppRGBAHalfFloat.
+  err = uhdr_dec_set_out_img_format(dec, UHDR_IMG_FMT_64bppRGBAHalfFloat);
+  if (err.error_code != UHDR_CODEC_OK) {
+    uhdr_release_decoder(dec);
+    return val::null();
+  }
+  err = uhdr_dec_set_out_color_transfer(dec, UHDR_CT_LINEAR);
+  if (err.error_code != UHDR_CODEC_OK) {
+    uhdr_release_decoder(dec);
+    return val::null();
+  }
+
+  err = uhdr_decode(dec);
+  if (err.error_code != UHDR_CODEC_OK) {
+    uhdr_release_decoder(dec);
+    return val::null();
+  }
+
+  uhdr_raw_image_t* out = uhdr_get_decoded_image(dec);
+  if (!out || !out->planes[UHDR_PLANE_PACKED]) {
+    uhdr_release_decoder(dec);
+    return val::null();
+  }
+
+  const size_t pixel_count = (size_t)out->w * (size_t)out->h;
+  const size_t byte_count = pixel_count * 8; // f16 RGBA
+  uint8_t* src = reinterpret_cast<uint8_t*>(out->planes[UHDR_PLANE_PACKED]);
+  // stride is in *pixels*; row size in bytes is stride * 8.
+  const size_t row_bytes_dst = (size_t)out->w * 8;
+  const size_t row_bytes_src = (size_t)out->stride[UHDR_PLANE_PACKED] * 8;
+
+  // Pack tightly for JS. Allocate via Uint8Array on the JS side.
+  val pixels = Uint8Array.new_(byte_count);
+  if (row_bytes_dst == row_bytes_src) {
+    pixels.call<void>("set", val(typed_memory_view(byte_count, src)));
+  } else {
+    for (size_t y = 0; y < (size_t)out->h; ++y) {
+      val row = val(typed_memory_view(row_bytes_dst, src + y * row_bytes_src));
+      pixels.call<void>("set", row, (unsigned)(y * row_bytes_dst));
+    }
+  }
+
+  val result = val::object();
+  result.set("data", pixels);
+  result.set("width", (int)out->w);
+  result.set("height", (int)out->h);
+  result.set("colorGamut", (int)out->cg);
+  result.set("colorTransfer", (int)out->ct);
+
+  uhdr_release_decoder(dec);
+  return result;
+}
+
 EMSCRIPTEN_BINDINGS(uhdr_module) {
   value_object<UhdrOptions>("UhdrOptions")
       .field("baseQuality", &UhdrOptions::baseQuality)
@@ -112,4 +195,6 @@ EMSCRIPTEN_BINDINGS(uhdr_module) {
       .field("multiChannelGainmap", &UhdrOptions::multiChannelGainmap);
 
   function("encode", &encode);
+  function("decode", &decode);
+  function("isUltraHdr", &is_ultra_hdr);
 }

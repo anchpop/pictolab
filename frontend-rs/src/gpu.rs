@@ -551,8 +551,13 @@ struct GpuCtx {
     device: JsValue,
     queue: JsValue,
 
-    // Source buffer (u32-packed RGBA) and its dimensions.
+    // Source buffer (u32-packed sRGB-encoded RGBA) and its dimensions.
     source_buf: JsValue,
+    // Parallel HDR source buffer (vec4f, linear extended Display P3).
+    // Always bound — when not in use it stays at minimum size and the
+    // remap shader picks the SDR `source_buf` based on `is_hdr_source`.
+    hdr_source_buf: JsValue,
+    is_hdr_source: u32,
     src_w: u32,
     src_h: u32,
     src_n: u32,
@@ -613,7 +618,7 @@ struct Params {
   hue_sin: f32,
   show_hdr: f32,
   time: f32,
-  _pad0: f32,
+  is_hdr_source: f32,
   _pad1: f32,
   _pad2: f32,
   _pad3: f32,
@@ -622,6 +627,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
 @group(0) @binding(1) var<storage, read_write> linp3_out: array<vec4f>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> hdr_in: array<vec4f>;
 
 fn srgb_to_linear(c: f32) -> f32 {
   if (c <= 0.04045) { return c / 12.92; }
@@ -637,18 +643,32 @@ fn cbrt_signed(x: f32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let idx = gid.x;
-  let n = arrayLength(&rgba_in);
+  // Use the HDR source length when active so we don't gate on the
+  // tiny SDR placeholder buffer.
+  let n = select(arrayLength(&rgba_in), arrayLength(&hdr_in), params.is_hdr_source > 0.5);
   if (idx >= n) { return; }
 
-  let p = rgba_in[idx];
-  let r8 = f32(p & 0xFFu) / 255.0;
-  let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
-  let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
-  let a8 = f32((p >> 24u) & 0xFFu) / 255.0;
-
-  let lr = srgb_to_linear(r8);
-  let lg = srgb_to_linear(g8);
-  let lb = srgb_to_linear(b8);
+  var lr: f32;
+  var lg: f32;
+  var lb: f32;
+  var a8: f32;
+  if (params.is_hdr_source > 0.5) {
+    // Already linear extended Display P3, half-float decoded on the host.
+    let h = hdr_in[idx];
+    lr = h.r;
+    lg = h.g;
+    lb = h.b;
+    a8 = h.a;
+  } else {
+    let p = rgba_in[idx];
+    let r8 = f32(p & 0xFFu) / 255.0;
+    let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
+    let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
+    a8 = f32((p >> 24u) & 0xFFu) / 255.0;
+    lr = srgb_to_linear(r8);
+    lg = srgb_to_linear(g8);
+    lb = srgb_to_linear(b8);
+  }
 
   // Linear Display P3 → LMS (precomputed M_xyz_to_lms · M_p3_to_xyz).
   let lms_l = 0.4813371 * lr + 0.4620734 * lg + 0.0565038 * lb;
@@ -873,6 +893,16 @@ fn make_remap_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
         ("binding", 2u32.into()),
         ("visibility", SHADER_COMPUTE.into()),
         ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    // Binding 3: HDR source buffer (vec4f linear extended P3). Always
+    // bound — when an SDR source is active it points at a tiny dummy.
+    entries.push(&js_obj(&[
+        ("binding", 3u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "buffer",
+            js_obj(&[("type", "read-only-storage".into())]).into(),
+        ),
     ]));
     js_call1(
         device,
@@ -1128,12 +1158,19 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     // 4 u32 dims (16 bytes) for the resample shader
     let resample_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
 
+    // The HDR source binding is required by the layout but only used when
+    // an HDR image has been uploaded. Allocate a tiny placeholder up front
+    // so the bind group is always valid.
+    let hdr_source_buf = create_buffer(&device, 16, BUF_STORAGE | BUF_COPY_DST)?;
+
     // Source/remap buffers and textures are created lazily by gpu_set_source
     // and gpu_set_carve_lut once the dimensions are known.
     Ok(GpuCtx {
         device,
         queue,
         source_buf: JsValue::null(),
+        hdr_source_buf,
+        is_hdr_source: 0,
         src_w: 0,
         src_h: 0,
         src_n: 0,
@@ -1200,11 +1237,88 @@ pub fn gpu_set_source(image_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> 
             ctx.remap_bind_group = create_bind_group(
                 &ctx.device,
                 &bgl,
-                &[&ctx.source_buf, &ctx.remap_buf, &ctx.params_buf],
+                &[
+                    &ctx.source_buf,
+                    &ctx.remap_buf,
+                    &ctx.params_buf,
+                    &ctx.hdr_source_buf,
+                ],
             )?;
         }
 
         write_buffer_u8(&ctx.queue, &ctx.source_buf, image_data)?;
+        ctx.is_hdr_source = 0;
+        Ok(())
+    })
+}
+
+// Upload a linear extended Display P3 source as half-float RGBA. The
+// f16 values are unpacked to f32 (4 floats per pixel) and stored in
+// `hdr_source_buf` as `array<vec4f>`. The remap shader picks this buffer
+// when `is_hdr_source != 0`, skipping the 8-bit unpack + sRGB decode.
+#[wasm_bindgen]
+pub fn gpu_set_source_linear_f16(
+    f16_data: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        let n = (w as usize) * (h as usize);
+        let expected = n * 8; // 4 channels * 2 bytes
+        if f16_data.len() < expected {
+            return Err("f16 source buffer too small".into());
+        }
+
+        // Decode f16 → f32 in place into a 16-byte/pixel scratch.
+        let mut f32_buf = vec![0f32; n * 4];
+        for i in 0..(n * 4) {
+            let lo = f16_data[i * 2] as u16;
+            let hi = f16_data[i * 2 + 1] as u16;
+            f32_buf[i] = f16_to_f32(lo | (hi << 8));
+        }
+
+        // (Re)allocate hdr_source_buf + remap_buf + bind group on dim
+        // change. The SDR source_buf is also (re)created at minimum size
+        // so the bind group has a valid binding even though it's unused.
+        if ctx.src_w != w || ctx.src_h != h {
+            if !ctx.hdr_source_buf.is_null() {
+                let _ = js_call0(&ctx.hdr_source_buf, "destroy");
+            }
+            if !ctx.remap_buf.is_null() {
+                let _ = js_call0(&ctx.remap_buf, "destroy");
+            }
+            if !ctx.source_buf.is_null() {
+                let _ = js_call0(&ctx.source_buf, "destroy");
+            }
+            ctx.hdr_source_buf =
+                create_buffer(&ctx.device, (n * 16) as u32, BUF_STORAGE | BUF_COPY_DST)?;
+            ctx.remap_buf = create_buffer(&ctx.device, (n * 16) as u32, BUF_STORAGE)?;
+            // Tiny SDR placeholder so the binding is valid.
+            ctx.source_buf = create_buffer(&ctx.device, 16, BUF_STORAGE | BUF_COPY_DST)?;
+            ctx.src_w = w;
+            ctx.src_h = h;
+            ctx.src_n = w * h;
+
+            let bgl = make_remap_bgl(&ctx.device)?;
+            ctx.remap_bind_group = create_bind_group(
+                &ctx.device,
+                &bgl,
+                &[
+                    &ctx.source_buf,
+                    &ctx.remap_buf,
+                    &ctx.params_buf,
+                    &ctx.hdr_source_buf,
+                ],
+            )?;
+        }
+
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f32_buf.as_ptr() as *const u8, f32_buf.len() * 4)
+        };
+        write_buffer_u8(&ctx.queue, &ctx.hdr_source_buf, bytes)?;
+        ctx.is_hdr_source = 1;
         Ok(())
     })
 }
@@ -1423,7 +1537,7 @@ pub fn gpu_render(
             hue_rad.sin(),
             show_hdr,
             time,
-            0.0,
+            ctx.is_hdr_source as f32,
             0.0,
             0.0,
             0.0,

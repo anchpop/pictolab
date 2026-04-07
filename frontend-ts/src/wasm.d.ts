@@ -49,6 +49,12 @@ declare module 'frontend-rs' {
     height: number
   ): void;
 
+  export function gpu_set_source_linear_f16(
+    f16_data: Uint8Array,
+    width: number,
+    height: number
+  ): void;
+
   export function gpu_set_carve_lut(
     lut: Uint32Array,
     target_w: number,

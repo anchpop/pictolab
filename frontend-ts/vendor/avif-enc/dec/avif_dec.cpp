@@ -49,6 +49,17 @@ val decode(std::string avifimage, uint32_t bitDepth = 8) {
           rgb.height);
     }
 
+    // Surface CICP + source bit-depth so JS can detect HDR (PQ/HLG) inputs
+    // and pick the right color pipeline. We attach these as plain props on
+    // the returned object — for the 8-bit ImageData path we still set them
+    // since ImageData accepts arbitrary props in JS.
+    if (!result.isNull()) {
+      result.set("colorPrimaries", (int)image->colorPrimaries);
+      result.set("transferCharacteristics", (int)image->transferCharacteristics);
+      result.set("matrixCoefficients", (int)image->matrixCoefficients);
+      result.set("sourceDepth", (int)image->depth);
+    }
+
     // Now we can safely free the RGB pixels:
     avifRGBImageFreePixels(&rgb);
   }
