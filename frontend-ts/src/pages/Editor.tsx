@@ -332,21 +332,21 @@ function Editor() {
     // so we can fall through to the canvas path.
     try {
       const { decodeHdr } = await import('@/lib/hdr-decode');
-      const hdr = await decodeHdr(buf);
-      if (hdr) {
+      const decoded = await decodeHdr(buf);
+      if (decoded) {
         const src: SourceState = {
           url: imageUrl,
-          // Stash the f16 bytes; the GPU upload effect picks the HDR path
-          // when `hdr` is set.
-          data: hdr.pixels,
-          sdrData: hdr.sdrPixels,
-          w: hdr.width,
-          h: hdr.height,
-          hdr: true,
+          // For real HDR sources `data` is the f16 buffer; for wasm-decoded
+          // SDR sources (e.g. HEIC) it's the same 8-bit buffer as sdrData.
+          data: decoded.hdr ? decoded.pixels! : decoded.sdrPixels,
+          sdrData: decoded.sdrPixels,
+          w: decoded.width,
+          h: decoded.height,
+          hdr: decoded.hdr,
         };
         setSource(src);
         sourceRef.current = src;
-        // Histogram + seam worker run on the tonemapped SDR proxy.
+        // Histogram + seam worker run on the (tonemapped or actual) SDR proxy.
         lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
         return;
       }

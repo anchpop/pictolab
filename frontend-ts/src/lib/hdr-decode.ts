@@ -19,12 +19,16 @@ const CP_BT2020 = 9;
 const CP_DISPLAY_P3 = 12;
 
 export interface HdrDecodeResult {
+  // True for real HDR (above-1 / wide-gamut). False means we decoded
+  // through a wasm path that produced quantized SDR — Editor should use
+  // gpu_set_source for these.
+  hdr: boolean;
   // Linear extended Display P3, half-float RGBA, tightly packed
-  // (8 bytes/pixel). Suitable for gpu_set_source_linear_f16.
-  pixels: Uint8Array;
-  // 8-bit Display P3 RGBA proxy for the seam worker + histogram, which
-  // both still want quantized SDR pixels. Highlights are tonemapped via
-  // a simple Reinhard-style rolloff so above-1.0 detail isn't crushed.
+  // (8 bytes/pixel). Only present for hdr=true sources.
+  pixels: Uint8Array | null;
+  // 8-bit Display P3 RGBA proxy for the seam worker + histogram. Always
+  // populated. For hdr=true this is a tonemapped quantization of the f16
+  // pixels; for hdr=false it's the actual decoded SDR pixels.
   sdrPixels: Uint8Array;
   width: number;
   height: number;
@@ -253,6 +257,7 @@ async function decodeAvif(buf: Uint8Array): Promise<HdrDecodeResult | null> {
     transfer
   );
   return {
+    hdr: true,
     pixels: packF16(f32),
     sdrPixels: quantizeToSdrP3(f32),
     width: result.width,
@@ -289,10 +294,75 @@ async function decodeUhdr(buf: Uint8Array): Promise<HdrDecodeResult | null> {
     f32[i] = sign ? -v : v;
   }
   return {
+    hdr: true,
     pixels: f16,
     sdrPixels: quantizeToSdrP3(f32),
     width: result.width,
     height: result.height,
+  };
+}
+
+// HEIC magic-byte sniff. The container is ISOBMFF; first 8 bytes are
+// the box length followed by "ftyp", then a 4-char major brand. iPhone
+// HEICs use one of `heic`, `heix`, `mif1`, `msf1`, `heim`, `heis`, `hevc`.
+function isHeic(bytes: Uint8Array): boolean {
+  if (bytes.length < 12) return false;
+  if (bytes[4] !== 0x66 || bytes[5] !== 0x74 || bytes[6] !== 0x79 || bytes[7] !== 0x70) {
+    return false;
+  }
+  const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+  return (
+    brand === 'heic' ||
+    brand === 'heix' ||
+    brand === 'mif1' ||
+    brand === 'msf1' ||
+    brand === 'heim' ||
+    brand === 'heis' ||
+    brand === 'hevc' ||
+    brand === 'hevx'
+  );
+}
+
+let libheifPromise: Promise<any> | null = null;
+async function getLibheif() {
+  if (!libheifPromise) {
+    // The wasm-bundle variant inlines the .wasm as base64 inside the JS,
+    // so vite doesn't need to know about a separate wasm asset.
+    libheifPromise = import('libheif-js/wasm-bundle' as any).then((m) => m.default ?? m);
+  }
+  return libheifPromise;
+}
+
+// Decode an HEIC file via libheif-js. The bundled emscripten build only
+// surfaces 8-bit RGBA through `image.display(...)`, so HDR HEICs are
+// tonemapped to SDR Display P3 inside libheif before we see them. That's
+// fine for the seam carve + edit pipeline; if you want true HDR HEIC,
+// the underlying C API supports 10/12-bit reads (uses heif_decode_image
+// with chroma=interleaved RRGGBBAA_LE).
+async function decodeHeic(buf: Uint8Array): Promise<HdrDecodeResult | null> {
+  const libheif = await getLibheif();
+  const decoder = new libheif.HeifDecoder();
+  // libheif-js wants a "file-like" Uint8Array — pass through directly.
+  const images = decoder.decode(buf);
+  if (!images || images.length === 0) return null;
+  const image = images[0];
+  const width = image.get_width();
+  const height = image.get_height();
+
+  const sdrPixels = new Uint8ClampedArray(width * height * 4);
+  await new Promise<void>((resolve, reject) => {
+    image.display({ data: sdrPixels, width, height }, (out: any) => {
+      if (!out) reject(new Error('libheif display() failed'));
+      else resolve();
+    });
+  });
+
+  return {
+    hdr: false,
+    pixels: null,
+    sdrPixels: new Uint8Array(sdrPixels.buffer, sdrPixels.byteOffset, sdrPixels.byteLength),
+    width,
+    height,
   };
 }
 
@@ -303,6 +373,7 @@ export async function decodeHdr(buf: Uint8Array): Promise<HdrDecodeResult | null
   try {
     if (isAvif(buf)) return await decodeAvif(buf);
     if (isJpeg(buf)) return await decodeUhdr(buf);
+    if (isHeic(buf)) return await decodeHeic(buf);
   } catch (err) {
     console.warn('HDR decode failed, falling back to SDR:', err);
   }
