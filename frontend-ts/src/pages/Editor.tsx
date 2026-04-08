@@ -326,6 +326,7 @@ function orientHdrDecodeResult<T extends {
 // device). Used to defer carve slider state updates until release.
 const LOW_CORE_DEVICE =
   typeof navigator !== 'undefined' && navigator.hardwareConcurrency <= 2;
+const GPU_RECOVERY_DELAY_MS = 250;
 
 const ASPECT_OPTIONS: { value: AspectRatio; label: string }[] = [
   { value: 'free', label: 'Free' },
@@ -753,6 +754,7 @@ function Editor() {
   // Tracks whether the persistent GPU context has been initialized against
   // the current canvas element.
   const gpuInitedRef = useRef(false);
+  const gpuRecoveryRef = useRef<Promise<boolean> | null>(null);
 
   // Cached pieces of the pipeline.
   const wasmRef = useRef<typeof import('frontend-rs') | null>(null);
@@ -775,57 +777,6 @@ function Editor() {
   const hueRef = useRef(0);
   const showHdrRef = useRef(false);
   const hdrRafRef = useRef<number | null>(null);
-
-  // After the source state is set and React mounts the canvas, init the
-  // GPU context (if needed), upload the source, and kick off precompute.
-  useEffect(() => {
-    const wasm = wasmRef.current;
-    const src = source;
-    const c = canvasRef.current;
-    if (!wasm || !src || !c) return;
-    let cancelled = false;
-    (async () => {
-      c.width = src.w;
-      c.height = src.h;
-      try {
-        if (!gpuInitedRef.current) {
-          await wasm.gpu_init(c);
-          gpuInitedRef.current = true;
-          setHdrPresentationActive(wasm.gpu_is_hdr_presentation_active());
-        }
-        if (cancelled) return;
-        if (src.hdr) {
-          wasm.gpu_set_source_linear_f16(src.data, src.w, src.h);
-        } else {
-          wasm.gpu_set_source(src.data, src.w, src.h);
-        }
-      } catch (err) {
-        console.error('GPU init/upload failed:', err);
-        return;
-      }
-      targetWRef.current = src.w;
-      targetHRef.current = src.h;
-      setTargetW(src.w);
-      setTargetH(src.h);
-      setTargetWDraft(null);
-      setTargetHDraft(null);
-      // Carve is the default mode and needs the seam precompute before
-      // build_carve_lut works. We defer that work until the Resize
-      // section is opened; until then, show the source at native size
-      // via the squish path so the editor is immediately interactive.
-      if (resizeModeRef.current === 'carve') {
-        wasm.gpu_set_squish_dims(src.w, src.h);
-        setReady(true);
-        requestAnimationFrame(render);
-      } else {
-        applyResize();
-        setReady(true);
-        requestAnimationFrame(render);
-      }
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [source]);
 
   // Mirror straighten/rotate90/crop state into refs and re-render. The
   // refs are what `render()` reads, so any change to these inputs has
@@ -930,6 +881,100 @@ function Editor() {
     }
   };
 
+  const uploadSourceToGpu = (
+    wasm: typeof import('frontend-rs'),
+    src: SourceState
+  ) => {
+    if (src.hdr) {
+      wasm.gpu_set_source_linear_f16(src.data, src.w, src.h);
+    } else {
+      wasm.gpu_set_source(src.data, src.w, src.h);
+    }
+  };
+
+  const configureGpuForSource = async (src: SourceState, preserveDims: boolean) => {
+    const wasm = wasmRef.current;
+    const c = canvasRef.current;
+    if (!wasm || !c) return;
+
+    c.width = src.w;
+    c.height = src.h;
+
+    if (!gpuInitedRef.current) {
+      await wasm.gpu_init(c);
+      gpuInitedRef.current = true;
+    }
+    setHdrPresentationActive(wasm.gpu_is_hdr_presentation_active());
+    uploadSourceToGpu(wasm, src);
+
+    const haveDims = preserveDims && targetWRef.current > 0 && targetHRef.current > 0;
+    const nextW = haveDims ? targetWRef.current : src.w;
+    const nextH = haveDims ? targetHRef.current : src.h;
+
+    if (!haveDims) {
+      targetWRef.current = nextW;
+      targetHRef.current = nextH;
+      setTargetW(nextW);
+      setTargetH(nextH);
+      setTargetWDraft(null);
+      setTargetHDraft(null);
+    }
+
+    // Carve needs the seam order before it can build the LUT. If we're
+    // recovering before that exists, fall back to a squish preview so the
+    // canvas repaints instead of staying blank.
+    if (
+      resizeModeRef.current === 'carve' &&
+      (!haveDims || !orderRef.current || orderDirectionRef.current !== directionRef.current)
+    ) {
+      wasm.gpu_set_squish_dims(nextW, nextH);
+    } else {
+      applyResize();
+    }
+
+    setReady(true);
+    requestAnimationFrame(render);
+  };
+
+  const recoverGpu = async (reason: string, cause: unknown): Promise<boolean> => {
+    if (gpuRecoveryRef.current) return gpuRecoveryRef.current;
+
+    const job = (async () => {
+      const wasm = wasmRef.current;
+      const src = sourceRef.current;
+      console.error(`GPU ${reason} failed; attempting recovery`, cause);
+      if (!wasm || !src) return false;
+      setReady(false);
+      const resumeHdrLoop = showHdrRef.current;
+      stopHdrLoop();
+
+      // Give transient WebGPU/context hiccups a moment to settle so we don't
+      // immediately thrash through repeated dispose/init cycles.
+      await new Promise((resolve) => window.setTimeout(resolve, GPU_RECOVERY_DELAY_MS));
+
+      try {
+        wasm.gpu_dispose();
+      } catch {
+        /* ignore */
+      }
+      gpuInitedRef.current = false;
+
+      try {
+        await configureGpuForSource(src, true);
+        if (resumeHdrLoop) startHdrLoop();
+        return true;
+      } catch (err) {
+        console.error('GPU recovery failed:', err);
+        return false;
+      } finally {
+        gpuRecoveryRef.current = null;
+      }
+    })();
+
+    gpuRecoveryRef.current = job;
+    return job;
+  };
+
   const syncGpuTransform = (): OutputTransform => {
     const wasm = wasmRef.current;
     const transform = resolveOutputTransform({
@@ -971,40 +1016,44 @@ function Editor() {
   // from any callback.
   const render = () => {
     const wasm = wasmRef.current;
-    if (!wasm || !gpuInitedRef.current) return;
+    if (!wasm || !gpuInitedRef.current || gpuRecoveryRef.current) return;
 
-    const tw = targetWRef.current;
-    const th = targetHRef.current;
-    const transform = syncGpuTransform();
-    const showTransformedPreview = transform.active;
+    try {
+      const tw = targetWRef.current;
+      const th = targetHRef.current;
+      const transform = syncGpuTransform();
+      const showTransformedPreview = transform.active;
 
-    // Sync the canvas attribute + CSS *before* the GPU submit. Setting
-    // canvas.width/height clears the contents, so doing it after a
-    // render would wipe the freshly-drawn frame and the next paint
-    // wouldn't land until the next render() call.
-    const c = canvasRef.current;
-    const src = sourceRef.current;
-    if (c && src) {
-      if (showTransformedPreview) {
-        // Transform active: canvas attribute matches the rotated/cropped dst
-        // dims so the present pass blits 1:1; CSS fills the wrapper
-        // (which has its aspect overridden to dstW/dstH).
-        if (c.width !== transform.dstW) c.width = transform.dstW;
-        if (c.height !== transform.dstH) c.height = transform.dstH;
-        c.style.width = '100%';
-        c.style.height = '100%';
-      } else {
-        if (c.width !== src.w) c.width = src.w;
-        if (c.height !== src.h) c.height = src.h;
-        c.style.width = `${(tw / src.w) * 100}%`;
-        c.style.height = `${(th / src.h) * 100}%`;
+      // Sync the canvas attribute + CSS *before* the GPU submit. Setting
+      // canvas.width/height clears the contents, so doing it after a
+      // render would wipe the freshly-drawn frame and the next paint
+      // wouldn't land until the next render() call.
+      const c = canvasRef.current;
+      const src = sourceRef.current;
+      if (c && src) {
+        if (showTransformedPreview) {
+          // Transform active: canvas attribute matches the rotated/cropped dst
+          // dims so the present pass blits 1:1; CSS fills the wrapper
+          // (which has its aspect overridden to dstW/dstH).
+          if (c.width !== transform.dstW) c.width = transform.dstW;
+          if (c.height !== transform.dstH) c.height = transform.dstH;
+          c.style.width = '100%';
+          c.style.height = '100%';
+        } else {
+          if (c.width !== src.w) c.width = src.w;
+          if (c.height !== src.h) c.height = src.h;
+          c.style.width = `${(tw / src.w) * 100}%`;
+          c.style.height = `${(th / src.h) * 100}%`;
+        }
       }
-    }
 
-    const [lMin, lMax] = lRangeRef.current;
-    const [cMin, cMax] = cRangeRef.current;
-    const t = performance.now() / 1000;
-    wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
+      const [lMin, lMax] = lRangeRef.current;
+      const [cMin, cMax] = cRangeRef.current;
+      const t = performance.now() / 1000;
+      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
+    } catch (err) {
+      void recoverGpu('render', err);
+    }
   };
 
   // Animation loop for HDR view: re-renders every frame so the marker
@@ -1038,6 +1087,25 @@ function Editor() {
       render();
     }
   };
+
+  // After the source state is set and React mounts the canvas, init the
+  // GPU context (if needed), upload the source, and kick off precompute.
+  useEffect(() => {
+    const src = source;
+    if (!src) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await configureGpuForSource(src, false);
+      } catch (err) {
+        if (!cancelled) {
+          void recoverGpu('init/upload', err);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source]);
 
   // Run seam-order precompute via worker. Used by the carve path; the
   // squish path doesn't need this.
