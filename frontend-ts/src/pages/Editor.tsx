@@ -1585,7 +1585,7 @@ function Editor() {
 
       <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
         {/* ── Main preview area ──────────────────────────────────────── */}
-        <main className="sticky top-0 z-30 flex max-h-[70vh] flex-1 flex-col bg-background lg:static lg:min-h-0 lg:max-h-none">
+        <main className="flex flex-1 flex-col bg-background lg:min-h-0">
         <div
           className="flex flex-1 items-center justify-center overflow-auto p-4 sm:p-8"
           style={{
