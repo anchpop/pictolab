@@ -160,80 +160,134 @@ function orientPackedRgba(
   };
 }
 
-// Read the JPEG SOF marker to get the *raw stored* pixel dims, before any
-// EXIF rotation. We use this as ground truth to detect when an upstream
-// decoder (libultrahdr, libheif) has already auto-applied EXIF orientation,
-// so we don't double-rotate.
-function parseJpegStoredDims(buf: Uint8Array): { width: number; height: number } | null {
+type JpegMetadata = {
+  orientation: ExifOrientation;
+  storedWidth: number | null;
+  storedHeight: number | null;
+};
+
+function parseExifOrientationFromApp1(
+  buf: Uint8Array,
+  segmentStart: number,
+  segmentEnd: number
+): ExifOrientation | null {
+  if (segmentStart + 14 > segmentEnd) return null;
+  if (
+    buf[segmentStart] !== 0x45 || buf[segmentStart + 1] !== 0x78 ||
+    buf[segmentStart + 2] !== 0x69 || buf[segmentStart + 3] !== 0x66 ||
+    buf[segmentStart + 4] !== 0x00 || buf[segmentStart + 5] !== 0x00
+  ) {
+    return null;
+  }
+
+  const tiff = segmentStart + 6;
+  const byteOrderA = buf[tiff];
+  const byteOrderB = buf[tiff + 1];
+  const little = byteOrderA === 0x49 && byteOrderB === 0x49;
+  const big = byteOrderA === 0x4d && byteOrderB === 0x4d;
+  if (!little && !big) return null;
+
+  const read16 = (offset: number): number | null => {
+    if (offset + 1 >= segmentEnd) return null;
+    return little
+      ? (buf[offset] | (buf[offset + 1] << 8))
+      : ((buf[offset] << 8) | buf[offset + 1]);
+  };
+
+  const read32 = (offset: number): number | null => {
+    if (offset + 3 >= segmentEnd) return null;
+    return little
+      ? (
+        buf[offset] |
+        (buf[offset + 1] << 8) |
+        (buf[offset + 2] << 16) |
+        (buf[offset + 3] << 24)
+      ) >>> 0
+      : (
+        (buf[offset] << 24) |
+        (buf[offset + 1] << 16) |
+        (buf[offset + 2] << 8) |
+        buf[offset + 3]
+      ) >>> 0;
+  };
+
+  if (read16(tiff + 2) !== 42) return null;
+  const ifdOffset = read32(tiff + 4);
+  if (ifdOffset === null) return null;
+  const ifd0 = tiff + ifdOffset;
+  const entryCount = read16(ifd0);
+  if (entryCount === null) return null;
+
+  for (let j = 0; j < entryCount; j++) {
+    const entry = ifd0 + 2 + j * 12;
+    if (entry + 11 >= segmentEnd) return null;
+    const tag = read16(entry);
+    const type = read16(entry + 2);
+    const count = read32(entry + 4);
+    if (tag === 0x0112 && type === 3 && count === 1) {
+      const value = read16(entry + 8);
+      return value === null ? null : normalizeOrientation(value);
+    }
+  }
+  return null;
+}
+
+// Scan the JPEG metadata once to get both the raw stored SOF dims and the
+// EXIF Orientation tag. We own this parse instead of delegating to exifr so
+// the critical JPEG upload path behaves the same across browsers.
+function scanJpegMetadata(buf: Uint8Array): JpegMetadata | null {
   if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
   let i = 2;
-  while (i + 9 < buf.length) {
-    if (buf[i] !== 0xff) return null;
-    const marker = buf[i + 1];
-    // SOF0..SOF15, excluding DHT(C4), JPG(C8), DAC(CC).
+  let orientation: ExifOrientation = 1;
+  let storedWidth: number | null = null;
+  let storedHeight: number | null = null;
+
+  while (i < buf.length) {
+    while (i < buf.length && buf[i] === 0xff) i++;
+    if (i >= buf.length) break;
+    const marker = buf[i++];
+
+    // Start-of-scan switches into entropy-coded data where segment parsing no
+    // longer applies. EOI means there is nothing left to inspect.
+    if (marker === 0xda || marker === 0xd9) break;
+    // TEM and restart markers have no payload length.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (i + 1 >= buf.length) break;
+
+    const size = (buf[i] << 8) | buf[i + 1];
+    if (size < 2 || i + size > buf.length) break;
+    const segmentStart = i + 2;
+    const segmentEnd = i + size;
+
     if (
+      storedWidth === null &&
       marker >= 0xc0 && marker <= 0xcf &&
-      marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc &&
+      segmentStart + 4 < segmentEnd
     ) {
-      const h = (buf[i + 5] << 8) | buf[i + 6];
-      const w = (buf[i + 7] << 8) | buf[i + 8];
-      return { width: w, height: h };
+      storedHeight = (buf[segmentStart + 1] << 8) | buf[segmentStart + 2];
+      storedWidth = (buf[segmentStart + 3] << 8) | buf[segmentStart + 4];
+    } else if (marker === 0xe1 && orientation === 1) {
+      const parsed = parseExifOrientationFromApp1(buf, segmentStart, segmentEnd);
+      if (parsed !== null) orientation = parsed;
     }
-    const size = (buf[i + 2] << 8) | buf[i + 3];
-    if (size < 2) return null;
-    i += 2 + size;
+
+    i = segmentEnd;
   }
-  return null;
+
+  return { orientation, storedWidth, storedHeight };
 }
 
-// Inline JPEG EXIF Orientation parser. We hand-roll this instead of going
-// through exifr because exifr has been observed returning Orientation=1 on
-// iOS Chrome even when the EXIF block clearly contains a non-1 value, which
-// caused iPhone uploads to render rotated.
-function parseJpegExifOrientation(buf: Uint8Array): ExifOrientation | null {
-  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
-  let i = 2;
-  while (i + 4 < buf.length) {
-    if (buf[i] !== 0xff) return null;
-    const marker = buf[i + 1];
-    const size = (buf[i + 2] << 8) | buf[i + 3];
-    if (size < 2) return null;
-    if (marker === 0xe1 && i + 10 < buf.length) {
-      if (
-        buf[i + 4] === 0x45 && buf[i + 5] === 0x78 &&
-        buf[i + 6] === 0x69 && buf[i + 7] === 0x66
-      ) {
-        const tiff = i + 10;
-        const little = buf[tiff] === 0x49;
-        const get16 = (o: number) => little
-          ? (buf[o] | (buf[o + 1] << 8))
-          : ((buf[o] << 8) | buf[o + 1]);
-        const get32 = (o: number) => little
-          ? (buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16) | (buf[o + 3] << 24))
-          : ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]);
-        const ifd0 = tiff + get32(tiff + 4);
-        if (ifd0 + 2 > buf.length) return null;
-        const n = get16(ifd0);
-        for (let j = 0; j < n; j++) {
-          const e = ifd0 + 2 + j * 12;
-          if (e + 12 > buf.length) return null;
-          if (get16(e) === 0x0112) {
-            return normalizeOrientation(get16(e + 8));
-          }
-        }
-      }
-    }
-    i += 2 + size;
-  }
-  return null;
-}
-
-async function parseOrientation(buf: Uint8Array): Promise<ExifOrientation> {
-  const inline = parseJpegExifOrientation(buf);
-  if (inline !== null) return inline;
+async function parseOrientation(
+  buf: Uint8Array,
+  jpegMeta: JpegMetadata | null = scanJpegMetadata(buf)
+): Promise<ExifOrientation> {
+  if (jpegMeta) return jpegMeta.orientation;
   try {
     const exifr = await import('exifr');
-    const parsed: any = await exifr.parse(buf, ['Orientation']).catch(() => null);
+    const parsed = await exifr.parse(buf, ['Orientation']).catch(() => null) as
+      | { Orientation?: unknown }
+      | null;
     return normalizeOrientation(parsed?.Orientation);
   } catch {
     return 1;
@@ -1042,8 +1096,11 @@ function Editor() {
       console.error('image fetch failed:', err);
       return;
     }
-    const orientation = await parseOrientation(buf);
-    const storedJpegDims = parseJpegStoredDims(buf);
+    const jpegMeta = scanJpegMetadata(buf);
+    const orientation = await parseOrientation(buf, jpegMeta);
+    const storedJpegDims = jpegMeta?.storedWidth && jpegMeta?.storedHeight
+      ? { width: jpegMeta.storedWidth, height: jpegMeta.storedHeight }
+      : null;
 
     // Try the HDR path first. Returns null for SDR / unsupported formats
     // so we can fall through to the canvas path.
