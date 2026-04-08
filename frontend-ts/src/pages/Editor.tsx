@@ -197,39 +197,6 @@ function orientHdrDecodeResult<T extends {
   };
 }
 
-function applyCanvasOrientation(
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-  orientation: ExifOrientation
-) {
-  switch (orientation) {
-    case 2:
-      ctx.setTransform(-1, 0, 0, 1, width, 0);
-      break;
-    case 3:
-      ctx.setTransform(-1, 0, 0, -1, width, height);
-      break;
-    case 4:
-      ctx.setTransform(1, 0, 0, -1, 0, height);
-      break;
-    case 5:
-      ctx.setTransform(0, 1, 1, 0, 0, 0);
-      break;
-    case 6:
-      ctx.setTransform(0, 1, -1, 0, height, 0);
-      break;
-    case 7:
-      ctx.setTransform(0, -1, -1, 0, height, width);
-      break;
-    case 8:
-      ctx.setTransform(0, -1, 1, 0, 0, width);
-      break;
-    default:
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-  }
-}
-
 // Safari iOS caps navigator.hardwareConcurrency at 2 regardless of actual
 // core count, so this catches all iPhones (and any genuinely low-core
 // device). Used to defer carve slider state updates until release.
