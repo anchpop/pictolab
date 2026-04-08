@@ -43,6 +43,8 @@ declare module 'frontend-rs' {
 
   export function gpu_init(canvas: HTMLCanvasElement): Promise<void>;
 
+  export function gpu_is_hdr_presentation_active(): boolean;
+
   export function gpu_set_source(
     image_data: Uint8Array,
     width: number,
@@ -62,6 +64,19 @@ declare module 'frontend-rs' {
   ): void;
 
   export function gpu_set_squish_dims(target_w: number, target_h: number): void;
+
+  export function gpu_set_rotation(
+    m00: number,
+    m01: number,
+    m10: number,
+    m11: number,
+    t0: number,
+    t1: number,
+    dst_w: number,
+    dst_h: number
+  ): void;
+
+  export function gpu_clear_rotation(): void;
 
   export function gpu_render(
     l_min: number,

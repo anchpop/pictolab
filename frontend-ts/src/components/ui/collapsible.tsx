@@ -7,9 +7,14 @@ interface CollapsibleProps {
   label: React.ReactNode
   /** Initial open state. */
   defaultOpen?: boolean
+  /** Controlled open state. */
+  open?: boolean
+  /** Controlled state change callback. */
+  onOpenChange?: (open: boolean) => void
   /** Optional right-side content shown in the header (e.g. a status pill). */
   meta?: React.ReactNode
   className?: string
+  contentClassName?: string
   children: React.ReactNode
 }
 
@@ -22,11 +27,20 @@ interface CollapsibleProps {
 export function Collapsible({
   label,
   defaultOpen = false,
+  open: openProp,
+  onOpenChange,
   meta,
   className,
+  contentClassName,
   children,
 }: CollapsibleProps) {
-  const [open, setOpen] = React.useState(defaultOpen)
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(defaultOpen)
+  const open = openProp ?? uncontrolledOpen
+  const setOpen = (next: boolean | ((prev: boolean) => boolean)) => {
+    const resolved = typeof next === "function" ? next(open) : next
+    if (openProp === undefined) setUncontrolledOpen(resolved)
+    onOpenChange?.(resolved)
+  }
   return (
     <div className={cn("space-y-2", className)}>
       <button
@@ -46,7 +60,7 @@ export function Collapsible({
         </span>
         {meta}
       </button>
-      {open && <div>{children}</div>}
+      {open && <div className={cn("space-y-2", contentClassName)}>{children}</div>}
     </div>
   )
 }

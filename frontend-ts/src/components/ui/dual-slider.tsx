@@ -48,10 +48,14 @@ export function DualSlider({
   }
   const trackRef = React.useRef<HTMLDivElement>(null)
   const activeRef = React.useRef<0 | 1 | null>(null)
+  const [isHovered, setIsHovered] = React.useState(false)
+  const [isFocused, setIsFocused] = React.useState(false)
+  const [isDragging, setIsDragging] = React.useState(false)
 
   const pct = (v: number) => ((v - min) / (max - min)) * 100
   const lo = Math.min(value[0], value[1])
   const hi = Math.max(value[0], value[1])
+  const showSafeRange = isHovered || isFocused || isDragging
 
   const valueFromClientX = (clientX: number) => {
     const track = trackRef.current
@@ -66,6 +70,7 @@ export function DualSlider({
     e.preventDefault()
     e.stopPropagation()
     activeRef.current = idx
+    setIsDragging(true)
     ;(e.target as Element).setPointerCapture?.(e.pointerId)
   }
 
@@ -81,6 +86,7 @@ export function DualSlider({
   const handlePointerUp = (e: React.PointerEvent) => {
     if (activeRef.current === null) return
     activeRef.current = null
+    setIsDragging(false)
     ;(e.target as Element).releasePointerCapture?.(e.pointerId)
   }
 
@@ -94,6 +100,7 @@ export function DualSlider({
     next[idx] = v
     onValueChange(next)
     activeRef.current = idx
+    setIsDragging(true)
     ;(e.currentTarget as Element).setPointerCapture?.(e.pointerId)
   }
 
@@ -103,6 +110,14 @@ export function DualSlider({
         "relative flex h-9 w-full touch-none select-none items-center",
         className
       )}
+      onPointerEnter={() => setIsHovered(true)}
+      onPointerLeave={() => setIsHovered(false)}
+      onFocusCapture={() => setIsFocused(true)}
+      onBlurCapture={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setIsFocused(false)
+        }
+      }}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
@@ -114,13 +129,19 @@ export function DualSlider({
       >
         {safeRange && safeRange[0] > min && (
           <div
-            className="absolute h-full bg-destructive/40"
+            className={cn(
+              "absolute h-full bg-destructive/35 transition-opacity duration-150",
+              showSafeRange ? "opacity-100" : "opacity-0"
+            )}
             style={{ left: 0, width: `${pct(safeRange[0])}%` }}
           />
         )}
         {safeRange && safeRange[1] < max && (
           <div
-            className="absolute h-full bg-destructive/40"
+            className={cn(
+              "absolute h-full bg-destructive/35 transition-opacity duration-150",
+              showSafeRange ? "opacity-100" : "opacity-0"
+            )}
             style={{ left: `${pct(safeRange[1])}%`, width: `${100 - pct(safeRange[1])}%` }}
           />
         )}

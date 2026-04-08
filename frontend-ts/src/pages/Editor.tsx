@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeftRight, Download, Eye, ImagePlus, Loader2, Minus, Plus } from 'lucide-react';
+import { ArrowLeftRight, Crop as CropIcon, Download, Eye, ImagePlus, Loader2, Minus, Plus, RotateCcw, RotateCw, X } from 'lucide-react';
 import ImageDropZone from '@/components/ImageDropZone';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -10,6 +10,7 @@ import { Slider } from '@/components/ui/slider';
 import { DualSlider } from '@/components/ui/dual-slider';
 import { Segmented } from '@/components/ui/segmented';
 import { Collapsible } from '@/components/ui/collapsible';
+import { cn } from '@/lib/utils';
 
 type Direction = 'width' | 'height';
 type ResizeMode = 'squish' | 'carve';
@@ -32,6 +33,17 @@ interface SourceState {
   // export silently drops the alpha channel.
   hasAlpha: boolean;
 }
+
+type CropRect = { x: number; y: number; w: number; h: number };
+
+type OutputTransform = {
+  active: boolean;
+  m: [number, number, number, number, number, number];
+  dstW: number;
+  dstH: number;
+};
+
+type Point = { x: number; y: number };
 
 // Scan an 8-bit RGBA buffer for any non-opaque pixel. Cheap O(n) walk.
 function bufferHasAlpha(rgba: Uint8Array): boolean {
@@ -247,6 +259,334 @@ function aspectRatioValue(ar: AspectRatio, src: SourceState): number | null {
   }
 }
 
+// Photo-app-style angle slider: a strip of tick marks that the user
+// clicks/drags through, with a number bubble over the active tick.
+// Drag is captured pointer-style so it survives leaving the strip
+// while held.
+function TickSlider({
+  value,
+  min,
+  max,
+  onChange,
+  disabled = false,
+  tickStep = 1,
+  majorTickStep = 5,
+  snapStep = 0.1,
+  trackClassName,
+  activeTickClassName = 'bg-amber-500',
+  activeMarkerClassName = 'bg-amber-500',
+  title = 'Drag to adjust · double-click to reset',
+  resetTitle = 'Reset to 0°',
+  formatValue = (v: number) => `${v.toFixed(1)}°`,
+}: {
+  value: number;
+  min: number;
+  max: number;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+  tickStep?: number;
+  majorTickStep?: number;
+  snapStep?: number;
+  trackClassName?: string;
+  activeTickClassName?: string;
+  activeMarkerClassName?: string;
+  title?: string;
+  resetTitle?: string;
+  formatValue?: (v: number) => string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+
+  const setFromPointer = (clientX: number) => {
+    const el = ref.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const f = (clientX - rect.left) / rect.width;
+    const clamped = Math.max(0, Math.min(1, f));
+    const raw = min + clamped * (max - min);
+    const snapped = Math.round(raw / snapStep) * snapStep;
+    onChange(snapped);
+  };
+
+  const ticks: { v: number; major: boolean }[] = [];
+  for (let v = min; v <= max; v += tickStep) {
+    const rounded = Math.round(v * 1000) / 1000;
+    const major = Math.abs(rounded / majorTickStep - Math.round(rounded / majorTickStep)) < 1e-6;
+    ticks.push({ v: rounded, major });
+  }
+
+  const fraction = Math.max(0, Math.min(1, (value - min) / (max - min)));
+
+  return (
+    <div
+      className={
+        'flex flex-1 flex-col items-center gap-1 select-none ' +
+        (disabled ? 'opacity-50' : '')
+      }
+    >
+      {/* Number bubble over the current value */}
+      <div className="relative h-5 w-full">
+        <div
+          className="absolute -translate-x-1/2 rounded-full border border-border bg-background px-2 py-0.5 font-mono text-[10px] text-foreground shadow-sm"
+          style={{ left: `${fraction * 100}%` }}
+        >
+          {formatValue(value)}
+        </div>
+      </div>
+      {/* Tick strip */}
+      <div
+        ref={ref}
+        className={cn(
+          'relative h-7 w-full touch-none rounded-md bg-zinc-900 px-2',
+          trackClassName,
+          disabled ? 'cursor-default' : 'cursor-pointer'
+        )}
+        onPointerDown={(e) => {
+          if (disabled) return;
+          dragging.current = true;
+          (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+          setFromPointer(e.clientX);
+        }}
+        onPointerMove={(e) => {
+          if (disabled) return;
+          if (!dragging.current) return;
+          setFromPointer(e.clientX);
+        }}
+        onPointerUp={(e) => {
+          if (disabled) return;
+          dragging.current = false;
+          (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+        }}
+        onDoubleClick={() => {
+          if (!disabled) onChange(0);
+        }}
+        title={title}
+      >
+        {/* Center reference dot (sits at value = midpoint) */}
+        <div
+          className="absolute top-0 h-1 w-1 -translate-x-1/2 rounded-full bg-muted-foreground/60"
+          style={{ left: '50%' }}
+        />
+        {ticks.map((t) => {
+          const f = (t.v - min) / (max - min);
+          // Highlight ticks between center and current value.
+          const lit =
+            (value >= 0 && t.v >= 0 && t.v <= value) ||
+            (value <= 0 && t.v <= 0 && t.v >= value);
+          return (
+            <div
+              key={t.v}
+              className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2"
+              style={{ left: `${f * 100}%` }}
+            >
+              <div
+                className={cn(
+                  lit
+                    ? activeTickClassName
+                    : t.major
+                    ? 'bg-zinc-300'
+                    : 'bg-zinc-500',
+                  t.major ? 'h-4 w-px' : 'h-2 w-px'
+                )}
+              />
+            </div>
+          );
+        })}
+        {/* Active position marker */}
+        <div
+          className={cn('absolute top-0 bottom-0 w-px', activeMarkerClassName)}
+          style={{ left: `${fraction * 100}%` }}
+        />
+      </div>
+      {/* Reset to 0° */}
+      <button
+        type="button"
+        onClick={() => onChange(0)}
+        disabled={disabled || value === 0}
+        title={resetTitle}
+        className="rounded-full p-1 text-muted-foreground hover:text-foreground disabled:cursor-default disabled:opacity-30"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+function normalizeQuarterTurns(rotate90: number): number {
+  return ((rotate90 % 4) + 4) % 4;
+}
+
+function clampCropRect(crop: CropRect | null, targetW: number, targetH: number): CropRect | null {
+  if (!crop) return null;
+  const x = Math.max(0, Math.min(targetW - 1, crop.x));
+  const y = Math.max(0, Math.min(targetH - 1, crop.y));
+  const maxW = Math.max(1, targetW - x);
+  const maxH = Math.max(1, targetH - y);
+  const w = Math.max(1, Math.min(maxW, crop.w));
+  const h = Math.max(1, Math.min(maxH, crop.h));
+  if (x <= 0 && y <= 0 && w >= targetW && h >= targetH) return null;
+  return { x, y, w, h };
+}
+
+function scaleCropRect(
+  crop: CropRect | null,
+  prevW: number,
+  prevH: number,
+  nextW: number,
+  nextH: number
+): CropRect | null {
+  if (!crop || prevW <= 0 || prevH <= 0) return crop;
+  const sx = nextW / prevW;
+  const sy = nextH / prevH;
+  return clampCropRect(
+    {
+      x: crop.x * sx,
+      y: crop.y * sy,
+      w: crop.w * sx,
+      h: crop.h * sy,
+    },
+    nextW,
+    nextH
+  );
+}
+
+function scalePoint(
+  point: Point | null,
+  prevW: number,
+  prevH: number,
+  nextW: number,
+  nextH: number
+): Point | null {
+  if (!point || prevW <= 0 || prevH <= 0) return point;
+  return {
+    x: point.x * (nextW / prevW),
+    y: point.y * (nextH / prevH),
+  };
+}
+
+function mapPreviewPointToSource(transform: OutputTransform, point: Point): Point {
+  const [m00, m01, m10, m11, t0, t1] = transform.m;
+  return {
+    x: m00 * point.x + m01 * point.y + t0,
+    y: m10 * point.x + m11 * point.y + t1,
+  };
+}
+
+function mapSourcePointToPreview(transform: OutputTransform, point: Point): Point {
+  const [m00, m01, m10, m11, t0, t1] = transform.m;
+  const sx = point.x - t0;
+  const sy = point.y - t1;
+  return {
+    x: m00 * sx + m10 * sy,
+    y: m01 * sx + m11 * sy,
+  };
+}
+
+function recenterCropRect(
+  crop: CropRect | null,
+  previewTransform: OutputTransform,
+  anchor: Point | null
+): CropRect | null {
+  if (!crop || !anchor) return crop;
+  const center = mapSourcePointToPreview(previewTransform, anchor);
+  return clampCropRect(
+    {
+      x: center.x - crop.w / 2,
+      y: center.y - crop.h / 2,
+      w: crop.w,
+      h: crop.h,
+    },
+    previewTransform.dstW,
+    previewTransform.dstH
+  );
+}
+
+function resolveRotationTransform(args: {
+  targetW: number;
+  targetH: number;
+  straightenDeg: number;
+  rotate90: number;
+}): OutputTransform {
+  const { targetW, targetH, straightenDeg, rotate90 } = args;
+  const cx = targetW / 2;
+  const cy = targetH / 2;
+
+  const turns = normalizeQuarterTurns(rotate90);
+  const theta = ((turns * 90 + straightenDeg) * Math.PI) / 180;
+  const swap = turns % 2 === 1;
+  const baseW = swap ? targetH : targetW;
+  const baseH = swap ? targetW : targetH;
+
+  const cosT = Math.cos(theta);
+  const sinT = Math.sin(theta);
+
+  // Solve for the largest scale factor s ∈ (0, 1] such that the four
+  // dst corners, mapped to src via R(θ), all stay inside the source.
+  let s = 1;
+  for (const sgnX of [-1, 1]) {
+    for (const sgnY of [-1, 1]) {
+      const dx = (sgnX * baseW) / 2;
+      const dy = (sgnY * baseH) / 2;
+      const ox = cosT * dx - sinT * dy;
+      const oy = sinT * dx + cosT * dy;
+      if (ox > 1e-9) s = Math.min(s, (targetW - cx) / ox);
+      else if (ox < -1e-9) s = Math.min(s, -cx / ox);
+      if (oy > 1e-9) s = Math.min(s, (targetH - cy) / oy);
+      else if (oy < -1e-9) s = Math.min(s, -cy / oy);
+    }
+  }
+  s = Math.max(0, s);
+
+  const dstW = Math.max(1, Math.round(baseW * s));
+  const dstH = Math.max(1, Math.round(baseH * s));
+
+  // Forward dst→src: src = C + R(θ) · (dst - dstCenter)
+  //   sx = cx + cosT·(dx - dstW/2) - sinT·(dy - dstH/2)
+  //   sy = cy + sinT·(dx - dstW/2) + cosT·(dy - dstH/2)
+  const m00 = cosT;
+  const m01 = -sinT;
+  const m10 = sinT;
+  const m11 = cosT;
+  const t0 = cx - cosT * (dstW / 2) + sinT * (dstH / 2);
+  const t1 = cy - sinT * (dstW / 2) - cosT * (dstH / 2);
+
+  const active = straightenDeg !== 0 || turns !== 0;
+  return { active, m: [m00, m01, m10, m11, t0, t1], dstW, dstH };
+}
+
+function applyCropToTransform(base: OutputTransform, crop: CropRect | null): OutputTransform {
+  const clampedCrop = clampCropRect(crop, base.dstW, base.dstH);
+  if (!clampedCrop) return base;
+  const [m00, m01, m10, m11, t0, t1] = base.m;
+  return {
+    active: true,
+    m: [
+      m00,
+      m01,
+      m10,
+      m11,
+      m00 * clampedCrop.x + m01 * clampedCrop.y + t0,
+      m10 * clampedCrop.x + m11 * clampedCrop.y + t1,
+    ],
+    dstW: Math.max(1, Math.round(clampedCrop.w)),
+    dstH: Math.max(1, Math.round(clampedCrop.h)),
+  };
+}
+
+// Resolve the final GPU output transform for the current crop + rotation
+// controls. Crop lives in the rotated/straightened preview space and is
+// applied as the final stage after the base rotation transform.
+function resolveOutputTransform(args: {
+  targetW: number;
+  targetH: number;
+  crop: CropRect | null;
+  straightenDeg: number;
+  rotate90: number;
+}): OutputTransform {
+  const base = resolveRotationTransform(args);
+  return applyCropToTransform(base, args.crop);
+}
+
 // Largest (W, H) ≤ (src.w, src.h) that satisfies the ratio. Used for the
 // initial snap when an aspect is selected; subsequent slider drags
 // re-derive the other dim from the dragged one.
@@ -294,8 +634,27 @@ function Editor() {
   const [showHdr, setShowHdr] = useState(false);
   // null = still detecting, true/false = known result.
   const [gpuAvailable, setGpuAvailable] = useState<boolean | null>(null);
+  const [hdrPresentationActive, setHdrPresentationActive] = useState<boolean | null>(null);
+  const [resizeOpen, setResizeOpen] = useState(false);
+  const [lightnessOpen, setLightnessOpen] = useState(false);
+  const [chromaOpen, setChromaOpen] = useState(false);
+  const [hueOpen, setHueOpen] = useState(false);
+  const [exportOpen, setExportOpen] = useState(true);
   const [targetWDraft, setTargetWDraft] = useState<number | null>(null);
   const [targetHDraft, setTargetHDraft] = useState<number | null>(null);
+
+  // Straighten + 90° rotation. Composed at the end of the pipeline by a
+  // Lanczos rotation pass on the GPU.
+  const [cropTool, setCropTool] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [cropDrag, setCropDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const [straightenDeg, setStraightenDeg] = useState(0);
+  const [rotate90, setRotate90] = useState(0);
+  const straightenDegRef = useRef(0);
+  const rotate90Ref = useRef(0);
+  const cropRectRef = useRef<CropRect | null>(null);
+  const cropAnchorRef = useRef<Point | null>(null);
+  const cropToolRef = useRef(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -341,6 +700,7 @@ function Editor() {
         if (!gpuInitedRef.current) {
           await wasm.gpu_init(c);
           gpuInitedRef.current = true;
+          setHdrPresentationActive(wasm.gpu_is_hdr_presentation_active());
         }
         if (cancelled) return;
         if (src.hdr) {
@@ -359,18 +719,13 @@ function Editor() {
       setTargetWDraft(null);
       setTargetHDraft(null);
       // Carve is the default mode and needs the seam precompute before
-      // build_carve_lut works. Show the source at its native size as a
-      // first paint (identity Lanczos = the unmodified image, not a
-      // resize fallback) so the canvas isn't blank while we wait. All
-      // resize controls are gated on isPrecomputing.
+      // build_carve_lut works. We defer that work until the Resize
+      // section is opened; until then, show the source at native size
+      // via the squish path so the editor is immediately interactive.
       if (resizeModeRef.current === 'carve') {
         wasm.gpu_set_squish_dims(src.w, src.h);
         setReady(true);
         requestAnimationFrame(render);
-        runPrecompute(src, directionRef.current, () => {
-          applyResize();
-          render();
-        });
       } else {
         applyResize();
         setReady(true);
@@ -380,6 +735,48 @@ function Editor() {
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source]);
+
+  // Mirror straighten/rotate90/crop state into refs and re-render. The
+  // refs are what `render()` reads, so any change to these inputs has
+  // to land in the refs *before* we kick the GPU.
+  useEffect(() => {
+    straightenDegRef.current = straightenDeg;
+    rotate90Ref.current = rotate90;
+    cropRectRef.current = cropRect;
+    cropToolRef.current = cropTool;
+    if (sourceRef.current && ready) render();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [straightenDeg, rotate90, cropRect, cropTool, ready]);
+
+  useEffect(() => {
+    if (!cropRectRef.current || !cropAnchorRef.current) return;
+    const previewTransform = resolveRotationTransform({
+      targetW: targetWRef.current,
+      targetH: targetHRef.current,
+      straightenDeg,
+      rotate90,
+    });
+    const nextCrop = recenterCropRect(cropRectRef.current, previewTransform, cropAnchorRef.current);
+    if (!nextCrop) return;
+    const prevCrop = cropRectRef.current;
+    const changed =
+      Math.abs(nextCrop.x - prevCrop.x) > 0.25 ||
+      Math.abs(nextCrop.y - prevCrop.y) > 0.25 ||
+      Math.abs(nextCrop.w - prevCrop.w) > 0.25 ||
+      Math.abs(nextCrop.h - prevCrop.h) > 0.25;
+    if (!changed) return;
+    cropRectRef.current = nextCrop;
+    setCropRect(nextCrop);
+  }, [straightenDeg, rotate90]);
+
+  useEffect(() => {
+    if (!resizeOpen) return;
+    ensureCarvePrecompute(() => {
+      applyResize();
+      render();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resizeOpen, resizeMode, direction, source]);
 
   // Detect WebGPU + load wasm.
   useEffect(() => {
@@ -442,27 +839,81 @@ function Editor() {
     }
   };
 
+  const syncGpuTransform = (): OutputTransform => {
+    const wasm = wasmRef.current;
+    const transform = resolveOutputTransform({
+      targetW: targetWRef.current,
+      targetH: targetHRef.current,
+      crop: cropToolRef.current ? null : cropRectRef.current,
+      straightenDeg: straightenDegRef.current,
+      rotate90: rotate90Ref.current,
+    });
+    if (!wasm || !gpuInitedRef.current) return transform;
+
+    if (transform.active) {
+      try {
+        wasm.gpu_set_rotation(
+          transform.m[0],
+          transform.m[1],
+          transform.m[2],
+          transform.m[3],
+          transform.m[4],
+          transform.m[5],
+          transform.dstW,
+          transform.dstH
+        );
+      } catch (err) {
+        console.error('gpu_set_rotation failed:', err);
+      }
+    } else {
+      try {
+        wasm.gpu_clear_rotation();
+      } catch {
+        /* ignore — first render before output_tex exists */
+      }
+    }
+
+    return transform;
+  };
+
   // Issue a render with the current L/C/hue params. Cheap; safe to call
   // from any callback.
   const render = () => {
     const wasm = wasmRef.current;
     if (!wasm || !gpuInitedRef.current) return;
+
+    const tw = targetWRef.current;
+    const th = targetHRef.current;
+    const transform = syncGpuTransform();
+    const showTransformedPreview = transform.active;
+
+    // Sync the canvas attribute + CSS *before* the GPU submit. Setting
+    // canvas.width/height clears the contents, so doing it after a
+    // render would wipe the freshly-drawn frame and the next paint
+    // wouldn't land until the next render() call.
+    const c = canvasRef.current;
+    const src = sourceRef.current;
+    if (c && src) {
+      if (showTransformedPreview) {
+        // Transform active: canvas attribute matches the rotated/cropped dst
+        // dims so the present pass blits 1:1; CSS fills the wrapper
+        // (which has its aspect overridden to dstW/dstH).
+        if (c.width !== transform.dstW) c.width = transform.dstW;
+        if (c.height !== transform.dstH) c.height = transform.dstH;
+        c.style.width = '100%';
+        c.style.height = '100%';
+      } else {
+        if (c.width !== src.w) c.width = src.w;
+        if (c.height !== src.h) c.height = src.h;
+        c.style.width = `${(tw / src.w) * 100}%`;
+        c.style.height = `${(th / src.h) * 100}%`;
+      }
+    }
+
     const [lMin, lMax] = lRangeRef.current;
     const [cMin, cMax] = cRangeRef.current;
     const t = performance.now() / 1000;
     wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
-    // Sync the canvas CSS box imperatively in the same tick as the GPU
-    // submit. React state for targetW/H also drives this percentage on
-    // commit, but for large sources the React commit can land a frame
-    // after the GPU update — producing a visible "stretched then snap"
-    // during slider drags. Updating the style ref directly here keeps
-    // GPU output and CSS sizing in lockstep regardless.
-    const c = canvasRef.current;
-    const src = sourceRef.current;
-    if (c && src) {
-      c.style.width = `${(targetWRef.current / src.w) * 100}%`;
-      c.style.height = `${(targetHRef.current / src.h) * 100}%`;
-    }
   };
 
   // Animation loop for HDR view: re-renders every frame so the marker
@@ -524,6 +975,20 @@ function Editor() {
       requestId: id,
       useGPU: true,
     });
+  };
+
+  const ensureCarvePrecompute = (onDone?: () => void) => {
+    const src = sourceRef.current;
+    if (!src || resizeModeRef.current !== 'carve') {
+      onDone?.();
+      return;
+    }
+    if (isPrecomputing) return;
+    if (orderRef.current && orderDirectionRef.current === directionRef.current) {
+      onDone?.();
+      return;
+    }
+    runPrecompute(src, directionRef.current, onDone);
   };
 
   const handleImageSelect = async (imageUrl: string) => {
@@ -658,7 +1123,7 @@ function Editor() {
         setAspect('free');
       }
     }
-    if (resizeModeRef.current === 'carve' && orderDirectionRef.current !== dir) {
+    if (resizeOpen && resizeModeRef.current === 'carve' && orderDirectionRef.current !== dir) {
       runPrecompute(src, dir, () => {
         applyResize();
         render();
@@ -672,12 +1137,42 @@ function Editor() {
   // Push (w, h) into state + refs together. Used by all the dim-changing
   // helpers so the squish/carve aspect-locked paths can update both at once.
   const setDims = (w: number, h: number) => {
+    const prevPreview = resolveRotationTransform({
+      targetW: targetWRef.current,
+      targetH: targetHRef.current,
+      straightenDeg: straightenDegRef.current,
+      rotate90: rotate90Ref.current,
+    });
+    const nextPreview = resolveRotationTransform({
+      targetW: w,
+      targetH: h,
+      straightenDeg: straightenDegRef.current,
+      rotate90: rotate90Ref.current,
+    });
+    const nextCrop = scaleCropRect(
+      cropRectRef.current,
+      prevPreview.dstW,
+      prevPreview.dstH,
+      nextPreview.dstW,
+      nextPreview.dstH
+    );
+    const nextAnchor = scalePoint(
+      cropAnchorRef.current,
+      targetWRef.current,
+      targetHRef.current,
+      w,
+      h
+    );
     targetWRef.current = w;
     targetHRef.current = h;
+    cropRectRef.current = nextCrop;
+    cropAnchorRef.current = nextAnchor;
     setTargetW(w);
     setTargetH(h);
     setTargetWDraft(null);
     setTargetHDraft(null);
+    setCropRect(nextCrop);
+    setCropDrag(null);
   };
 
   // In carve mode an active aspect ratio fully determines (W, H), so a
@@ -793,7 +1288,7 @@ function Editor() {
         setAspect('free');
       }
     }
-    if (mode === 'carve' && orderDirectionRef.current !== directionRef.current) {
+    if (resizeOpen && mode === 'carve' && orderDirectionRef.current !== directionRef.current) {
       runPrecompute(src, directionRef.current, () => {
         applyResize();
         render();
@@ -837,21 +1332,25 @@ function Editor() {
   const [exportFormat, setExportFormat] = useState<ExportFormat>('avif');
   const [downloading, setDownloading] = useState(false);
   const [smallerFile, setSmallerFile] = useState(false);
+  const [lossless, setLossless] = useState(false);
 
+  // Crop state. cropRect is in target output pixel coordinates
+  // (the same space as targetW × targetH). null = no crop.
   const handleDownload = async () => {
     const wasm = wasmRef.current;
     const src = sourceRef.current;
     if (!wasm || !src) return;
     setDownloading(true);
     try {
+      const transform = syncGpuTransform();
       // Make sure the texture has the latest params (and turn off the
       // HDR-view marker pixels for the export).
       const [lMin, lMax] = lRangeRef.current;
       const [cMin, cMax] = cRangeRef.current;
       wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0);
 
-      const outW = targetWRef.current;
-      const outH = targetHRef.current;
+      const outW = transform.active ? transform.dstW : targetWRef.current;
+      const outH = transform.active ? transform.dstH : targetHRef.current;
 
       let blob: Blob;
       let filename: string;
@@ -896,16 +1395,20 @@ function Editor() {
       } else {
         // 10-bit BT.2020 PQ readback for HDR AVIF.
         const rgba16 = await wasm.gpu_readback_hdr_pq_u16(10);
-        const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL } = await import('@/lib/avif-hdr');
+        const { encodeAvif, CP_BT2020, TC_PQ, MC_BT2020_NCL, MC_IDENTITY } = await import('@/lib/avif-hdr');
         const avif = await encodeAvif(rgba16, outW, outH, {
           bitDepth: 10,
-          // Higher than the libavif default (~60) — for HDR master output
-          // we want chroma transitions in saturated highlights to stay
-          // clean, and 60 leaves visible banding/blocking on bright sky.
-          quality: smallerFile ? 55 : 80,
+          // Lossless: q=100, 4:4:4 subsampling, identity matrix so the
+          // RGB samples are stored verbatim (no YUV round-trip).
+          // Otherwise: higher than the libavif default (~60) — for HDR
+          // master output we want chroma transitions in saturated
+          // highlights to stay clean, and 60 leaves visible
+          // banding/blocking on bright sky.
+          quality: lossless ? 100 : smallerFile ? 55 : 80,
+          subsample: lossless ? 0 : 1,
           cicpColorPrimaries: CP_BT2020,
           cicpTransferCharacteristics: TC_PQ,
-          cicpMatrixCoefficients: MC_BT2020_NCL,
+          cicpMatrixCoefficients: lossless ? MC_IDENTITY : MC_BT2020_NCL,
           // gpu_readback_hdr_pq_u16 quantizes [0,1] linearly to the full
           // 0..(2^depth-1) code-point range, so the AVIF must declare
           // full range too. Telling libavif "limited" here would make
@@ -925,8 +1428,7 @@ function Editor() {
       console.error('export failed:', err);
     } finally {
       setDownloading(false);
-      // Restore the HDR view if it was on.
-      if (showHdrRef.current) render();
+      render();
     }
   };
 
@@ -949,6 +1451,16 @@ function Editor() {
     lRangeRef.current = [0, 100];
     cRangeRef.current = [0, 100];
     hueRef.current = 0;
+    setCropTool(false);
+    setCropRect(null);
+    setCropDrag(null);
+    setStraightenDeg(0);
+    setRotate90(0);
+    straightenDegRef.current = 0;
+    rotate90Ref.current = 0;
+    cropRectRef.current = null;
+    cropAnchorRef.current = null;
+    cropToolRef.current = false;
   };
 
   const outW = targetW;
@@ -993,18 +1505,38 @@ function Editor() {
   })();
 
   const gpuMissing = gpuAvailable === false;
+  const hdrPresentationMissing = hdrPresentationActive === false;
+
+  // Resolve the rotation pass at render time so the JSX can adjust the
+  // wrapper aspect / dimension label / crop overlay visibility. Cheap.
+  const editPreviewTransformNow = source
+    ? resolveRotationTransform({
+        targetW,
+        targetH,
+        straightenDeg,
+        rotate90,
+      })
+    : { active: false, m: [1, 0, 0, 1, 0, 0] as [number, number, number, number, number, number], dstW: 0, dstH: 0 };
+  const outputTransformNow = source
+    ? resolveOutputTransform({
+        targetW,
+        targetH,
+        crop: cropRect,
+        straightenDeg,
+        rotate90,
+      })
+    : { active: false, m: [1, 0, 0, 1, 0, 0] as [number, number, number, number, number, number], dstW: 0, dstH: 0 };
+  const previewTransformNow = cropTool ? editPreviewTransformNow : outputTransformNow;
+  const previewTransformActive = previewTransformNow.active;
   const deferCarveSliderUpdates = LOW_CORE_DEVICE && resizeMode === 'carve';
   const widthSliderValue = deferCarveSliderUpdates ? (targetWDraft ?? targetW) : targetW;
   const heightSliderValue = deferCarveSliderUpdates ? (targetHDraft ?? targetH) : targetH;
 
   return (
-    <div className="flex h-full min-h-screen flex-col bg-background text-foreground">
+    <div className="flex h-full min-h-screen flex-col bg-background text-foreground lg:h-screen lg:overflow-hidden">
       <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
           <div>
             <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
-            <p className="text-xs text-muted-foreground">
-              Lanczos / content-aware resize · OKLab color remap · WebGPU
-            </p>
           </div>
           <div className="flex items-center gap-2">
             {source && (
@@ -1033,9 +1565,9 @@ function Editor() {
           </div>
         </header>
 
-      <div className="flex flex-1 flex-col lg:flex-row">
+      <div className="flex flex-1 flex-col lg:min-h-0 lg:flex-row">
         {/* ── Main preview area ──────────────────────────────────────── */}
-        <main className="sticky top-0 z-30 flex max-h-[70vh] flex-1 flex-col bg-background lg:static lg:max-h-none">
+        <main className="sticky top-0 z-30 flex max-h-[70vh] flex-1 flex-col bg-background lg:static lg:min-h-0 lg:max-h-none">
         <div
           className="flex flex-1 items-center justify-center overflow-auto p-4 sm:p-8"
           style={{
@@ -1062,10 +1594,14 @@ function Editor() {
               <div
                 className="relative overflow-hidden rounded-lg border border-border shadow-sm"
                 style={{
-                  aspectRatio: `${source.w} / ${source.h}`,
+                  aspectRatio: previewTransformActive
+                    ? `${previewTransformNow.dstW} / ${previewTransformNow.dstH}`
+                    : `${source.w} / ${source.h}`,
                   // Fit inside both 90vw and 50vh (mobile) / 75vh (desktop)
                   // by computing the largest width that satisfies both.
-                  width: `min(90vw, 60vh * ${source.w / source.h})`,
+                  width: previewTransformActive
+                    ? `min(90vw, 60vh * ${previewTransformNow.dstW / previewTransformNow.dstH})`
+                    : `min(90vw, 60vh * ${source.w / source.h})`,
                   // Checkerboard so transparent pixels are obvious as
                   // such instead of getting blended with the (white)
                   // card background.
@@ -1084,6 +1620,113 @@ function Editor() {
                     height: `${(targetH / source.h) * 100}%`,
                   }}
                 />
+                {/* Crop overlay: positioned identically to the canvas
+                    so its coordinate space matches the rendered image
+                    pixel-for-pixel. Captures pointer events only when
+                    the crop tool is active; otherwise it's strictly
+                    decorative (drawn marquee for an existing crop). */}
+                {cropTool && (
+                  <div
+                    className="absolute top-0 left-0"
+                    style={{
+                      width: previewTransformActive ? '100%' : `${(targetW / source.w) * 100}%`,
+                      height: previewTransformActive ? '100%' : `${(targetH / source.h) * 100}%`,
+                      cursor: cropTool ? 'crosshair' : 'default',
+                      pointerEvents: cropTool ? 'auto' : 'none',
+                      touchAction: cropTool ? 'none' : 'auto',
+                    }}
+                    onPointerDown={(e) => {
+                      if (!cropTool) return;
+                      const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+                      const fx = (e.clientX - rect.left) / rect.width;
+                      const fy = (e.clientY - rect.top) / rect.height;
+                      const px = Math.max(0, Math.min(previewTransformNow.dstW, fx * previewTransformNow.dstW));
+                      const py = Math.max(0, Math.min(previewTransformNow.dstH, fy * previewTransformNow.dstH));
+                      (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                      setCropDrag({ x0: px, y0: py, x1: px, y1: py });
+                    }}
+                    onPointerMove={(e) => {
+                      if (!cropTool || !cropDrag) return;
+                      const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+                      const fx = (e.clientX - rect.left) / rect.width;
+                      const fy = (e.clientY - rect.top) / rect.height;
+                      const px = Math.max(0, Math.min(previewTransformNow.dstW, fx * previewTransformNow.dstW));
+                      const py = Math.max(0, Math.min(previewTransformNow.dstH, fy * previewTransformNow.dstH));
+                      setCropDrag({ ...cropDrag, x1: px, y1: py });
+                    }}
+                    onPointerUp={(e) => {
+                      if (!cropTool || !cropDrag) return;
+                      (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                      const x = Math.min(cropDrag.x0, cropDrag.x1);
+                      const y = Math.min(cropDrag.y0, cropDrag.y1);
+                      const w = Math.abs(cropDrag.x1 - cropDrag.x0);
+                      const h = Math.abs(cropDrag.y1 - cropDrag.y0);
+                      setCropDrag(null);
+                      // Ignore stray clicks (need at least a few px in
+                      // both dimensions for it to be a real selection).
+                      // Crop mode stays on after a successful drag so
+                      // the rotate/straighten panel below remains
+                      // accessible — the user dismisses it with Done.
+                      if (w >= 4 && h >= 4) {
+                        const nextCrop = { x, y, w, h };
+                        cropAnchorRef.current = mapPreviewPointToSource(previewTransformNow, {
+                          x: x + w / 2,
+                          y: y + h / 2,
+                        });
+                        cropRectRef.current = nextCrop;
+                        setCropRect(nextCrop);
+                      }
+                    }}
+                  >
+                    {(() => {
+                      // Build the visible marquee. While dragging, use
+                      // the live drag rect; otherwise use the committed
+                      // cropRect.
+                      let rx: number, ry: number, rw: number, rh: number;
+                      if (cropDrag) {
+                        rx = Math.min(cropDrag.x0, cropDrag.x1);
+                        ry = Math.min(cropDrag.y0, cropDrag.y1);
+                        rw = Math.abs(cropDrag.x1 - cropDrag.x0);
+                        rh = Math.abs(cropDrag.y1 - cropDrag.y0);
+                      } else if (cropRect) {
+                        rx = cropRect.x; ry = cropRect.y; rw = cropRect.w; rh = cropRect.h;
+                      } else {
+                        return null;
+                      }
+                      return (
+                        <svg
+                          className="absolute inset-0 h-full w-full"
+                          viewBox={`0 0 ${previewTransformNow.dstW} ${previewTransformNow.dstH}`}
+                          preserveAspectRatio="none"
+                        >
+                          {/* Mask: dim everything except the rect. */}
+                          <defs>
+                            <mask id="crop-mask">
+                              <rect width={previewTransformNow.dstW} height={previewTransformNow.dstH} fill="white" />
+                              <rect x={rx} y={ry} width={rw} height={rh} fill="black" />
+                            </mask>
+                          </defs>
+                          <rect
+                            width={previewTransformNow.dstW}
+                            height={previewTransformNow.dstH}
+                            fill="rgba(0,0,0,0.5)"
+                            mask="url(#crop-mask)"
+                          />
+                          <rect
+                            x={rx}
+                            y={ry}
+                            width={rw}
+                            height={rh}
+                            fill="none"
+                            stroke="white"
+                            strokeWidth={Math.max(1, Math.min(previewTransformNow.dstW, previewTransformNow.dstH) / 400)}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        </svg>
+                      );
+                    })()}
+                  </div>
+                )}
                 {isPrecomputing && (
                   <div className="absolute inset-0 flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
                     <div className="flex items-center gap-2 rounded-md bg-background/90 px-3 py-2 text-sm text-foreground shadow-lg">
@@ -1093,24 +1736,138 @@ function Editor() {
                   </div>
                 )}
               </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant={cropTool ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => {
+                    setCropTool((v) => !v);
+                    setCropDrag(null);
+                  }}
+                  title="Click and drag on the image to crop"
+                >
+                  <CropIcon className="mr-1 h-4 w-4" />
+                  {cropTool ? 'Done' : cropRect ? 'Re-crop' : 'Crop'}
+                </Button>
+                {cropRect && !cropTool && (
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8"
+                    onClick={() => {
+                      setCropRect(null);
+                      cropRectRef.current = null;
+                      cropAnchorRef.current = null;
+                      setStraightenDeg(0);
+                      setRotate90(0);
+                      straightenDegRef.current = 0;
+                      rotate90Ref.current = 0;
+                    }}
+                    title="Remove crop"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
               <p className="text-xs text-muted-foreground">
-                {outW} × {outH}
+                {outputTransformNow.active
+                  ? `${outputTransformNow.dstW} × ${outputTransformNow.dstH} (transformed, from ${outW} × ${outH})`
+                  : cropRect
+                  ? `${Math.round(cropRect.w)} × ${Math.round(cropRect.h)} (cropped from ${outW} × ${outH})`
+                  : `${outW} × ${outH}`}
               </p>
+              {cropTool && (
+                <div className="flex w-full max-w-lg items-center gap-3">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    onClick={() => setRotate90((((rotate90 - 1) % 4) + 4) % 4)}
+                    title="Rotate 90° counter-clockwise"
+                  >
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
+                  <TickSlider
+                    value={straightenDeg}
+                    min={-45}
+                    max={45}
+                    onChange={setStraightenDeg}
+                  />
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9 shrink-0"
+                    onClick={() => setRotate90((((rotate90 + 1) % 4) + 4) % 4)}
+                    title="Rotate 90° clockwise"
+                  >
+                    <RotateCw className="h-4 w-4" />
+                  </Button>
+                </div>
+              )}
             </div>
           )}
         </div>
       </main>
 
       {/* ── Right sidebar ──────────────────────────────────────────── */}
-      <aside className="w-full shrink-0 overflow-y-auto border-t border-border bg-card p-4 lg:w-80 lg:border-t-0 lg:border-l">
+      <aside className="w-full shrink-0 overflow-y-auto border-t border-border bg-card p-4 lg:h-full lg:min-h-0 lg:w-80 lg:border-t-0 lg:border-l">
         {!source ? (
-          <div className="text-sm text-muted-foreground">
-            {gpuMissing
-              ? 'WebGPU unavailable.'
-              : 'Drop an image to start editing.'}
-          </div>
+          gpuMissing ? (
+            <div className="text-sm text-muted-foreground">WebGPU unavailable.</div>
+          ) : (
+            <div className="space-y-3 text-sm text-foreground">
+              <p>Drop an image to start editing.</p>
+              <div className="space-y-3">
+                <p className="font-medium">Why Pictolab?</p>
+
+                <div>
+                  <p className="font-medium">High-quality resizing</p>
+                  <p className="text-muted-foreground">
+                    Lanczos resampling, widely considered the gold standard for downscaling
+                    photos, preserving sharpness without the ringing or blur of simpler filters.
+                    Plus content-aware resize (seam carving) when you need to change aspect
+                    ratio without squashing the subject.
+                  </p>
+                </div>
+
+                <div>
+                  <p className="font-medium">Photometrically correct color</p>
+                  <p className="text-muted-foreground">
+                    Brightness and tone adjustments happen in OKLab, a perceptually uniform
+                    color space, so changes look the way your eyes expect instead of
+                    skewing hue and saturation.
+                  </p>
+                </div>
+
+                <div>
+                  <p className="font-medium">Fast, local, GPU-accelerated</p>
+                  <p className="text-muted-foreground">
+                    Built on WebGPU. Everything runs on your machine. Your images never
+                    leave the browser.
+                  </p>
+                </div>
+
+                <div>
+                  <p className="font-medium">End-to-end HDR</p>
+                  <p className="text-muted-foreground">
+                    Full HDR pipeline with true 10-bit color, including HEIC input and HDR
+                    output.
+                  </p>
+                </div>
+
+                <div>
+                  <p className="font-medium">AVIF and JPEG export</p>
+                  <p className="text-muted-foreground">
+                    AVIF is the default: lossless mode beats PNG on file size, and lossy
+                    mode beats JPEG at the same quality. For maximum compatibility we also
+                    support Ultra HDR JPEG export.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )
         ) : (
-          <div className="space-y-4">
+          <div className="space-y-6 pb-24">
             <Button
               variant={showHdr ? 'default' : 'outline'}
               size="sm"
@@ -1122,11 +1879,19 @@ function Editor() {
               HDR view
             </Button>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Resize</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
+            {hdrPresentationMissing && (
+              <div className="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] leading-snug text-amber-900">
+                Your browser does not support HDR. The preview will be SDR, but the exported file will still be HDR.
+              </div>
+            )}
+
+            <section>
+              <Collapsible
+                label={<CardTitle>Resize</CardTitle>}
+                open={resizeOpen}
+                onOpenChange={setResizeOpen}
+                className="space-y-4"
+              >
                 <Segmented<ResizeMode>
                   value={resizeMode}
                   onValueChange={handleResizeModeChange}
@@ -1145,50 +1910,39 @@ function Editor() {
                   ]}
                 />
 
-                <Collapsible
-                  label="Aspect ratio"
-                  meta={
-                    aspect !== 'free' && (
-                      <span className="font-mono text-[10px] text-foreground">
-                        {ASPECT_OPTIONS.find((o) => o.value === aspect)?.label}
-                      </span>
-                    )
-                  }
-                >
-                  <div className="flex flex-wrap gap-1">
-                    {ASPECT_OPTIONS.filter((opt) => {
-                      // Lock is meaningless in carve mode — the only ratio
-                      // that preserves source aspect is the source itself.
-                      if (resizeMode === 'carve' && opt.value === 'lock') return false;
-                      // Hide any aspect that can't be directly reached in
-                      // the current carve direction. The inverted ratio
-                      // has its own button (e.g. 9:16 vs 16:9), so we'd
-                      // just be duplicating it.
-                      if (
-                        source &&
-                        resizeMode === 'carve' &&
-                        opt.value !== 'free'
-                      ) {
-                        const r = aspectRatioValue(opt.value, source);
-                        if (r === null || snapCarve(r, source, direction) === null) {
-                          return false;
-                        }
+                <div className="flex flex-wrap gap-1 pt-3">
+                  {ASPECT_OPTIONS.filter((opt) => {
+                    // Lock is meaningless in carve mode — the only ratio
+                    // that preserves source aspect is the source itself.
+                    if (resizeMode === 'carve' && opt.value === 'lock') return false;
+                    // Hide any aspect that can't be directly reached in
+                    // the current carve direction. The inverted ratio
+                    // has its own button (e.g. 9:16 vs 16:9), so we'd
+                    // just be duplicating it.
+                    if (
+                      source &&
+                      resizeMode === 'carve' &&
+                      opt.value !== 'free'
+                    ) {
+                      const r = aspectRatioValue(opt.value, source);
+                      if (r === null || snapCarve(r, source, direction) === null) {
+                        return false;
                       }
-                      return true;
-                    }).map((opt) => (
-                      <Button
-                        key={opt.value}
-                        variant={aspect === opt.value ? 'default' : 'outline'}
-                        size="sm"
-                        className="h-7 flex-1 px-2 text-xs"
-                        onClick={() => handleAspectChange(opt.value)}
-                        disabled={isPrecomputing}
-                      >
-                        {opt.label}
-                      </Button>
-                    ))}
-                  </div>
-                </Collapsible>
+                    }
+                    return true;
+                  }).map((opt) => (
+                    <Button
+                      key={opt.value}
+                      variant={aspect === opt.value ? 'default' : 'outline'}
+                      size="sm"
+                      className="h-7 flex-1 px-2 text-xs"
+                      onClick={() => handleAspectChange(opt.value)}
+                      disabled={isPrecomputing}
+                    >
+                      {opt.label}
+                    </Button>
+                  ))}
+                </div>
                 {resizeMode === 'carve' && (
                   <Segmented<Direction>
                     value={direction}
@@ -1281,48 +2035,16 @@ function Editor() {
                     {' '}— removes low-energy seams instead of resampling.
                   </p>
                 )}
-              </CardContent>
-            </Card>
+              </Collapsible>
+            </section>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Lightness</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label className="text-xs">Range</Label>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 px-2"
-                      onClick={() => handleLRangeChange([lRangeRef.current[1], lRangeRef.current[0]])}
-                      title="Invert (swap handles)"
-                    >
-                      <ArrowLeftRight className="h-3 w-3" />
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 px-2"
-                      onClick={() => adjustExposure(-0.5)}
-                      title="−½ stop"
-                    >
-                      <Minus className="h-3 w-3" />
-                      ½ EV
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 px-2"
-                      onClick={() => adjustExposure(0.5)}
-                      title="+½ stop"
-                    >
-                      <Plus className="h-3 w-3" />
-                      ½ EV
-                    </Button>
-                  </div>
-                </div>
+            <section>
+              <Collapsible
+                label={<CardTitle>Lightness</CardTitle>}
+                open={lightnessOpen}
+                onOpenChange={setLightnessOpen}
+                className="space-y-4"
+              >
                 <DualSlider
                   min={-50}
                   max={150}
@@ -1332,24 +2054,53 @@ function Editor() {
                   safeRange={[0, 100]}
                   snapPoints={[0, 100]}
                 />
+                <div className="flex w-full items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 flex-1"
+                    onClick={() => handleLRangeChange([lRangeRef.current[1], lRangeRef.current[0]])}
+                    title="Invert (swap handles)"
+                  >
+                    <ArrowLeftRight className="h-3 w-3" />
+                    Invert
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 flex-1"
+                    onClick={() => adjustExposure(-0.5)}
+                    title="−½ stop"
+                  >
+                    <Minus className="h-3 w-3" />
+                    ½ EV
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 flex-1"
+                    onClick={() => adjustExposure(0.5)}
+                    title="+½ stop"
+                  >
+                    <Plus className="h-3 w-3" />
+                    ½ EV
+                  </Button>
+                </div>
                 {lClipping && (lClipping.dark > 0 || lClipping.light > 0) ? (
                   <p className="text-[11px] leading-snug text-destructive">
                     Clipping: {lClipping.dark.toFixed(1)}% shadows · {lClipping.light.toFixed(1)}% highlights
                   </p>
-                ) : (
-                  <p className="text-[11px] leading-snug text-muted-foreground">
-                    L ranges 0–100 by default. Push past either end to boost/reduce exposure. 100 → 0 inverts; collapse for equalize.
-                  </p>
-                )}
-              </CardContent>
-            </Card>
+                ) : null}
+              </Collapsible>
+            </section>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Chroma</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <Label className="text-xs">Range</Label>
+            <section>
+              <Collapsible
+                label={<CardTitle>Chroma</CardTitle>}
+                open={chromaOpen}
+                onOpenChange={setChromaOpen}
+                className="space-y-4"
+              >
                 <DualSlider
                   min={-50}
                   max={150}
@@ -1365,33 +2116,44 @@ function Editor() {
                     {cClipping.boosted > 0 && cClipping.inverted > 0 && <> · </>}
                     {cClipping.inverted > 0 && <>{cClipping.inverted.toFixed(1)}% hue-inverted</>}
                   </p>
-                ) : (
-                  <p className="text-[11px] leading-snug text-muted-foreground">
-                    Same semantic as L. Identity is 0 → 100. Push past 100 to boost saturation, below 0 to invert hue.
-                  </p>
-                )}
+                ) : null}
+              </Collapsible>
+            </section>
 
-                <div className="space-y-2 pt-2">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-xs">Hue rotation</Label>
-                    <span className="font-mono text-xs text-muted-foreground">
-                      {hue > 0 ? '+' : ''}
-                      {hue}°
-                    </span>
-                  </div>
-                  <Slider
+            <section>
+              <Collapsible
+                label={<CardTitle>Hue</CardTitle>}
+                open={hueOpen}
+                onOpenChange={setHueOpen}
+                className="space-y-4"
+              >
+                <div className="space-y-2">
+                  <TickSlider
+                    value={hue}
                     min={-180}
                     max={180}
-                    step={1}
-                    value={[hue]}
-                    onValueChange={(v) => handleHueChange(v[0])}
-                    snapPoints={[-180, -90, 0, 90, 180]}
+                    onChange={handleHueChange}
+                    tickStep={15}
+                    majorTickStep={45}
+                    snapStep={1}
+                    trackClassName="bg-secondary"
+                    activeTickClassName="bg-primary/80"
+                    activeMarkerClassName="bg-primary/80"
+                    title="Drag to rotate hue · double-click to reset"
+                    resetTitle="Reset hue rotation to 0°"
+                    formatValue={(v) => `${v > 0 ? '+' : ''}${Math.round(v)}°`}
                   />
                 </div>
-              </CardContent>
-            </Card>
+              </Collapsible>
+            </section>
 
-            <div className="space-y-2">
+            <section>
+              <Collapsible
+                label={<CardTitle>Export</CardTitle>}
+                open={exportOpen}
+                onOpenChange={setExportOpen}
+                className="space-y-4"
+              >
               <Segmented<ExportFormat>
                 value={exportFormat}
                 onValueChange={setExportFormat}
@@ -1415,29 +2177,45 @@ function Editor() {
                   color. Use AVIF to preserve alpha.
                 </p>
               )}
-              <Button
-                className="w-full"
-                onClick={handleDownload}
-                disabled={!ready || downloading}
-              >
-                {downloading ? (
-                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-                ) : (
-                  <Download className="mr-1 h-4 w-4" />
-                )}
-                Export {exportFormat === 'jpeg' ? 'JPEG' : 'AVIF'}
-              </Button>
+              <div className="sticky bottom-0 z-10 -mx-4 bg-card/95 px-4 py-3 backdrop-blur supports-[backdrop-filter]:bg-card/80">
+                <Button
+                  className="w-full"
+                  onClick={handleDownload}
+                  disabled={!ready || downloading}
+                >
+                  {downloading ? (
+                    <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                  ) : (
+                    <Download className="mr-1 h-4 w-4" />
+                  )}
+                  Export {exportFormat === 'jpeg' ? 'JPEG' : 'AVIF'}
+                </Button>
+              </div>
               <div className="flex items-center justify-between pt-1">
                 <Label htmlFor="smaller-file" className="text-xs font-normal text-muted-foreground">
                   Smaller file size (lower quality)
                 </Label>
                 <Switch
                   id="smaller-file"
-                  checked={smallerFile}
+                  checked={smallerFile && !(exportFormat === 'avif' && lossless)}
+                  disabled={exportFormat === 'avif' && lossless}
                   onCheckedChange={setSmallerFile}
                 />
               </div>
-            </div>
+              {exportFormat === 'avif' && (
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="lossless" className="text-xs font-normal text-muted-foreground">
+                    Lossless (much larger file)
+                  </Label>
+                  <Switch
+                    id="lossless"
+                    checked={lossless}
+                    onCheckedChange={setLossless}
+                  />
+                </div>
+              )}
+              </Collapsible>
+            </section>
           </div>
         )}
       </aside>

@@ -47,6 +47,11 @@ async fn js_await(val: JsValue) -> Result<JsValue, JsValue> {
     JsFuture::from(val.dyn_into::<Promise>()?).await
 }
 
+fn try_js_call1(obj: &JsValue, method: &str, a: &JsValue) -> Result<JsValue, JsValue> {
+    let func = js_get(obj, method)?.dyn_into::<Function>()?;
+    func.call1(obj, a)
+}
+
 fn create_buffer(device: &JsValue, size: u32, usage: u32) -> Result<JsValue, JsValue> {
     js_call1(
         device,
@@ -596,6 +601,22 @@ struct GpuCtx {
     // function was called most recently.
     resize_mode: u32,
 
+    // Optional Lanczos rotation pass. When `rotation_active` is true,
+    // gpu_render dispatches the rotation compute pass after the resize
+    // pass to populate `rotated_tex`, and the canvas presentation pass
+    // samples `rotated_tex` instead of `output_tex`. Readback functions
+    // also pick `rotated_tex` automatically.
+    rotation_pipeline: JsValue,
+    rotation_bgl: JsValue,
+    rotation_bind_group: Option<JsValue>,
+    rotation_params_buf: JsValue,
+    rotated_tex: Option<JsValue>,
+    rotated_tex_view: Option<JsValue>,
+    rotated_render_bind_group: Option<JsValue>,
+    rotated_w: u32,
+    rotated_h: u32,
+    rotation_active: bool,
+
     // Render pipeline + canvas context.
     render_pipeline: JsValue,
     render_bgl: JsValue,
@@ -848,6 +869,83 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 "#
 }
 
+// Lanczos-3 rotation pass. Reads `src_tex` (the unrotated rgba16float
+// output of the resize pass) via per-texel textureLoad calls and writes
+// into `dst_tex` (a separate rgba16float storage texture sized to the
+// rotated/cropped output). For each destination pixel we apply the
+// pre-computed inverse affine transform (CPU-side) to find the source
+// sample center, then accumulate a 6×6 axis-aligned Lanczos-3 window in
+// source space. Out-of-bounds samples are skipped and the partial weight
+// sum is normalized — but the JS-side auto-shrink keeps every export
+// pixel safely inside the source so we never see edge fall-off in
+// practice.
+fn rotation_shader() -> &'static str {
+    r#"
+struct Params {
+  // dst pixel center (gid + 0.5) -> src pixel center, as a 2x3 affine.
+  m00: f32, m01: f32, m10: f32, m11: f32,
+  t0: f32, t1: f32,
+  _pad0: f32, _pad1: f32,
+  src_w: u32, src_h: u32, dst_w: u32, dst_h: u32,
+}
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var dst_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+const PI: f32 = 3.14159265358979323846;
+const A: f32 = 3.0;
+
+fn sinc(x: f32) -> f32 {
+  let ax = abs(x);
+  if (ax < 1e-6) { return 1.0; }
+  let px = PI * x;
+  return sin(px) / px;
+}
+
+fn lanczos(x: f32) -> f32 {
+  if (abs(x) >= A) { return 0.0; }
+  return sinc(x) * sinc(x / A);
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= params.dst_w || gid.y >= params.dst_h) { return; }
+  let dx = f32(gid.x) + 0.5;
+  let dy = f32(gid.y) + 0.5;
+  let sx = params.m00 * dx + params.m01 * dy + params.t0;
+  let sy = params.m10 * dx + params.m11 * dy + params.t1;
+
+  // Lanczos a3 around (sx, sy) in source space, axis-aligned.
+  let cx = sx - 0.5;
+  let cy = sy - 0.5;
+  let x0 = i32(floor(cx - A));
+  let x1 = i32(ceil(cx + A));
+  let y0 = i32(floor(cy - A));
+  let y1 = i32(ceil(cy + A));
+  let sw = i32(params.src_w);
+  let sh = i32(params.src_h);
+
+  var sum = vec4f(0.0);
+  var w_total = 0.0;
+  for (var y = y0; y <= y1; y = y + 1) {
+    if (y < 0 || y >= sh) { continue; }
+    let wy = lanczos(f32(y) - cy);
+    for (var x = x0; x <= x1; x = x + 1) {
+      if (x < 0 || x >= sw) { continue; }
+      let wx = lanczos(f32(x) - cx);
+      let w = wx * wy;
+      let s = textureLoad(src_tex, vec2i(x, y), 0);
+      sum = sum + s * w;
+      w_total = w_total + w;
+    }
+  }
+  let out = sum / max(w_total, 1e-6);
+  textureStore(dst_tex, vec2i(i32(gid.x), i32(gid.y)), out);
+}
+"#
+}
+
 fn render_shader() -> &'static str {
     r#"
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -1011,6 +1109,51 @@ fn make_resample_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     )
 }
 
+// Bind group layout for the rotation pass: a sampled view of the
+// upstream rgba16float texture, the destination storage texture, and
+// the params uniform.
+fn make_rotation_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    // 0: src texture (sampled, read via textureLoad)
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "texture",
+            js_obj(&[
+                ("sampleType", "unfilterable-float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 1: dst storage texture
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "storageTexture",
+            js_obj(&[
+                ("access", "write-only".into()),
+                ("format", "rgba16float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 2: params uniform
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
 const SHADER_VERTEX: u32 = 1;
 const SHADER_FRAGMENT: u32 = 2;
 
@@ -1070,19 +1213,38 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     if canvas_ctx.is_null() || canvas_ctx.is_undefined() {
         return Err("canvas getContext('webgpu') returned null".into());
     }
-    // rgba16float lets us carry extended-range Display P3 values for HDR.
-    // toneMapping: 'extended' tells the compositor to use the display's
-    // headroom for values above 1.0 on HDR displays; SDR displays clip.
-    let canvas_format = "rgba16float".to_string();
-    let tone_mapping = js_obj(&[("mode", "extended".into())]);
-    let configure_desc = js_obj(&[
-        ("device", device.clone()),
-        ("format", canvas_format.as_str().into()),
-        ("colorSpace", "display-p3".into()),
-        ("toneMapping", tone_mapping.into()),
-        ("alphaMode", "premultiplied".into()),
-    ]);
-    js_call1(&canvas_ctx, "configure", &configure_desc)?;
+    // Prefer an HDR-capable canvas when supported so the browser can
+    // present extended-range Display P3 values directly. Firefox still
+    // rejects rgba16float swapchains, so fall back to the browser's
+    // preferred SDR canvas format while keeping all internal processing
+    // in float textures.
+    let preferred_canvas_format = js_call0(&gpu, "getPreferredCanvasFormat")?
+        .as_string()
+        .ok_or_else(|| JsValue::from("getPreferredCanvasFormat returned non-string"))?;
+    let hdr_canvas_desc = {
+        let tone_mapping = js_obj(&[("mode", "extended".into())]);
+        js_obj(&[
+            ("device", device.clone()),
+            ("format", "rgba16float".into()),
+            ("colorSpace", "display-p3".into()),
+            ("toneMapping", tone_mapping.into()),
+            ("alphaMode", "premultiplied".into()),
+        ])
+    };
+    let (canvas_format, _hdr_presentation) =
+        match try_js_call1(&canvas_ctx, "configure", &hdr_canvas_desc) {
+            Ok(_) => ("rgba16float".to_string(), true),
+            Err(_) => {
+                let sdr_canvas_desc = js_obj(&[
+                    ("device", device.clone()),
+                    ("format", preferred_canvas_format.clone().into()),
+                    ("colorSpace", "display-p3".into()),
+                    ("alphaMode", "premultiplied".into()),
+                ]);
+                js_call1(&canvas_ctx, "configure", &sdr_canvas_desc)?;
+                (preferred_canvas_format, false)
+            }
+        };
 
     // ── Remap pipeline ──────────────────────────────────────────────────
     let remap_module = create_shader(&device, remap_shader())?;
@@ -1123,6 +1285,20 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     };
     let resample_pipeline =
         create_pipeline(&device, &resample_pl_layout, &resample_module, "main")?;
+
+    // ── Rotation (Lanczos) pipeline ─────────────────────────────────────
+    let rotation_module = create_shader(&device, rotation_shader())?;
+    let rotation_bgl = make_rotation_bgl(&device)?;
+    let rotation_pl_layout = {
+        let layouts = Array::of1(&rotation_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let rotation_pipeline =
+        create_pipeline(&device, &rotation_pl_layout, &rotation_module, "main")?;
 
     // ── Render pipeline ─────────────────────────────────────────────────
     let render_module = create_shader(&device, render_shader())?;
@@ -1173,6 +1349,8 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     let carve_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the resample shader
     let resample_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
+    // Rotation params: 8 f32 (32 bytes) + 4 u32 (16 bytes) = 48 bytes.
+    let rotation_params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
 
     // The HDR source binding is required by the layout but only used when
     // an HDR image has been uploaded. Allocate a tiny placeholder up front
@@ -1205,6 +1383,16 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         resample_bind_group: None,
         resample_dims_buf,
         resize_mode: 0,
+        rotation_pipeline,
+        rotation_bgl,
+        rotation_bind_group: None,
+        rotation_params_buf,
+        rotated_tex: None,
+        rotated_tex_view: None,
+        rotated_render_bind_group: None,
+        rotated_w: 0,
+        rotated_h: 0,
+        rotation_active: false,
         render_pipeline,
         render_bgl,
         render_bind_group: None,
@@ -1224,6 +1412,15 @@ pub async fn gpu_init(canvas: JsValue) -> Result<(), JsValue> {
     let ctx = create_gpu_ctx(&canvas).await?;
     GPU_CTX.with(|c| *c.borrow_mut() = Some(ctx));
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn gpu_is_hdr_presentation_active() -> Result<bool, JsValue> {
+    GPU_CTX.with(|c| -> Result<bool, JsValue> {
+        let c = c.borrow();
+        let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        Ok(ctx.canvas_format == "rgba16float")
+    })
 }
 
 #[wasm_bindgen]
@@ -1375,6 +1572,18 @@ fn ensure_output_tex(ctx: &mut GpuCtx, target_w: u32, target_h: u32) -> Result<(
     // Bind groups that point at the old texture view are now invalid.
     ctx.carve_bind_group = None;
     ctx.resample_bind_group = None;
+    // The rotation pass reads from output_tex_view, so its bind group is
+    // also invalid; the JS side will call gpu_set_rotation again to
+    // rebuild it for the new dims.
+    ctx.rotation_bind_group = None;
+    ctx.rotation_active = false;
+    if let Some(old) = ctx.rotated_tex.take() {
+        let _ = js_call0(&old, "destroy");
+    }
+    ctx.rotated_tex_view = None;
+    ctx.rotated_render_bind_group = None;
+    ctx.rotated_w = 0;
+    ctx.rotated_h = 0;
     Ok(())
 }
 
@@ -1467,6 +1676,135 @@ pub fn gpu_set_squish_dims(target_w: u32, target_h: u32) -> Result<(), JsValue> 
             unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
         write_buffer_u8(&ctx.queue, &ctx.resample_dims_buf, dims_bytes)?;
         ctx.resize_mode = 0;
+        Ok(())
+    })
+}
+
+// Configure the optional Lanczos rotation pass. The 2x3 affine matrix is
+// the inverse transform (dst pixel center → src pixel center) — JS bakes
+// the rotation angle, the source center of rotation, the destination
+// center, and any auto-shrink scale into these six numbers. Allocates a
+// fresh `rotated_tex` of `(dst_w, dst_h)`, rebuilds the rotation +
+// rotated-render bind groups, and flips `rotation_active` on. Subsequent
+// `gpu_render` calls dispatch the rotation pass after the resize pass and
+// present `rotated_tex` to the canvas instead of `output_tex`.
+#[wasm_bindgen]
+pub fn gpu_set_rotation(
+    m00: f32,
+    m01: f32,
+    m10: f32,
+    m11: f32,
+    t0: f32,
+    t1: f32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        if ctx.output_tex_view.is_none() {
+            return Err("gpu_set_rotation called before output_tex exists".into());
+        }
+        if dst_w == 0 || dst_h == 0 {
+            return Err("rotation dst dims must be > 0".into());
+        }
+
+        // (Re)allocate rotated_tex if dims changed.
+        let need_new_tex = ctx.rotated_tex.is_none()
+            || ctx.rotated_w != dst_w
+            || ctx.rotated_h != dst_h;
+        if need_new_tex {
+            if let Some(old) = ctx.rotated_tex.take() {
+                let _ = js_call0(&old, "destroy");
+            }
+            ctx.rotated_tex_view = None;
+            ctx.rotated_render_bind_group = None;
+            ctx.rotation_bind_group = None;
+
+            let size = js_obj(&[
+                ("width", dst_w.into()),
+                ("height", dst_h.into()),
+                ("depthOrArrayLayers", 1u32.into()),
+            ]);
+            let tex_desc = js_obj(&[
+                ("size", size.into()),
+                ("format", "rgba16float".into()),
+                (
+                    "usage",
+                    (TEX_BINDING | TEX_STORAGE | 1/* COPY_SRC */).into(),
+                ),
+            ]);
+            let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
+            let view = js_call1(&tex, "createView", &Object::new())?;
+            ctx.rotated_tex = Some(tex);
+            ctx.rotated_tex_view = Some(view);
+            ctx.rotated_w = dst_w;
+            ctx.rotated_h = dst_h;
+        }
+
+        // Rebuild the rotation bind group if absent (post-tex-realloc or
+        // post-output_tex-realloc).
+        if ctx.rotation_bind_group.is_none() {
+            let entries = Array::new();
+            entries.push(&js_obj(&[
+                ("binding", 0u32.into()),
+                ("resource", ctx.output_tex_view.as_ref().unwrap().clone()),
+            ]));
+            entries.push(&js_obj(&[
+                ("binding", 1u32.into()),
+                ("resource", ctx.rotated_tex_view.as_ref().unwrap().clone()),
+            ]));
+            entries.push(&js_obj(&[
+                ("binding", 2u32.into()),
+                (
+                    "resource",
+                    js_obj(&[("buffer", ctx.rotation_params_buf.clone())]).into(),
+                ),
+            ]));
+            ctx.rotation_bind_group = Some(js_call1(
+                &ctx.device,
+                "createBindGroup",
+                &js_obj(&[
+                    ("layout", ctx.rotation_bgl.clone()),
+                    ("entries", entries.into()),
+                ]),
+            )?);
+        }
+
+        // The canvas presentation pass needs a render bind group that
+        // points at the rotated_tex view (instead of output_tex_view).
+        if ctx.rotated_render_bind_group.is_none() {
+            ctx.rotated_render_bind_group = Some(make_render_bind_group(
+                &ctx.device,
+                &ctx.render_bgl,
+                ctx.rotated_tex_view.as_ref().unwrap().clone(),
+                ctx.sampler.clone(),
+            )?);
+        }
+
+        // Upload the params uniform: 8 f32 + 4 u32 = 48 bytes.
+        let mut params_bytes = [0u8; 48];
+        let f = [m00, m01, m10, m11, t0, t1, 0.0f32, 0.0f32];
+        for (i, v) in f.iter().enumerate() {
+            params_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let u = [ctx.target_w, ctx.target_h, dst_w, dst_h];
+        for (i, v) in u.iter().enumerate() {
+            params_bytes[32 + i * 4..32 + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        write_buffer_u8(&ctx.queue, &ctx.rotation_params_buf, &params_bytes)?;
+
+        ctx.rotation_active = true;
+        Ok(())
+    })
+}
+
+#[wasm_bindgen]
+pub fn gpu_clear_rotation() -> Result<(), JsValue> {
+    GPU_CTX.with(|c| -> Result<(), JsValue> {
+        let mut c = c.borrow_mut();
+        let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
+        ctx.rotation_active = false;
         Ok(())
     })
 }
@@ -1592,7 +1930,24 @@ pub fn gpu_render(
         )?;
         js_call0(&pass, "end")?;
 
-        // Pass 3: render output_tex → canvas
+        // Optional pass 2.5: rotation. Dispatched only when JS has called
+        // gpu_set_rotation since the last gpu_clear_rotation. Reads
+        // output_tex via the rotation bind group, writes rotated_tex.
+        if ctx.rotation_active {
+            if let Some(rot_bg) = ctx.rotation_bind_group.as_ref() {
+                let rx = ctx.rotated_w.div_ceil(8);
+                let ry = ctx.rotated_h.div_ceil(8);
+                let pass = js_call1(&enc, "beginComputePass", &Object::new())?;
+                js_call1(&pass, "setPipeline", &ctx.rotation_pipeline)?;
+                js_call2(&pass, "setBindGroup", &0.into(), rot_bg)?;
+                let dispatch_fn: Function = js_get(&pass, "dispatchWorkgroups")?.dyn_into()?;
+                Reflect::apply(&dispatch_fn, &pass, &Array::of2(&rx.into(), &ry.into()))?;
+                js_call0(&pass, "end")?;
+            }
+        }
+
+        // Pass 3: render output_tex (or rotated_tex when rotation is
+        // active) → canvas
         let canvas_tex = js_call0(&ctx.canvas_ctx, "getCurrentTexture")?;
         let canvas_view = js_call1(&canvas_tex, "createView", &Object::new())?;
         let color_attachment = js_obj(&[
@@ -1614,7 +1969,11 @@ pub fn gpu_render(
         let render_desc = js_obj(&[("colorAttachments", attachments.into())]);
         let rpass = js_call1(&enc, "beginRenderPass", &render_desc)?;
         js_call1(&rpass, "setPipeline", &ctx.render_pipeline)?;
-        let render_bg = ctx.render_bind_group.as_ref().unwrap();
+        let render_bg = if ctx.rotation_active {
+            ctx.rotated_render_bind_group.as_ref().unwrap()
+        } else {
+            ctx.render_bind_group.as_ref().unwrap()
+        };
         js_call2(&rpass, "setBindGroup", &0.into(), render_bg)?;
         let draw_fn: Function = js_get(&rpass, "draw")?.dyn_into()?;
         draw_fn.call1(&rpass, &3.into())?; // 3 vertices, fullscreen triangle
@@ -1650,17 +2009,23 @@ pub async fn gpu_readback_rgba8() -> Result<Uint8Array, JsValue> {
         GPU_CTX.with(|c| -> Result<_, JsValue> {
             let c = c.borrow();
             let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-            let tex = ctx
-                .output_tex
-                .as_ref()
-                .ok_or_else(|| JsValue::from("no output texture"))?;
-            Ok((
-                ctx.device.clone(),
-                ctx.queue.clone(),
-                tex.clone(),
-                ctx.target_w,
-                ctx.target_h,
-            ))
+            // When rotation is active, the canonical "output" we want
+            // to read back is the rotated texture, not the upstream
+            // pre-rotation result.
+            let (tex, w, h) = if ctx.rotation_active && ctx.rotated_tex.is_some() {
+                (
+                    ctx.rotated_tex.as_ref().unwrap().clone(),
+                    ctx.rotated_w,
+                    ctx.rotated_h,
+                )
+            } else {
+                let t = ctx
+                    .output_tex
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from("no output texture"))?;
+                (t.clone(), ctx.target_w, ctx.target_h)
+            };
+            Ok((ctx.device.clone(), ctx.queue.clone(), tex, w, h))
         })?;
 
     let bpp = 8u32; // rgba16float = 8 bytes/pixel
@@ -1787,17 +2152,23 @@ pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
         GPU_CTX.with(|c| -> Result<_, JsValue> {
             let c = c.borrow();
             let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-            let tex = ctx
-                .output_tex
-                .as_ref()
-                .ok_or_else(|| JsValue::from("no output texture"))?;
-            Ok((
-                ctx.device.clone(),
-                ctx.queue.clone(),
-                tex.clone(),
-                ctx.target_w,
-                ctx.target_h,
-            ))
+            // When rotation is active, the canonical "output" we want
+            // to read back is the rotated texture, not the upstream
+            // pre-rotation result.
+            let (tex, w, h) = if ctx.rotation_active && ctx.rotated_tex.is_some() {
+                (
+                    ctx.rotated_tex.as_ref().unwrap().clone(),
+                    ctx.rotated_w,
+                    ctx.rotated_h,
+                )
+            } else {
+                let t = ctx
+                    .output_tex
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from("no output texture"))?;
+                (t.clone(), ctx.target_w, ctx.target_h)
+            };
+            Ok((ctx.device.clone(), ctx.queue.clone(), tex, w, h))
         })?;
 
     let bpp = 8u32;
@@ -1875,17 +2246,23 @@ pub async fn gpu_readback_hdr_pq_u16(depth: u32) -> Result<Uint16Array, JsValue>
         GPU_CTX.with(|c| -> Result<_, JsValue> {
             let c = c.borrow();
             let ctx = c.as_ref().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-            let tex = ctx
-                .output_tex
-                .as_ref()
-                .ok_or_else(|| JsValue::from("no output texture"))?;
-            Ok((
-                ctx.device.clone(),
-                ctx.queue.clone(),
-                tex.clone(),
-                ctx.target_w,
-                ctx.target_h,
-            ))
+            // When rotation is active, the canonical "output" we want
+            // to read back is the rotated texture, not the upstream
+            // pre-rotation result.
+            let (tex, w, h) = if ctx.rotation_active && ctx.rotated_tex.is_some() {
+                (
+                    ctx.rotated_tex.as_ref().unwrap().clone(),
+                    ctx.rotated_w,
+                    ctx.rotated_h,
+                )
+            } else {
+                let t = ctx
+                    .output_tex
+                    .as_ref()
+                    .ok_or_else(|| JsValue::from("no output texture"))?;
+                (t.clone(), ctx.target_w, ctx.target_h)
+            };
+            Ok((ctx.device.clone(), ctx.queue.clone(), tex, w, h))
         })?;
 
     let bpp = 8u32; // rgba16float source
