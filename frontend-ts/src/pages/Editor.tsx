@@ -1038,10 +1038,16 @@ function Editor() {
     // SDR path: decode through a 2D canvas in display-p3 space.
     const blob = new Blob([buf as BlobPart]);
     let objectUrl: string | null = null;
+    // Let the browser apply EXIF rotation. Trying to do it manually with
+    // `imageOrientation: 'none'` is unreliable on iOS Safari, which bakes the
+    // rotation into transcoded JPEG pixels yet still ships the original EXIF
+    // tag, causing double-rotation. `'from-image'` is consistent across
+    // browsers, so we treat the resulting bitmap as already correctly oriented.
+    void orientation;
     const decodeSource = async (): Promise<ImageBitmap | HTMLImageElement> => {
       if (typeof createImageBitmap === 'function') {
         try {
-          return await createImageBitmap(blob, { imageOrientation: 'none' } as ImageBitmapOptions);
+          return await createImageBitmap(blob, { imageOrientation: 'from-image' } as ImageBitmapOptions);
         } catch {
           // Fall back to <img> below.
         }
@@ -1057,38 +1063,18 @@ function Editor() {
     try {
       const image = await decodeSource();
       const isBitmap = typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap;
-      const srcWidth = isBitmap
+      const outWidth = isBitmap
         ? image.width
         : (image as HTMLImageElement).naturalWidth || image.width;
-      const srcHeight = isBitmap
+      const outHeight = isBitmap
         ? image.height
         : (image as HTMLImageElement).naturalHeight || image.height;
-      // iOS Safari ignores `imageOrientation: 'none'` and returns already-rotated
-      // pixels. Detect that by asking for an `'from-image'` bitmap as well: if the
-      // dims match for an orientation that should swap them, the bitmap we already
-      // have is pre-rotated and we must skip the manual rotation step.
-      let effectiveOrientation = orientation;
-      if (isBitmap && orientation >= 5 && orientation <= 8) {
-        try {
-          const probe = await createImageBitmap(blob, {
-            imageOrientation: 'from-image',
-          } as ImageBitmapOptions);
-          if (probe.width === srcWidth && probe.height === srcHeight) {
-            effectiveOrientation = 1;
-          }
-          probe.close?.();
-        } catch {
-          // If the probe fails, fall through and trust the EXIF orientation.
-        }
-      }
-      const outSize = getOrientedSize(srcWidth, srcHeight, effectiveOrientation);
       const tmp = document.createElement('canvas');
-      tmp.width = outSize.width;
-      tmp.height = outSize.height;
+      tmp.width = outWidth;
+      tmp.height = outHeight;
       const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
-      applyCanvasOrientation(ctx, srcWidth, srcHeight, effectiveOrientation);
       ctx.drawImage(image, 0, 0);
-      const data = ctx.getImageData(0, 0, outSize.width, outSize.height, {
+      const data = ctx.getImageData(0, 0, outWidth, outHeight, {
         colorSpace: 'display-p3',
       });
       const sdrData = new Uint8Array(data.data);
@@ -1096,8 +1082,8 @@ function Editor() {
         url: imageUrl,
         data: sdrData,
         sdrData,
-        w: outSize.width,
-        h: outSize.height,
+        w: outWidth,
+        h: outHeight,
         hdr: false,
         hasAlpha: bufferHasAlpha(sdrData),
       };
