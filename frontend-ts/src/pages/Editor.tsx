@@ -1063,12 +1063,30 @@ function Editor() {
       const srcHeight = isBitmap
         ? image.height
         : (image as HTMLImageElement).naturalHeight || image.height;
-      const outSize = getOrientedSize(srcWidth, srcHeight, orientation);
+      // iOS Safari ignores `imageOrientation: 'none'` and returns already-rotated
+      // pixels. Detect that by asking for an `'from-image'` bitmap as well: if the
+      // dims match for an orientation that should swap them, the bitmap we already
+      // have is pre-rotated and we must skip the manual rotation step.
+      let effectiveOrientation = orientation;
+      if (isBitmap && orientation >= 5 && orientation <= 8) {
+        try {
+          const probe = await createImageBitmap(blob, {
+            imageOrientation: 'from-image',
+          } as ImageBitmapOptions);
+          if (probe.width === srcWidth && probe.height === srcHeight) {
+            effectiveOrientation = 1;
+          }
+          probe.close?.();
+        } catch {
+          // If the probe fails, fall through and trust the EXIF orientation.
+        }
+      }
+      const outSize = getOrientedSize(srcWidth, srcHeight, effectiveOrientation);
       const tmp = document.createElement('canvas');
       tmp.width = outSize.width;
       tmp.height = outSize.height;
       const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
-      applyCanvasOrientation(ctx, srcWidth, srcHeight, orientation);
+      applyCanvasOrientation(ctx, srcWidth, srcHeight, effectiveOrientation);
       ctx.drawImage(image, 0, 0);
       const data = ctx.getImageData(0, 0, outSize.width, outSize.height, {
         colorSpace: 'display-p3',
@@ -1582,8 +1600,7 @@ function Editor() {
           {gpuMissing ? (
             <div className="max-w-md text-center text-sm text-muted-foreground">
               WebGPU is required but unavailable on this device. Pictolab needs a
-              browser with WebGPU enabled (recent Chrome, Edge, or Safari Technology
-              Preview).
+              browser with WebGPU enabled (recent Chrome, Edge, or Safari on iOS 26).
             </div>
           ) : !source ? (
             <div className="w-full max-w-2xl">
