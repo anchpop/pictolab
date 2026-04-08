@@ -9,11 +9,6 @@ const EXAMPLE_IMAGES = [
   { src: '/examples/artwork_05.webp', label: 'Artwork 5' },
 ];
 
-const IS_IOS =
-  typeof navigator !== 'undefined' &&
-  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
-    (navigator.platform === 'MacIntel' && (navigator as any).maxTouchPoints > 1));
-
 const DB_NAME = 'pictolab-images';
 const STORE_NAME = 'uploads';
 const MAX_SAVED_IMAGES = 10;
@@ -251,12 +246,6 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
 
   return (
     <div className="image-picker">
-      {IS_IOS && (
-        <div className="ios-hdr-banner">
-          Heads up: iOS Safari converts photos to standard JPEG when uploading,
-          so HDR images can't be edited at full fidelity here on iPhone or iPad.
-        </div>
-      )}
       <div
         className={`image-drop-zone ${isDragging ? 'dragging' : ''} ${disabled ? 'disabled' : ''}`}
         onDragOver={handleDragOver}

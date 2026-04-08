@@ -160,7 +160,77 @@ function orientPackedRgba(
   };
 }
 
+// Read the JPEG SOF marker to get the *raw stored* pixel dims, before any
+// EXIF rotation. We use this as ground truth to detect when an upstream
+// decoder (libultrahdr, libheif) has already auto-applied EXIF orientation,
+// so we don't double-rotate.
+function parseJpegStoredDims(buf: Uint8Array): { width: number; height: number } | null {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) return null;
+    const marker = buf[i + 1];
+    // SOF0..SOF15, excluding DHT(C4), JPG(C8), DAC(CC).
+    if (
+      marker >= 0xc0 && marker <= 0xcf &&
+      marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+    ) {
+      const h = (buf[i + 5] << 8) | buf[i + 6];
+      const w = (buf[i + 7] << 8) | buf[i + 8];
+      return { width: w, height: h };
+    }
+    const size = (buf[i + 2] << 8) | buf[i + 3];
+    if (size < 2) return null;
+    i += 2 + size;
+  }
+  return null;
+}
+
+// Inline JPEG EXIF Orientation parser. We hand-roll this instead of going
+// through exifr because exifr has been observed returning Orientation=1 on
+// iOS Chrome even when the EXIF block clearly contains a non-1 value, which
+// caused iPhone uploads to render rotated.
+function parseJpegExifOrientation(buf: Uint8Array): ExifOrientation | null {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 4 < buf.length) {
+    if (buf[i] !== 0xff) return null;
+    const marker = buf[i + 1];
+    const size = (buf[i + 2] << 8) | buf[i + 3];
+    if (size < 2) return null;
+    if (marker === 0xe1 && i + 10 < buf.length) {
+      if (
+        buf[i + 4] === 0x45 && buf[i + 5] === 0x78 &&
+        buf[i + 6] === 0x69 && buf[i + 7] === 0x66
+      ) {
+        const tiff = i + 10;
+        const little = buf[tiff] === 0x49;
+        const get16 = (o: number) => little
+          ? (buf[o] | (buf[o + 1] << 8))
+          : ((buf[o] << 8) | buf[o + 1]);
+        const get32 = (o: number) => little
+          ? (buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16) | (buf[o + 3] << 24))
+          : ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]);
+        const ifd0 = tiff + get32(tiff + 4);
+        if (ifd0 + 2 > buf.length) return null;
+        const n = get16(ifd0);
+        for (let j = 0; j < n; j++) {
+          const e = ifd0 + 2 + j * 12;
+          if (e + 12 > buf.length) return null;
+          if (get16(e) === 0x0112) {
+            return normalizeOrientation(get16(e + 8));
+          }
+        }
+      }
+    }
+    i += 2 + size;
+  }
+  return null;
+}
+
 async function parseOrientation(buf: Uint8Array): Promise<ExifOrientation> {
+  const inline = parseJpegExifOrientation(buf);
+  if (inline !== null) return inline;
   try {
     const exifr = await import('exifr');
     const parsed: any = await exifr.parse(buf, ['Orientation']).catch(() => null);
@@ -973,13 +1043,28 @@ function Editor() {
       return;
     }
     const orientation = await parseOrientation(buf);
+    const storedJpegDims = parseJpegStoredDims(buf);
 
     // Try the HDR path first. Returns null for SDR / unsupported formats
     // so we can fall through to the canvas path.
     try {
       const { decodeHdr } = await import('@/lib/hdr-decode');
       const decodedRaw = await decodeHdr(buf);
-      const decoded = decodedRaw ? orientHdrDecodeResult(decodedRaw, orientation) : null;
+      // Some HDR decoders (notably libultrahdr on iOS-shot JPEGs) honor the
+      // EXIF Orientation tag internally and return already-rotated pixels.
+      // When that happens, the decoded dims match the *swapped* JPEG SOF dims
+      // (for orientation 5–8). Detect that and skip our manual rotation so
+      // we don't double-rotate.
+      let effectiveOrientation = orientation;
+      if (decodedRaw && storedJpegDims && orientation >= 5 && orientation <= 8) {
+        if (
+          decodedRaw.width === storedJpegDims.height &&
+          decodedRaw.height === storedJpegDims.width
+        ) {
+          effectiveOrientation = 1;
+        }
+      }
+      const decoded = decodedRaw ? orientHdrDecodeResult(decodedRaw, effectiveOrientation) : null;
       if (decoded) {
         const src: SourceState = {
           url: imageUrl,
