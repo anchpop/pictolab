@@ -163,6 +163,27 @@ fn dispatch(
     Ok(())
 }
 
+// Dispatches `total_workgroups` worth of compute work as a 2D X×Y grid so we
+// stay under maxComputeWorkgroupsPerDimension (65535). Shaders called this
+// way must reconstruct the linear workgroup index from `gid` + `num_workgroups`.
+fn dispatch_2d_for_n(
+    encoder: &JsValue,
+    pipeline: &JsValue,
+    bind_group: &JsValue,
+    total_workgroups: u32,
+) -> Result<(), JsValue> {
+    const MAX_DIM: u32 = 65535;
+    let wg_x = total_workgroups.min(MAX_DIM).max(1);
+    let wg_y = total_workgroups.div_ceil(MAX_DIM).max(1);
+    let pass = js_call1(encoder, "beginComputePass", &Object::new())?;
+    js_call1(&pass, "setPipeline", pipeline)?;
+    js_call2(&pass, "setBindGroup", &0.into(), bind_group)?;
+    let dispatch_fn: js_sys::Function = js_get(&pass, "dispatchWorkgroups")?.dyn_into()?;
+    dispatch_fn.call3(&pass, &wg_x.into(), &wg_y.into(), &1u32.into())?;
+    js_call0(&pass, "end")?;
+    Ok(())
+}
+
 // ── WGSL shaders ────────────────────────────────────────────────────────────
 
 fn lab_conversion_shader(n: u32) -> String {
@@ -181,8 +202,15 @@ fn cbrt_signed(x: f32) -> f32 {{
 }}
 
 @compute @workgroup_size(256)
-fn convert(@builtin(global_invocation_id) gid: vec3u) {{
-  let idx = gid.x;
+fn convert(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u,
+) {{
+  // Dispatched as a 2D grid (X×Y workgroups) because at workgroup_size 256
+  // a 1D dispatch caps out at 65535*256 ≈ 16.7M pixels, and large phone
+  // photos exceed that. The 2D layout is invocation-major along X, so the
+  // linear pixel index is `gid.y * (workgroups_x * 256) + gid.x`.
+  let idx = gid.y * nwg.x * 256u + gid.x;
   if (idx >= {n}u) {{ return; }}
   let p = rgba[idx];
   let lr = srgb_to_linear(f32(p & 0xFFu) / 255.0);
@@ -381,15 +409,23 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     if adapter.is_null() || adapter.is_undefined() {
         return Err("No GPU adapter".into());
     }
-    // Request the adapter's max storage buffer binding size (can exceed u32, keep as f64)
-    let max_storage = js_get(&js_get(&adapter, "limits")?, "maxStorageBufferBindingSize")?
+    // Request the adapter's max storage buffer binding size and max buffer
+    // size. Both default to 256 MiB on most adapters, which is too small for
+    // large source images (e.g. an iPhone HEIC at f16 RGBA can exceed it).
+    // Adapters typically expose limits up to 4 GiB; pass them through verbatim
+    // so we never blow the default ceiling.
+    let adapter_limits = js_get(&adapter, "limits")?;
+    let max_storage = js_get(&adapter_limits, "maxStorageBufferBindingSize")?
         .as_f64()
         .unwrap_or(134217728.0);
+    let max_buffer = js_get(&adapter_limits, "maxBufferSize")?
+        .as_f64()
+        .unwrap_or(max_storage);
 
-    let required_limits = js_obj(&[(
-        "maxStorageBufferBindingSize",
-        JsValue::from_f64(max_storage),
-    )]);
+    let required_limits = js_obj(&[
+        ("maxStorageBufferBindingSize", JsValue::from_f64(max_storage)),
+        ("maxBufferSize", JsValue::from_f64(max_buffer)),
+    ]);
     let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
     let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
     let queue = js_get(&device, "queue")?;
@@ -451,7 +487,7 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
     // ── LAB conversion ──────────────────────────────────────────────────
     let lab_bg = create_bind_group(&device, &lab_bgl, &[&rgba_b, &lab_b])?;
     let enc = js_call1(&device, "createCommandEncoder", &Object::new())?;
-    dispatch(&enc, &lab_pipe, &lab_bg, n.div_ceil(256))?;
+    dispatch_2d_for_n(&enc, &lab_pipe, &lab_bg, n.div_ceil(256))?;
     let cmd_buf = js_call0(&enc, "finish")?;
     let cmds = Array::of1(&cmd_buf);
     js_call1(&queue, "submit", &cmds)?;
@@ -545,15 +581,19 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
 // operations so slider drags only touch GPU (no JS↔wasm pixel readback).
 //
 // Pipeline:
-//   1. Source RGBA (u32-packed bytes) lives in `source_buf`, uploaded once
-//      per image via `gpu_set_source`.
-//   2. The remap compute shader reads source_buf + uniform params, writes
-//      vec4f remapped pixels into `remap_buf`. Slider drags hit this.
-//   3. The carve compute shader reads remap_buf + the carve LUT, writes
-//      rgba16float pixels into `output_tex`. The LUT is rebuilt CPU-side
-//      whenever target dimensions change.
-//   4. A trivial render pipeline (fullscreen triangle + textureSample)
-//      samples output_tex into the WebGPU canvas current texture.
+//   1. Source pixels (rgba8 SDR or f16 HDR) are uploaded to a staging
+//      buffer and a one-shot normalize compute pass converts them into
+//      canonical OKLab + alpha in `source_tex` (rgba16float). After this
+//      step the per-frame path no longer cares about the input format.
+//   2. The remap compute shader reads `source_tex` + uniform params,
+//      applies the slider edits in OKLab, inverts to linear extended
+//      Display P3, and writes vec4f pixels into `remap_buf`. Slider
+//      drags hit this.
+//   3. Either the carve or the resample compute shader reads `remap_buf`
+//      and writes `output_tex` (linear extended P3, rgba16float).
+//   4. The render fragment shader samples `output_tex`, applies the HDR
+//      clipping overlay and the sRGB transfer encode, and writes to the
+//      WebGPU canvas current texture.
 //
 // The download path is the only consumer that reads pixels back to CPU.
 
@@ -565,16 +605,30 @@ struct GpuCtx {
     device: JsValue,
     queue: JsValue,
 
-    // Source buffer (u32-packed sRGB-encoded RGBA) and its dimensions.
-    source_buf: JsValue,
-    // Parallel HDR source buffer (vec4f, linear extended Display P3).
-    // Always bound — when not in use it stays at minimum size and the
-    // remap shader picks the SDR `source_buf` based on `is_hdr_source`.
-    hdr_source_buf: JsValue,
-    is_hdr_source: u32,
+    // Source as a `rgba16float` storage texture holding canonical OKLab + alpha.
+    // Both SDR and HDR uploads are normalized into this single format by a
+    // one-shot compute pass at upload time, so the per-frame remap shader
+    // never has to know which input format the source came from.
+    source_tex: Option<JsValue>,
+    source_tex_view: Option<JsValue>,
+    // Persistent staging buffer the upload bytes are written into before
+    // the normalize compute pass reads them. Grown lazily whenever the
+    // next upload needs more bytes than the current allocation holds —
+    // dims *and* bytes-per-pixel both matter, because SDR→HDR transitions
+    // at the same dims still double the required size.
+    source_upload_buf: JsValue,
+    source_upload_buf_bytes: u32,
     src_w: u32,
     src_h: u32,
     src_n: u32,
+
+    // One-shot normalize pipelines that convert raw upload bytes (rgba8 SDR
+    // or rgba16float HDR) into the canonical OKLab `source_tex` above.
+    normalize_sdr_pipeline: JsValue,
+    normalize_sdr_bgl: JsValue,
+    normalize_hdr_pipeline: JsValue,
+    normalize_hdr_bgl: JsValue,
+    normalize_dims_buf: JsValue, // uniform vec4u: src_w, src_h, _, _
 
     // Remap compute pipeline + intermediate vec4f buffer.
     remap_pipeline: JsValue,
@@ -627,93 +681,52 @@ struct GpuCtx {
 
     // Shared params uniform (l/c min/max, hue cos/sin).
     params_buf: JsValue,
-
-    // Optional readback buffer for the download path. Created lazily on
-    // first download since downloads are infrequent.
-    read_buf: RefCell<Option<JsValue>>,
 }
 
 thread_local! {
     static GPU_CTX: RefCell<Option<GpuCtx>> = const { RefCell::new(None) };
 }
 
-fn remap_shader() -> &'static str {
-    r#"
-struct Params {
-  l_min: f32,
-  l_max: f32,
-  c_min: f32,
-  c_max: f32,
-  hue_cos: f32,
-  hue_sin: f32,
-  show_hdr: f32,
-  time: f32,
-  is_hdr_source: f32,
-  _pad1: f32,
-  _pad2: f32,
-  _pad3: f32,
-}
-
-@group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
-@group(0) @binding(1) var<storage, read_write> linp3_out: array<vec4f>;
-@group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var<storage, read> hdr_in: array<vec4f>;
-
-fn srgb_to_linear(c: f32) -> f32 {
-  if (c <= 0.04045) { return c / 12.92; }
-  return pow((c + 0.055) / 1.055, 2.4);
-}
-
-// Cube root that preserves sign for negative inputs (which can occur for
-// out-of-gamut LMS values when extrapolating boosts).
+// Shared OKLab forward-conversion WGSL snippet used by both normalize
+// pipelines. Takes linear extended Display P3 (lr, lg, lb) and returns
+// canonical OKLab (L ~ [0,1], a/b ~ [-0.5, 0.5] for sRGB gamut, larger for
+// HDR extended values) without any UI scaling baked in. The slider math
+// in the per-frame remap shader applies the *100/*400 scaling at use time.
+const OKLAB_HELPERS_WGSL: &str = r#"
 fn cbrt_signed(x: f32) -> f32 {
   return sign(x) * pow(abs(x), 1.0 / 3.0);
 }
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let idx = gid.x;
-  // Use the HDR source length when active so we don't gate on the
-  // tiny SDR placeholder buffer.
-  let n = select(arrayLength(&rgba_in), arrayLength(&hdr_in), params.is_hdr_source > 0.5);
-  if (idx >= n) { return; }
-
-  var lr: f32;
-  var lg: f32;
-  var lb: f32;
-  var a8: f32;
-  if (params.is_hdr_source > 0.5) {
-    // Already linear extended Display P3, half-float decoded on the host.
-    let h = hdr_in[idx];
-    lr = h.r;
-    lg = h.g;
-    lb = h.b;
-    a8 = h.a;
-  } else {
-    let p = rgba_in[idx];
-    let r8 = f32(p & 0xFFu) / 255.0;
-    let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
-    let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
-    a8 = f32((p >> 24u) & 0xFFu) / 255.0;
-    lr = srgb_to_linear(r8);
-    lg = srgb_to_linear(g8);
-    lb = srgb_to_linear(b8);
-  }
-
-  // Linear Display P3 → LMS (precomputed M_xyz_to_lms · M_p3_to_xyz).
+fn linear_p3_to_oklab(lr: f32, lg: f32, lb: f32) -> vec3f {
+  // Linear Display P3 → LMS (M_xyz_to_lms · M_p3_to_xyz, precomputed).
   let lms_l = 0.4813371 * lr + 0.4620734 * lg + 0.0565038 * lb;
   let lms_m = 0.2288498 * lr + 0.6532486 * lg + 0.1179665 * lb;
   let lms_s = 0.0839833 * lr + 0.2242765 * lg + 0.6922382 * lb;
-
-  // Nonlinear LMS' (cube root)
+  // LMS → LMS' (sign-preserving cube root for HDR negatives).
   let l_ = cbrt_signed(lms_l);
   let m_ = cbrt_signed(lms_m);
   let s_ = cbrt_signed(lms_s);
+  // LMS' → canonical OKLab.
+  let big_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+  let aa    = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+  let bb    = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+  return vec3f(big_l, aa, bb);
+}
+"#;
 
-  // LMS' → OKLab, then scale to match the historical 0..100 / 0..160 ranges.
-  var L = (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_) * 100.0;
-  var A = (1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_) * 400.0;
-  var B = (0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_) * 400.0;
+// Shared WGSL snippet that takes a canonical OKLab + alpha sample and the
+// shared Params uniform, applies the L/C/hue slider edits, inverts OKLab to
+// linear extended Display P3, and returns a vec4f. Inlined into both the
+// per-frame remap shader and the carve shader (which fuses the inverse
+// directly into its single source tap).
+const OKLAB_EDIT_AND_INVERT_WGSL: &str = r#"
+fn apply_edits_and_invert(s: vec4f, params: Params) -> vec4f {
+  // Source is canonical OKLab. Scale L to 0..100 and a/b to ±200-ish so
+  // the slider math (legacy ranges) keeps working unchanged.
+  var L = s.x * 100.0;
+  var A = s.y * 400.0;
+  var B = s.z * 400.0;
+  let a8 = s.w;
 
   let l_scale = (params.l_max - params.l_min) / 100.0;
   L = params.l_min + L * l_scale;
@@ -735,7 +748,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   A = new_a;
   B = new_b;
 
-  // Unscale and invert OKLab.
+  // Unscale and invert OKLab. The inverse uses x*x*x cubes (cheap), so
+  // this whole helper is dramatically lighter than the original which
+  // also did 3× pow(x, 1/3) per source pixel per frame.
   let big_l = L / 100.0;
   let aa = A / 400.0;
   let bb = B / 400.0;
@@ -752,49 +767,164 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let lg2 = -1.0911312 * lin_l + 2.4133403 * lin_m - 0.3221775 * lin_s;
   let lb2 = -0.0260093 * lin_l - 0.5080364 * lin_m + 1.5332833 * lin_s;
 
-  // HDR view: any channel above 1.0 in linear extended P3 will clip on
-  // SDR displays. Mark those pixels with a color that oscillates between
-  // red and green based on `time` so they pop visually.
-  if (params.show_hdr > 0.5) {
-    let max_ch = max(max(lr2, lg2), lb2);
-    if (max_ch > 1.0) {
-      let t = 0.5 + 0.5 * sin(params.time * 4.0);
-      linp3_out[idx] = vec4f(t, 1.0 - t, 0.0, a8);
-      return;
-    }
-  }
-
-  // Apply the Display P3 (= sRGB) transfer function. Chrome treats values
-  // written to an rgba16float canvas as already encoded in the configured
-  // color space, so we need to encode here. Sign-preserving for HDR-ready
-  // extended-range values that may go negative or above 1.
-  let er = sign(lr2) * select(1.055 * pow(abs(lr2), 1.0 / 2.4) - 0.055, 12.92 * abs(lr2), abs(lr2) <= 0.0031308);
-  let eg = sign(lg2) * select(1.055 * pow(abs(lg2), 1.0 / 2.4) - 0.055, 12.92 * abs(lg2), abs(lg2) <= 0.0031308);
-  let eb = sign(lb2) * select(1.055 * pow(abs(lb2), 1.0 / 2.4) - 0.055, 12.92 * abs(lb2), abs(lb2) <= 0.0031308);
-
-  linp3_out[idx] = vec4f(er, eg, eb, a8);
+  return vec4f(lr2, lg2, lb2, a8);
 }
-"#
+"#;
+
+// Shared Params struct WGSL (matches the Rust upload at gpu_render).
+const PARAMS_STRUCT_WGSL: &str = r#"
+struct Params {
+  l_min: f32,
+  l_max: f32,
+  c_min: f32,
+  c_max: f32,
+  hue_cos: f32,
+  hue_sin: f32,
+  show_hdr: f32,
+  time: f32,
+}
+"#;
+
+// Convert raw rgba8 SDR upload bytes (sRGB encoded) into canonical OKLab
+// in source_tex. Runs once per source upload, never on the per-frame path.
+fn normalize_sdr_shader() -> String {
+    let mut s = String::new();
+    s.push_str(r#"
+@group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
+@group(0) @binding(1) var source_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> dims: vec4u; // src_w, src_h, _, _
+
+fn srgb_to_linear(c: f32) -> f32 {
+  if (c <= 0.04045) { return c / 12.92; }
+  return pow((c + 0.055) / 1.055, 2.4);
+}
+"#);
+    s.push_str(OKLAB_HELPERS_WGSL);
+    s.push_str(r#"
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let w = dims.x;
+  let h = dims.y;
+  if (gid.x >= w || gid.y >= h) { return; }
+  let idx = gid.y * w + gid.x;
+  let p = rgba_in[idx];
+  let r8 = f32(p & 0xFFu) / 255.0;
+  let g8 = f32((p >> 8u) & 0xFFu) / 255.0;
+  let b8 = f32((p >> 16u) & 0xFFu) / 255.0;
+  let a8 = f32((p >> 24u) & 0xFFu) / 255.0;
+  let lr = srgb_to_linear(r8);
+  let lg = srgb_to_linear(g8);
+  let lb = srgb_to_linear(b8);
+  let lab = linear_p3_to_oklab(lr, lg, lb);
+  textureStore(source_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(lab.x, lab.y, lab.z, a8));
+}
+"#);
+    s
 }
 
-fn carve_shader() -> &'static str {
-    r#"
-@group(0) @binding(0) var<storage, read> linp3_in: array<vec4f>;
+// Convert raw f16 RGBA HDR upload bytes (already linear extended Display P3)
+// into canonical OKLab in source_tex. Reads two u32s per pixel and decodes
+// each into a pair of f16 channels via the WGSL builtin unpack2x16float.
+fn normalize_hdr_shader() -> String {
+    let mut s = String::new();
+    s.push_str(r#"
+@group(0) @binding(0) var<storage, read> f16_in: array<u32>;
+@group(0) @binding(1) var source_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> dims: vec4u; // src_w, src_h, _, _
+"#);
+    s.push_str(OKLAB_HELPERS_WGSL);
+    s.push_str(r#"
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let w = dims.x;
+  let h = dims.y;
+  if (gid.x >= w || gid.y >= h) { return; }
+  let idx = gid.y * w + gid.x;
+  // Each pixel is 8 bytes = 2 u32s. Word 0 = (R, G), word 1 = (B, A).
+  let rg = unpack2x16float(f16_in[idx * 2u]);
+  let ba = unpack2x16float(f16_in[idx * 2u + 1u]);
+  let lr = rg.x;
+  let lg = rg.y;
+  let lb = ba.x;
+  let a  = ba.y;
+  let lab = linear_p3_to_oklab(lr, lg, lb);
+  textureStore(source_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(lab.x, lab.y, lab.z, a));
+}
+"#);
+    s
+}
+
+fn remap_shader() -> String {
+    let mut s = String::new();
+    s.push_str(PARAMS_STRUCT_WGSL);
+    s.push_str(r#"
+// source_tex holds canonical OKLab (L, a, b) plus alpha. Both SDR and HDR
+// uploads were normalized into this single perceptual-space format by a
+// one-shot compute pass at upload time, so this hot-path shader is just
+// "apply slider edits in OKLab, then invert to linear extended P3."
+@group(0) @binding(0) var source_tex: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> linp3_out: array<vec4f>;
+@group(0) @binding(2) var<uniform> params: Params;
+"#);
+    s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
+    s.push_str(r#"
+@compute @workgroup_size(256)
+fn main(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u,
+) {
+  // 2D dispatch — see dispatch_2d_for_n. Reconstruct the linear pixel index.
+  let idx = gid.y * nwg.x * 256u + gid.x;
+  let dims = textureDimensions(source_tex);
+  let w = dims.x;
+  let h = dims.y;
+  if (idx >= w * h) { return; }
+  let x = idx % w;
+  let y = idx / w;
+
+  let s = textureLoad(source_tex, vec2i(i32(x), i32(y)), 0);
+  // Write LINEAR extended Display P3. The sRGB transfer encode and the
+  // HDR clipping overlay both happen later, in the render fragment shader,
+  // so the resize/rotation passes can filter linear light instead of
+  // gamma-encoded values.
+  linp3_out[idx] = apply_edits_and_invert(s, params);
+}
+"#);
+    s
+}
+
+fn carve_shader() -> String {
+    let mut s = String::new();
+    s.push_str(PARAMS_STRUCT_WGSL);
+    s.push_str(r#"
+// Carve is a one-tap gather: each output pixel reads exactly one source
+// pixel through the seam-order LUT. Because there's no redundancy, we
+// fuse the per-frame OKLab inverse + slider edits directly here, skipping
+// the separate remap pass and its full-resolution intermediate buffer.
+@group(0) @binding(0) var source_tex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read> lut: array<u32>;
 @group(0) @binding(2) var output_tex: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var<uniform> dims: vec4u; // target_w, target_h, _, _
-
+@group(0) @binding(3) var<uniform> dims: vec4u; // target_w, target_h, src_w, src_h
+@group(0) @binding(4) var<uniform> params: Params;
+"#);
+    s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
+    s.push_str(r#"
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let tw = dims.x;
   let th = dims.y;
+  let sw = dims.z;
   if (gid.x >= tw || gid.y >= th) { return; }
   let out_idx = gid.y * tw + gid.x;
   let src_idx = lut[out_idx];
-  let pixel = linp3_in[src_idx];
-  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), pixel);
+  let sx = src_idx % sw;
+  let sy = src_idx / sw;
+  let s = textureLoad(source_tex, vec2i(i32(sx), i32(sy)), 0);
+  let lin = apply_edits_and_invert(s, params);
+  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), lin);
 }
-"#
+"#);
+    s
 }
 
 // Lanczos-3 separable resample done as a single 2D pass. Each output
@@ -850,6 +980,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let y0 = max(i32(floor(cy - radius_y)), 0);
   let y1 = min(i32(ceil(cy + radius_y)), i32(sh) - 1);
 
+  // Filter premultiplied RGBA. Filtering straight-alpha would let RGB
+  // values from fully-transparent pixels (where RGB is undefined) leak
+  // into the result, producing dark/bright halos around transparent edges.
+  // Premultiplying first weights RGB by alpha so transparent samples
+  // contribute zero RGB, then we unpremultiply at the end.
   var sum = vec4f(0.0);
   var w_total = 0.0;
   for (var y = y0; y <= y1; y = y + 1) {
@@ -858,13 +993,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       let wx = lanczos((f32(x) - cx) / kx);
       let w = wx * wy;
       let src = linp3_in[u32(y) * sw + u32(x)];
-      sum = sum + src * w;
+      let pre = vec4f(src.rgb * src.a, src.a);
+      sum = sum + pre * w;
       w_total = w_total + w;
     }
   }
 
-  let out = sum / max(w_total, 1e-6);
-  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), out);
+  let norm = sum / max(w_total, 1e-6);
+  let a_out = norm.a;
+  let rgb_out = norm.rgb / max(a_out, 1e-6);
+  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(rgb_out, a_out));
 }
 "#
 }
@@ -926,6 +1064,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let sw = i32(params.src_w);
   let sh = i32(params.src_h);
 
+  // Filter premultiplied RGBA so transparent samples don't leak undefined
+  // RGB into the result. See the resample shader for the rationale.
   var sum = vec4f(0.0);
   var w_total = 0.0;
   for (var y = y0; y <= y1; y = y + 1) {
@@ -936,20 +1076,35 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       let wx = lanczos(f32(x) - cx);
       let w = wx * wy;
       let s = textureLoad(src_tex, vec2i(x, y), 0);
-      sum = sum + s * w;
+      let pre = vec4f(s.rgb * s.a, s.a);
+      sum = sum + pre * w;
       w_total = w_total + w;
     }
   }
-  let out = sum / max(w_total, 1e-6);
-  textureStore(dst_tex, vec2i(i32(gid.x), i32(gid.y)), out);
+  let norm = sum / max(w_total, 1e-6);
+  let a_out = norm.a;
+  let rgb_out = norm.rgb / max(a_out, 1e-6);
+  textureStore(dst_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(rgb_out, a_out));
 }
 "#
 }
 
 fn render_shader() -> &'static str {
     r#"
+struct Params {
+  l_min: f32,
+  l_max: f32,
+  c_min: f32,
+  c_max: f32,
+  hue_cos: f32,
+  hue_sin: f32,
+  show_hdr: f32,
+  time: f32,
+}
+
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_smp: sampler;
+@group(0) @binding(2) var<uniform> params: Params;
 
 struct VsOut {
   @builtin(position) pos: vec4f,
@@ -972,15 +1127,51 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
   return out;
 }
 
+// sRGB / Display P3 transfer function (linear → encoded). Sign-preserving
+// so HDR extended-range values that may go negative or above 1.0 keep their
+// sign through the encode.
+fn srgb_encode(c: f32) -> f32 {
+  let a = abs(c);
+  let e = select(1.055 * pow(a, 1.0 / 2.4) - 0.055, 12.92 * a, a <= 0.0031308);
+  return sign(c) * e;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
+  // src_tex contains LINEAR extended Display P3, straight alpha. We do
+  // the gamut clipping overlay and the sRGB transfer encode here, at the
+  // very last step before the canvas, so the resampling/rotation passes
+  // can filter linear light (the right thing to do) instead of encoded
+  // values (which causes filtering artifacts around bright edges).
+  let s = textureSample(src_tex, src_smp, in.uv);
+  var lr = s.r;
+  var lg = s.g;
+  var lb = s.b;
+  let a = s.a;
+
+  // HDR view: any channel above 1.0 in linear extended P3 will clip on
+  // SDR displays. Mark those pixels with a color that oscillates between
+  // red and green based on `time` so they pop visually.
+  if (params.show_hdr > 0.5) {
+    let max_ch = max(max(lr, lg), lb);
+    if (max_ch > 1.0) {
+      let t = 0.5 + 0.5 * sin(params.time * 4.0);
+      lr = t;
+      lg = 1.0 - t;
+      lb = 0.0;
+    }
+  }
+
+  let er = srgb_encode(lr);
+  let eg = srgb_encode(lg);
+  let eb = srgb_encode(lb);
+
   // The canvas is configured with alphaMode=premultiplied, so we have
   // to multiply RGB by A here. Our internal pipeline carries straight
   // alpha all the way through (because OKLab math on premultiplied
   // colors is meaningless), and we only premultiply at the very last
   // step before handing pixels to the swap chain.
-  let s = textureSample(src_tex, src_smp, in.uv);
-  return vec4f(s.rgb * s.a, s.a);
+  return vec4f(er * a, eg * a, eb * a, a);
 }
 "#
 }
@@ -988,6 +1179,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 // ── Bind group layout helpers (specific to the new context) ─────────────────
 
 fn make_remap_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    let entries = Array::new();
+    // 0: source_tex (canonical OKLab + alpha, sampled via textureLoad).
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        (
+            "texture",
+            js_obj(&[
+                ("sampleType", "float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
+    ]));
+    // 1: linp3_out (vec4f linear extended P3, write target for the
+    // resize pass to read).
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "storage".into())]).into()),
+    ]));
+    // 2: shared params uniform.
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    js_call1(
+        device,
+        "createBindGroupLayout",
+        &js_obj(&[("entries", entries.into())]),
+    )
+}
+
+// Bind group layout for the one-shot SDR normalize pass: rgba8 input
+// buffer, source_tex storage texture out, dims uniform.
+fn make_normalize_sdr_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     let entries = Array::new();
     entries.push(&js_obj(&[
         ("binding", 0u32.into()),
@@ -1000,22 +1228,20 @@ fn make_remap_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     entries.push(&js_obj(&[
         ("binding", 1u32.into()),
         ("visibility", SHADER_COMPUTE.into()),
-        ("buffer", js_obj(&[("type", "storage".into())]).into()),
+        (
+            "storageTexture",
+            js_obj(&[
+                ("access", "write-only".into()),
+                ("format", "rgba16float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
+        ),
     ]));
     entries.push(&js_obj(&[
         ("binding", 2u32.into()),
         ("visibility", SHADER_COMPUTE.into()),
         ("buffer", js_obj(&[("type", "uniform".into())]).into()),
-    ]));
-    // Binding 3: HDR source buffer (vec4f linear extended P3). Always
-    // bound — when an SDR source is active it points at a tiny dummy.
-    entries.push(&js_obj(&[
-        ("binding", 3u32.into()),
-        ("visibility", SHADER_COMPUTE.into()),
-        (
-            "buffer",
-            js_obj(&[("type", "read-only-storage".into())]).into(),
-        ),
     ]));
     js_call1(
         device,
@@ -1024,15 +1250,28 @@ fn make_remap_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     )
 }
 
+// Bind group layout for the one-shot HDR normalize pass: f16-packed input
+// buffer (read as u32 pairs), source_tex storage texture out, dims uniform.
+fn make_normalize_hdr_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
+    // Same shape as the SDR layout — only the shader's interpretation
+    // of binding 0 differs. Reusing the SDR helper would work too but
+    // keeping a separate name makes it obvious which pipeline owns each.
+    make_normalize_sdr_bgl(device)
+}
+
 fn make_carve_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     let entries = Array::new();
-    // 0: linp3_in (read-only storage)
+    // 0: source_tex (canonical OKLab + alpha, sampled via textureLoad)
     entries.push(&js_obj(&[
         ("binding", 0u32.into()),
         ("visibility", SHADER_COMPUTE.into()),
         (
-            "buffer",
-            js_obj(&[("type", "read-only-storage".into())]).into(),
+            "texture",
+            js_obj(&[
+                ("sampleType", "float".into()),
+                ("viewDimension", "2d".into()),
+            ])
+            .into(),
         ),
     ]));
     // 1: lut (read-only storage)
@@ -1058,9 +1297,15 @@ fn make_carve_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
             .into(),
         ),
     ]));
-    // 3: dims uniform
+    // 3: dims uniform (target_w, target_h, src_w, src_h)
     entries.push(&js_obj(&[
         ("binding", 3u32.into()),
+        ("visibility", SHADER_COMPUTE.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
+    // 4: shared params uniform (slider state)
+    entries.push(&js_obj(&[
+        ("binding", 4u32.into()),
         ("visibility", SHADER_COMPUTE.into()),
         ("buffer", js_obj(&[("type", "uniform".into())]).into()),
     ]));
@@ -1154,7 +1399,6 @@ fn make_rotation_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
     )
 }
 
-const SHADER_VERTEX: u32 = 1;
 const SHADER_FRAGMENT: u32 = 2;
 
 fn make_render_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
@@ -1178,6 +1422,13 @@ fn make_render_bgl(device: &JsValue) -> Result<JsValue, JsValue> {
         ("visibility", SHADER_FRAGMENT.into()),
         ("sampler", js_obj(&[("type", "filtering".into())]).into()),
     ]));
+    // 2: params uniform — used by the fragment shader for the HDR
+    // clipping overlay. Shared with the compute params buffer.
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("visibility", SHADER_FRAGMENT.into()),
+        ("buffer", js_obj(&[("type", "uniform".into())]).into()),
+    ]));
     js_call1(
         device,
         "createBindGroupLayout",
@@ -1197,13 +1448,17 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     if adapter.is_null() || adapter.is_undefined() {
         return Err("No GPU adapter".into());
     }
-    let max_storage = js_get(&js_get(&adapter, "limits")?, "maxStorageBufferBindingSize")?
+    let adapter_limits = js_get(&adapter, "limits")?;
+    let max_storage = js_get(&adapter_limits, "maxStorageBufferBindingSize")?
         .as_f64()
         .unwrap_or(134217728.0);
-    let required_limits = js_obj(&[(
-        "maxStorageBufferBindingSize",
-        JsValue::from_f64(max_storage),
-    )]);
+    let max_buffer = js_get(&adapter_limits, "maxBufferSize")?
+        .as_f64()
+        .unwrap_or(max_storage);
+    let required_limits = js_obj(&[
+        ("maxStorageBufferBindingSize", JsValue::from_f64(max_storage)),
+        ("maxBufferSize", JsValue::from_f64(max_buffer)),
+    ]);
     let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
     let device = js_await(js_call1(&adapter, "requestDevice", &device_desc)?).await?;
     let queue = js_get(&device, "queue")?;
@@ -1247,7 +1502,7 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         };
 
     // ── Remap pipeline ──────────────────────────────────────────────────
-    let remap_module = create_shader(&device, remap_shader())?;
+    let remap_module = create_shader(&device, &remap_shader())?;
     let remap_bgl = make_remap_bgl(&device)?;
     let remap_pl_layout = {
         let layouts = Array::of1(&remap_bgl);
@@ -1260,7 +1515,7 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     let remap_pipeline = create_pipeline(&device, &remap_pl_layout, &remap_module, "main")?;
 
     // ── Carve pipeline ──────────────────────────────────────────────────
-    let carve_module = create_shader(&device, carve_shader())?;
+    let carve_module = create_shader(&device, &carve_shader())?;
     let carve_bgl = make_carve_bgl(&device)?;
     let carve_pl_layout = {
         let layouts = Array::of1(&carve_bgl);
@@ -1285,6 +1540,41 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     };
     let resample_pipeline =
         create_pipeline(&device, &resample_pl_layout, &resample_module, "main")?;
+
+    // ── Normalize pipelines (one-shot at upload) ───────────────────────
+    let normalize_sdr_module = create_shader(&device, &normalize_sdr_shader())?;
+    let normalize_sdr_bgl = make_normalize_sdr_bgl(&device)?;
+    let normalize_sdr_pl_layout = {
+        let layouts = Array::of1(&normalize_sdr_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let normalize_sdr_pipeline = create_pipeline(
+        &device,
+        &normalize_sdr_pl_layout,
+        &normalize_sdr_module,
+        "main",
+    )?;
+
+    let normalize_hdr_module = create_shader(&device, &normalize_hdr_shader())?;
+    let normalize_hdr_bgl = make_normalize_hdr_bgl(&device)?;
+    let normalize_hdr_pl_layout = {
+        let layouts = Array::of1(&normalize_hdr_bgl);
+        js_call1(
+            &device,
+            "createPipelineLayout",
+            &js_obj(&[("bindGroupLayouts", layouts.into())]),
+        )?
+    };
+    let normalize_hdr_pipeline = create_pipeline(
+        &device,
+        &normalize_hdr_pl_layout,
+        &normalize_hdr_module,
+        "main",
+    )?;
 
     // ── Rotation (Lanczos) pipeline ─────────────────────────────────────
     let rotation_module = create_shader(&device, rotation_shader())?;
@@ -1343,31 +1633,37 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         ]),
     )?;
 
-    // 12 f32 params (48 bytes) — uniform alignment
-    let params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
+    // 8 f32 params (32 bytes) — uniform alignment
+    let params_buf = create_buffer(&device, 32, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the carve shader
     let carve_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the resample shader
     let resample_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
+    // 4 u32 dims (16 bytes) for the normalize shaders
+    let normalize_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
     // Rotation params: 8 f32 (32 bytes) + 4 u32 (16 bytes) = 48 bytes.
     let rotation_params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
 
-    // The HDR source binding is required by the layout but only used when
-    // an HDR image has been uploaded. Allocate a tiny placeholder up front
-    // so the bind group is always valid.
-    let hdr_source_buf = create_buffer(&device, 16, BUF_STORAGE | BUF_COPY_DST)?;
+    // Source upload staging buffer is created lazily on first upload once
+    // the dimensions and format (SDR vs HDR) are known.
 
     // Source/remap buffers and textures are created lazily by gpu_set_source
     // and gpu_set_carve_lut once the dimensions are known.
     Ok(GpuCtx {
         device,
         queue,
-        source_buf: JsValue::null(),
-        hdr_source_buf,
-        is_hdr_source: 0,
+        source_tex: None,
+        source_tex_view: None,
+        source_upload_buf: JsValue::null(),
+        source_upload_buf_bytes: 0,
         src_w: 0,
         src_h: 0,
         src_n: 0,
+        normalize_sdr_pipeline,
+        normalize_sdr_bgl,
+        normalize_hdr_pipeline,
+        normalize_hdr_bgl,
+        normalize_dims_buf,
         remap_pipeline,
         remap_bind_group: JsValue::null(),
         remap_buf: JsValue::null(),
@@ -1400,7 +1696,6 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         canvas_ctx,
         canvas_format,
         params_buf,
-        read_buf: RefCell::new(None),
     })
 }
 
@@ -1423,110 +1718,204 @@ pub fn gpu_is_hdr_presentation_active() -> Result<bool, JsValue> {
     })
 }
 
+// Allocate the source storage texture, the upload staging buffer, the
+// per-frame remap output buffer, and the remap bind group whenever the
+// source dims change. `bytes_per_pixel_in` controls the staging buffer
+// size — 4 for SDR rgba8, 8 for HDR f16 RGBA. After this call:
+//   - ctx.source_tex / source_tex_view are valid for (w, h)
+//   - ctx.source_upload_buf is at least `n * bytes_per_pixel_in` bytes
+//   - ctx.remap_buf is valid for n vec4f entries
+//   - ctx.remap_bind_group references the new source_tex + remap_buf
+fn ensure_source_resources(
+    ctx: &mut GpuCtx,
+    w: u32,
+    h: u32,
+    bytes_per_pixel_in: u32,
+) -> Result<(), JsValue> {
+    let n = w * h;
+    let needed_upload_bytes = n * bytes_per_pixel_in;
+    let dim_changed = ctx.src_w != w || ctx.src_h != h;
+
+    if dim_changed {
+        if let Some(old) = ctx.source_tex.take() {
+            let _ = js_call0(&old, "destroy");
+        }
+        ctx.source_tex_view = None;
+        if !ctx.remap_buf.is_null() {
+            let _ = js_call0(&ctx.remap_buf, "destroy");
+        }
+        // Any bind group that references the now-destroyed source_tex_view
+        // or remap_buf must be rebuilt before the next render. Drop them
+        // here so gpu_set_carve_lut / gpu_set_squish_dims can't accidentally
+        // reuse stale bindings when the next image happens to have the same
+        // target dims.
+        ctx.carve_bind_group = None;
+        ctx.resample_bind_group = None;
+
+        let usage = TEX_BINDING | TEX_STORAGE | 2 /* COPY_DST, unused but harmless */;
+        let size = js_obj(&[
+            ("width", w.into()),
+            ("height", h.into()),
+            ("depthOrArrayLayers", 1u32.into()),
+        ]);
+        let tex_desc = js_obj(&[
+            ("size", size.into()),
+            ("format", "rgba16float".into()),
+            ("usage", usage.into()),
+        ]);
+        let tex = js_call1(&ctx.device, "createTexture", &tex_desc)?;
+        let view = js_call1(&tex, "createView", &Object::new())?;
+        ctx.source_tex = Some(tex);
+        ctx.source_tex_view = Some(view);
+
+        ctx.remap_buf = create_buffer(&ctx.device, n * 16, BUF_STORAGE)?;
+        ctx.src_w = w;
+        ctx.src_h = h;
+        ctx.src_n = n;
+
+        let bgl = make_remap_bgl(&ctx.device)?;
+        // Built inline because binding 0 is a texture view, not a buffer,
+        // and the create_bind_group helper wraps every entry as {buffer:x}.
+        let entries = Array::new();
+        entries.push(&js_obj(&[
+            ("binding", 0u32.into()),
+            (
+                "resource",
+                ctx.source_tex_view.as_ref().unwrap().clone(),
+            ),
+        ]));
+        entries.push(&js_obj(&[
+            ("binding", 1u32.into()),
+            (
+                "resource",
+                js_obj(&[("buffer", ctx.remap_buf.clone())]).into(),
+            ),
+        ]));
+        entries.push(&js_obj(&[
+            ("binding", 2u32.into()),
+            (
+                "resource",
+                js_obj(&[("buffer", ctx.params_buf.clone())]).into(),
+            ),
+        ]));
+        ctx.remap_bind_group = js_call1(
+            &ctx.device,
+            "createBindGroup",
+            &js_obj(&[("layout", bgl), ("entries", entries.into())]),
+        )?;
+    }
+
+    // Grow the staging buffer whenever the next upload wants more bytes
+    // than we currently have. This covers both dim changes *and* format
+    // changes at the same dims (SDR is 4 B/pixel, HDR is 8 B/pixel).
+    if ctx.source_upload_buf.is_null() || ctx.source_upload_buf_bytes < needed_upload_bytes {
+        if !ctx.source_upload_buf.is_null() {
+            let _ = js_call0(&ctx.source_upload_buf, "destroy");
+        }
+        ctx.source_upload_buf =
+            create_buffer(&ctx.device, needed_upload_bytes, BUF_STORAGE | BUF_COPY_DST)?;
+        ctx.source_upload_buf_bytes = needed_upload_bytes;
+    }
+
+    Ok(())
+}
+
+// Run a one-shot compute dispatch that reads `source_upload_buf` and
+// writes canonical OKLab into `source_tex`. Used by both upload paths.
+fn run_normalize_pass(
+    ctx: &GpuCtx,
+    pipeline: &JsValue,
+    bgl: &JsValue,
+) -> Result<(), JsValue> {
+    // Built inline because binding 1 is a storage texture view, not a
+    // buffer, and the create_bind_group helper wraps every entry as
+    // {buffer:x}.
+    let entries = Array::new();
+    entries.push(&js_obj(&[
+        ("binding", 0u32.into()),
+        (
+            "resource",
+            js_obj(&[("buffer", ctx.source_upload_buf.clone())]).into(),
+        ),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 1u32.into()),
+        (
+            "resource",
+            ctx.source_tex_view.as_ref().unwrap().clone(),
+        ),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        (
+            "resource",
+            js_obj(&[("buffer", ctx.normalize_dims_buf.clone())]).into(),
+        ),
+    ]));
+    let bg = js_call1(
+        &ctx.device,
+        "createBindGroup",
+        &js_obj(&[("layout", bgl.clone()), ("entries", entries.into())]),
+    )?;
+    let dims = [ctx.src_w, ctx.src_h, 0u32, 0u32];
+    let dims_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
+    write_buffer_u8(&ctx.queue, &ctx.normalize_dims_buf, dims_bytes)?;
+
+    let enc = js_call1(&ctx.device, "createCommandEncoder", &Object::new())?;
+    let pass = js_call1(&enc, "beginComputePass", &Object::new())?;
+    js_call1(&pass, "setPipeline", pipeline)?;
+    js_call2(&pass, "setBindGroup", &0.into(), &bg)?;
+    let wg_x = ctx.src_w.div_ceil(8);
+    let wg_y = ctx.src_h.div_ceil(8);
+    let dispatch_fn: js_sys::Function = js_get(&pass, "dispatchWorkgroups")?.dyn_into()?;
+    dispatch_fn.call3(&pass, &wg_x.into(), &wg_y.into(), &1u32.into())?;
+    js_call0(&pass, "end")?;
+    let cmd = js_call0(&enc, "finish")?;
+    js_call1(&ctx.queue, "submit", &Array::of1(&cmd))?;
+    Ok(())
+}
+
 #[wasm_bindgen]
 pub fn gpu_set_source(image_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
     GPU_CTX.with(|c| -> Result<(), JsValue> {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-        let n = w * h;
-
-        // (Re)allocate source + remap buffers if the dimensions changed.
-        if ctx.src_w != w || ctx.src_h != h {
-            if !ctx.source_buf.is_null() {
-                let _ = js_call0(&ctx.source_buf, "destroy");
-            }
-            if !ctx.remap_buf.is_null() {
-                let _ = js_call0(&ctx.remap_buf, "destroy");
-            }
-            ctx.source_buf = create_buffer(&ctx.device, n * 4, BUF_STORAGE | BUF_COPY_DST)?;
-            // remap_buf holds vec4f per pixel = 16 bytes
-            ctx.remap_buf = create_buffer(&ctx.device, n * 16, BUF_STORAGE)?;
-            ctx.src_w = w;
-            ctx.src_h = h;
-            ctx.src_n = n;
-
-            // Recreate the remap bind group against the new buffers.
-            let bgl = make_remap_bgl(&ctx.device)?;
-            ctx.remap_bind_group = create_bind_group(
-                &ctx.device,
-                &bgl,
-                &[
-                    &ctx.source_buf,
-                    &ctx.remap_buf,
-                    &ctx.params_buf,
-                    &ctx.hdr_source_buf,
-                ],
-            )?;
+        let expected = (w as usize) * (h as usize) * 4; // 4 bytes/pixel rgba8
+        if image_data.len() < expected {
+            return Err("rgba8 source buffer too small".into());
         }
-
-        write_buffer_u8(&ctx.queue, &ctx.source_buf, image_data)?;
-        ctx.is_hdr_source = 0;
+        ensure_source_resources(ctx, w, h, 4)?;
+        write_buffer_u8(&ctx.queue, &ctx.source_upload_buf, &image_data[..expected])?;
+        let pipeline = ctx.normalize_sdr_pipeline.clone();
+        let bgl = ctx.normalize_sdr_bgl.clone();
+        run_normalize_pass(ctx, &pipeline, &bgl)?;
         Ok(())
     })
 }
 
-// Upload a linear extended Display P3 source as half-float RGBA. The
-// f16 values are unpacked to f32 (4 floats per pixel) and stored in
-// `hdr_source_buf` as `array<vec4f>`. The remap shader picks this buffer
-// when `is_hdr_source != 0`, skipping the 8-bit unpack + sRGB decode.
+// Upload a linear extended Display P3 source as half-float RGBA. The raw
+// f16 bytes are forwarded to a storage buffer and the HDR normalize pass
+// reads them via unpack2x16float, converting to canonical OKLab inside
+// `source_tex` — no Rust-side f16→f32 expansion.
 #[wasm_bindgen]
 pub fn gpu_set_source_linear_f16(f16_data: &[u8], w: u32, h: u32) -> Result<(), JsValue> {
     GPU_CTX.with(|c| -> Result<(), JsValue> {
         let mut c = c.borrow_mut();
         let ctx = c.as_mut().ok_or_else(|| JsValue::from("no gpu ctx"))?;
-        let n = (w as usize) * (h as usize);
-        let expected = n * 8; // 4 channels * 2 bytes
+        let expected = (w as usize) * (h as usize) * 8; // 4 channels * 2 bytes
         if f16_data.len() < expected {
             return Err("f16 source buffer too small".into());
         }
-
-        // Decode f16 → f32 in place into a 16-byte/pixel scratch.
-        let mut f32_buf = vec![0f32; n * 4];
-        for i in 0..(n * 4) {
-            let lo = f16_data[i * 2] as u16;
-            let hi = f16_data[i * 2 + 1] as u16;
-            f32_buf[i] = f16_to_f32(lo | (hi << 8));
-        }
-
-        // (Re)allocate hdr_source_buf + remap_buf + bind group on dim
-        // change. The SDR source_buf is also (re)created at minimum size
-        // so the bind group has a valid binding even though it's unused.
-        if ctx.src_w != w || ctx.src_h != h {
-            if !ctx.hdr_source_buf.is_null() {
-                let _ = js_call0(&ctx.hdr_source_buf, "destroy");
-            }
-            if !ctx.remap_buf.is_null() {
-                let _ = js_call0(&ctx.remap_buf, "destroy");
-            }
-            if !ctx.source_buf.is_null() {
-                let _ = js_call0(&ctx.source_buf, "destroy");
-            }
-            ctx.hdr_source_buf =
-                create_buffer(&ctx.device, (n * 16) as u32, BUF_STORAGE | BUF_COPY_DST)?;
-            ctx.remap_buf = create_buffer(&ctx.device, (n * 16) as u32, BUF_STORAGE)?;
-            // Tiny SDR placeholder so the binding is valid.
-            ctx.source_buf = create_buffer(&ctx.device, 16, BUF_STORAGE | BUF_COPY_DST)?;
-            ctx.src_w = w;
-            ctx.src_h = h;
-            ctx.src_n = w * h;
-
-            let bgl = make_remap_bgl(&ctx.device)?;
-            ctx.remap_bind_group = create_bind_group(
-                &ctx.device,
-                &bgl,
-                &[
-                    &ctx.source_buf,
-                    &ctx.remap_buf,
-                    &ctx.params_buf,
-                    &ctx.hdr_source_buf,
-                ],
-            )?;
-        }
-
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(f32_buf.as_ptr() as *const u8, f32_buf.len() * 4) };
-        write_buffer_u8(&ctx.queue, &ctx.hdr_source_buf, bytes)?;
-        ctx.is_hdr_source = 1;
+        ensure_source_resources(ctx, w, h, 8)?;
+        // Clamp to exactly `expected` bytes — the staging buffer is sized
+        // for that, and writeBuffer rejects any write that exceeds the
+        // destination size, so a caller that hands us an oversized slice
+        // would otherwise blow up at the WebGPU layer.
+        write_buffer_u8(&ctx.queue, &ctx.source_upload_buf, &f16_data[..expected])?;
+        let pipeline = ctx.normalize_hdr_pipeline.clone();
+        let bgl = ctx.normalize_hdr_bgl.clone();
+        run_normalize_pass(ctx, &pipeline, &bgl)?;
         Ok(())
     })
 }
@@ -1568,6 +1957,7 @@ fn ensure_output_tex(ctx: &mut GpuCtx, target_w: u32, target_h: u32) -> Result<(
         &ctx.render_bgl,
         ctx.output_tex_view.as_ref().unwrap().clone(),
         ctx.sampler.clone(),
+        &ctx.params_buf,
     )?);
     // Bind groups that point at the old texture view are now invalid.
     ctx.carve_bind_group = None;
@@ -1614,15 +2004,18 @@ pub fn gpu_set_carve_lut(lut: &[u32], target_w: u32, target_h: u32) -> Result<()
             ctx.carve_bind_group = Some(make_carve_bind_group(
                 &ctx.device,
                 &carve_bgl,
-                ctx.remap_buf.clone(),
+                ctx.source_tex_view.as_ref().unwrap().clone(),
                 ctx.lut_buf.as_ref().unwrap().clone(),
                 ctx.output_tex_view.as_ref().unwrap().clone(),
                 ctx.carve_dims_buf.clone(),
+                ctx.params_buf.clone(),
             )?);
         }
 
-        // Update the carve dims uniform every call — cheap.
-        let dims = [target_w, target_h, 0u32, 0u32];
+        // Update the carve dims uniform every call — cheap. The carve
+        // shader needs src_w to convert linear LUT indices into 2D
+        // texture coords.
+        let dims = [target_w, target_h, ctx.src_w, ctx.src_h];
         let dims_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
         write_buffer_u8(&ctx.queue, &ctx.carve_dims_buf, dims_bytes)?;
@@ -1779,6 +2172,7 @@ pub fn gpu_set_rotation(
                 &ctx.render_bgl,
                 ctx.rotated_tex_view.as_ref().unwrap().clone(),
                 ctx.sampler.clone(),
+                &ctx.params_buf,
             )?);
         }
 
@@ -1812,24 +2206,32 @@ pub fn gpu_clear_rotation() -> Result<(), JsValue> {
 fn make_carve_bind_group(
     device: &JsValue,
     layout: &JsValue,
-    linp3: JsValue,
+    source_tex_view: JsValue,
     lut: JsValue,
-    tex_view: JsValue,
+    out_tex_view: JsValue,
     dims_buf: JsValue,
+    params_buf: JsValue,
 ) -> Result<JsValue, JsValue> {
     let entries = Array::new();
     entries.push(&js_obj(&[
         ("binding", 0u32.into()),
-        ("resource", js_obj(&[("buffer", linp3)]).into()),
+        ("resource", source_tex_view),
     ]));
     entries.push(&js_obj(&[
         ("binding", 1u32.into()),
         ("resource", js_obj(&[("buffer", lut)]).into()),
     ]));
-    entries.push(&js_obj(&[("binding", 2u32.into()), ("resource", tex_view)]));
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        ("resource", out_tex_view),
+    ]));
     entries.push(&js_obj(&[
         ("binding", 3u32.into()),
         ("resource", js_obj(&[("buffer", dims_buf)]).into()),
+    ]));
+    entries.push(&js_obj(&[
+        ("binding", 4u32.into()),
+        ("resource", js_obj(&[("buffer", params_buf)]).into()),
     ]));
     js_call1(
         device,
@@ -1843,10 +2245,18 @@ fn make_render_bind_group(
     layout: &JsValue,
     tex_view: JsValue,
     sampler: JsValue,
+    params_buf: &JsValue,
 ) -> Result<JsValue, JsValue> {
     let entries = Array::new();
     entries.push(&js_obj(&[("binding", 0u32.into()), ("resource", tex_view)]));
     entries.push(&js_obj(&[("binding", 1u32.into()), ("resource", sampler)]));
+    entries.push(&js_obj(&[
+        ("binding", 2u32.into()),
+        (
+            "resource",
+            js_obj(&[("buffer", params_buf.clone())]).into(),
+        ),
+    ]));
     js_call1(
         device,
         "createBindGroup",
@@ -1888,25 +2298,26 @@ pub fn gpu_render(
             hue_rad.sin(),
             show_hdr,
             time,
-            ctx.is_hdr_source as f32,
-            0.0,
-            0.0,
-            0.0,
         ];
         let params_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 48) };
+            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 32) };
         write_buffer_u8(&ctx.queue, &ctx.params_buf, params_bytes)?;
 
         // Encode all three passes into one command buffer.
         let enc = js_call1(&ctx.device, "createCommandEncoder", &Object::new())?;
 
-        // Pass 1: remap compute → remap_buf
-        dispatch(
-            &enc,
-            &ctx.remap_pipeline,
-            &ctx.remap_bind_group,
-            ctx.src_n.div_ceil(256),
-        )?;
+        // Pass 1: per-frame remap compute → remap_buf. Skipped entirely
+        // when carve mode is active because the carve shader fuses the
+        // OKLab inverse + slider edits into its single source tap, so
+        // there's no upstream intermediate to write.
+        if ctx.resize_mode != 1 {
+            dispatch_2d_for_n(
+                &enc,
+                &ctx.remap_pipeline,
+                &ctx.remap_bind_group,
+                ctx.src_n.div_ceil(256),
+            )?;
+        }
 
         // Pass 2: carve compute or Lanczos resample → output_tex
         let resize_x = ctx.target_w.div_ceil(8);
@@ -2067,6 +2478,8 @@ pub async fn gpu_readback_rgba8() -> Result<Uint8Array, JsValue> {
     let mut raw = vec![0u8; buf_size as usize];
     raw_view.copy_to(&mut raw[..]);
 
+    // output_tex now stores LINEAR extended Display P3, so apply the sRGB
+    // transfer encode to RGB before quantizing to 8 bits. Alpha stays linear.
     let mut out = vec![0u8; (target_w * target_h * 4) as usize];
     for y in 0..target_h {
         let row_start = (y * bytes_per_row) as usize;
@@ -2074,7 +2487,9 @@ pub async fn gpu_readback_rgba8() -> Result<Uint8Array, JsValue> {
             for ch in 0..4u32 {
                 let off = row_start + ((x * bpp) + ch * 2) as usize;
                 let h = (raw[off] as u16) | ((raw[off + 1] as u16) << 8);
-                let v = f16_to_f32(h).clamp(0.0, 1.0);
+                let lin = f16_to_f32(h);
+                let encoded = if ch < 3 { srgb_encode(lin) } else { lin };
+                let v = encoded.clamp(0.0, 1.0);
                 let out_idx = ((y * target_w + x) * 4 + ch) as usize;
                 out[out_idx] = (v * 255.0 + 0.5) as u8;
             }
@@ -2089,6 +2504,7 @@ pub async fn gpu_readback_rgba8() -> Result<Uint8Array, JsValue> {
 
 // Inverse sRGB / Display P3 transfer (decode encoded → linear).
 // Sign-preserving so extended-range HDR values keep their sign.
+#[allow(dead_code)]
 fn srgb_decode(v: f32) -> f32 {
     let a = v.abs();
     let lin = if a <= 0.04045 {
@@ -2097,6 +2513,18 @@ fn srgb_decode(v: f32) -> f32 {
         ((a + 0.055) / 1.055).powf(2.4)
     };
     lin.copysign(v)
+}
+
+// Forward sRGB / Display P3 transfer (linear → encoded). Sign-preserving so
+// extended-range HDR values keep their sign through the encode.
+fn srgb_encode(v: f32) -> f32 {
+    let a = v.abs();
+    let e = if a <= 0.0031308 {
+        12.92 * a
+    } else {
+        1.055 * a.powf(1.0 / 2.4) - 0.055
+    };
+    e.copysign(v)
 }
 
 // SMPTE ST 2084 (PQ) inverse EOTF: linear normalized luminance [0,1]
@@ -2114,6 +2542,7 @@ fn pq_encode(y: f32) -> f32 {
 
 // Pack a single f32 value back to IEEE 754 half-precision (f16) bits.
 // Round-to-nearest-even, with overflow → ±Inf and subnormal flush-to-zero.
+#[allow(dead_code)]
 fn f32_to_f16(f: f32) -> u16 {
     let bits = f.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -2144,8 +2573,8 @@ fn f32_to_f16(f: f32) -> u16 {
 
 // Read back the output texture as raw linear extended Display P3 half-floats
 // (f16 RGBA). Used for the Ultra HDR JPEG export — libultrahdr accepts
-// rgba16float input directly so we just need to undo the sRGB transfer
-// curve we applied in the shader and hand the bytes over verbatim.
+// rgba16float input directly. Since output_tex is already linear, we just
+// need to repack the rows (the GPU staging buffer has 256-byte row padding).
 #[wasm_bindgen]
 pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
     let (device, queue, output_tex, target_w, target_h) =
@@ -2207,6 +2636,8 @@ pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
     let mut raw = vec![0u8; buf_size as usize];
     raw_view.copy_to(&mut raw[..]);
 
+    // output_tex already stores linear extended Display P3, so we just
+    // need to repack the rows tightly (the staging buffer has padding).
     let n = (target_w * target_h) as usize;
     let mut out = vec![0u8; n * 8]; // f16 RGBA, tight packing
     for y in 0..target_h {
@@ -2216,14 +2647,8 @@ pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
             let out_pix = ((y * target_w + x) as usize) * 8;
             for i in 0..4 {
                 let off = pix_off + i * 2;
-                let h = (raw[off] as u16) | ((raw[off + 1] as u16) << 8);
-                let f = f16_to_f32(h);
-                // Channels 0..2 are RGB — undo sRGB encoding to recover
-                // linear extended Display P3. Alpha is already linear.
-                let lin = if i < 3 { srgb_decode(f) } else { f };
-                let h2 = f32_to_f16(lin);
-                out[out_pix + i * 2] = (h2 & 0xFF) as u8;
-                out[out_pix + i * 2 + 1] = (h2 >> 8) as u8;
+                out[out_pix + i * 2] = raw[off];
+                out[out_pix + i * 2 + 1] = raw[off + 1];
             }
         }
     }
@@ -2235,11 +2660,11 @@ pub async fn gpu_readback_linear_f16() -> Result<Uint8Array, JsValue> {
 }
 
 // Read back the output texture as PQ-encoded BT.2020 16-bit RGB. Used for
-// the HDR AVIF export path. The texture currently stores sRGB-encoded
-// extended-range Display P3 values; we undo the sRGB transfer, convert
-// linear D65 P3 → linear D65 BT.2020 (matrix from BT.2407), apply the
-// PQ EOTF inverse using a 203-nit HDR/SDR reference white per ITU BT.2408,
-// and quantize into the bottom `depth` bits of a u16 (libavif convention).
+// the HDR AVIF export path. The texture stores linear extended-range
+// Display P3 values; we convert linear D65 P3 → linear D65 BT.2020 (matrix
+// from BT.2407), apply the PQ EOTF inverse using a 203-nit HDR/SDR
+// reference white per ITU BT.2408, and quantize into the bottom `depth`
+// bits of a u16 (libavif convention).
 #[wasm_bindgen]
 pub async fn gpu_readback_hdr_pq_u16(depth: u32) -> Result<Uint16Array, JsValue> {
     let (device, queue, output_tex, target_w, target_h) =
@@ -2319,10 +2744,10 @@ pub async fn gpu_readback_hdr_pq_u16(depth: u32) -> Result<Uint16Array, JsValue>
                 let h = (raw[off] as u16) | ((raw[off + 1] as u16) << 8);
                 ch[i] = f16_to_f32(h);
             }
-            // Undo sRGB encoding → linear extended-range P3.
-            let lr = srgb_decode(ch[0]);
-            let lg = srgb_decode(ch[1]);
-            let lb = srgb_decode(ch[2]);
+            // output_tex now stores linear extended-range P3 directly.
+            let lr = ch[0];
+            let lg = ch[1];
+            let lb = ch[2];
 
             // Linear D65 P3 → linear D65 BT.2020 (matrix derived from
             // M_p3_to_xyz · M_xyz_to_2020 with a Bradford D65↔D65 noop).

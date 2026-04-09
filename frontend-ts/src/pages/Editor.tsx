@@ -162,8 +162,7 @@ function orientPackedRgba(
 
 type JpegMetadata = {
   orientation: ExifOrientation;
-  storedWidth: number | null;
-  storedHeight: number | null;
+  storedSize: { width: number; height: number } | null;
 };
 
 function parseExifOrientationFromApp1(
@@ -239,8 +238,7 @@ function scanJpegMetadata(buf: Uint8Array): JpegMetadata | null {
   if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
   let i = 2;
   let orientation: ExifOrientation = 1;
-  let storedWidth: number | null = null;
-  let storedHeight: number | null = null;
+  let storedSize: { width: number; height: number } | null = null;
 
   while (i < buf.length) {
     while (i < buf.length && buf[i] === 0xff) i++;
@@ -260,13 +258,15 @@ function scanJpegMetadata(buf: Uint8Array): JpegMetadata | null {
     const segmentEnd = i + size;
 
     if (
-      storedWidth === null &&
+      storedSize === null &&
       marker >= 0xc0 && marker <= 0xcf &&
       marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc &&
       segmentStart + 4 < segmentEnd
     ) {
-      storedHeight = (buf[segmentStart + 1] << 8) | buf[segmentStart + 2];
-      storedWidth = (buf[segmentStart + 3] << 8) | buf[segmentStart + 4];
+      storedSize = {
+        height: (buf[segmentStart + 1] << 8) | buf[segmentStart + 2],
+        width: (buf[segmentStart + 3] << 8) | buf[segmentStart + 4],
+      };
     } else if (marker === 0xe1 && orientation === 1) {
       const parsed = parseExifOrientationFromApp1(buf, segmentStart, segmentEnd);
       if (parsed !== null) orientation = parsed;
@@ -275,23 +275,16 @@ function scanJpegMetadata(buf: Uint8Array): JpegMetadata | null {
     i = segmentEnd;
   }
 
-  return { orientation, storedWidth, storedHeight };
+  return { orientation, storedSize };
 }
 
-async function parseOrientation(
-  buf: Uint8Array,
-  jpegMeta: JpegMetadata | null = scanJpegMetadata(buf)
-): Promise<ExifOrientation> {
-  if (jpegMeta) return jpegMeta.orientation;
-  try {
-    const exifr = await import('exifr');
-    const parsed = await exifr.parse(buf, ['Orientation']).catch(() => null) as
-      | { Orientation?: unknown }
-      | null;
-    return normalizeOrientation(parsed?.Orientation);
-  } catch {
-    return 1;
-  }
+// We only apply manual orientation in our HDR path for JPEGs, where we own
+// the EXIF parse. Non-JPEG formats rely on their decoders/browser path to
+// honor orientation internally, so there is no extra post-decode rotation
+// to apply. libultrahdr — our JPEG HDR decoder — returns raw stored pixels
+// (verified empirically), so we apply the full EXIF orientation unchanged.
+function pickHdrManualRotation(jpegMeta: JpegMetadata | null): ExifOrientation {
+  return jpegMeta ? jpegMeta.orientation : 1;
 }
 
 function orientHdrDecodeResult<T extends {
@@ -755,6 +748,10 @@ function Editor() {
   // the current canvas element.
   const gpuInitedRef = useRef(false);
   const gpuRecoveryRef = useRef<Promise<boolean> | null>(null);
+  const [gpuLost, setGpuLost] = useState(false);
+  // Ref mirror of gpuLost so recoverGpu (which is not a useCallback and
+  // closes over the latest state via refs) can read it synchronously.
+  const gpuLostRef = useRef(false);
 
   // Cached pieces of the pipeline.
   const wasmRef = useRef<typeof import('frontend-rs') | null>(null);
@@ -938,6 +935,10 @@ function Editor() {
 
   const recoverGpu = async (reason: string, cause: unknown): Promise<boolean> => {
     if (gpuRecoveryRef.current) return gpuRecoveryRef.current;
+    // Once we've given up, stop trying — the source-mount effect clears
+    // gpuLost whenever the user loads a new image, giving the next attempt
+    // a fresh start.
+    if (gpuLostRef.current) return false;
 
     const job = (async () => {
       const wasm = wasmRef.current;
@@ -964,7 +965,13 @@ function Editor() {
         if (resumeHdrLoop) startHdrLoop();
         return true;
       } catch (err) {
+        // A single failed recovery is enough to surface the banner:
+        // render() now bails cleanly after dispose, so nothing else will
+        // retrigger recovery until the user loads a new source. Waiting
+        // for repeated failures just leaves the editor silently frozen.
         console.error('GPU recovery failed:', err);
+        gpuLostRef.current = true;
+        setGpuLost(true);
         return false;
       } finally {
         gpuRecoveryRef.current = null;
@@ -1017,6 +1024,7 @@ function Editor() {
   const render = () => {
     const wasm = wasmRef.current;
     if (!wasm || !gpuInitedRef.current || gpuRecoveryRef.current) return;
+    if (gpuLostRef.current) return;
 
     try {
       const tw = targetWRef.current;
@@ -1093,6 +1101,10 @@ function Editor() {
   useEffect(() => {
     const src = source;
     if (!src) return;
+    // A new source is a fresh chance: clear any prior "GPU lost" state so the
+    // user can try uploading again after a previous failure.
+    gpuLostRef.current = false;
+    setGpuLost(false);
     let cancelled = false;
     (async () => {
       try {
@@ -1165,31 +1177,15 @@ function Editor() {
       return;
     }
     const jpegMeta = scanJpegMetadata(buf);
-    const orientation = await parseOrientation(buf, jpegMeta);
-    const storedJpegDims = jpegMeta?.storedWidth && jpegMeta?.storedHeight
-      ? { width: jpegMeta.storedWidth, height: jpegMeta.storedHeight }
-      : null;
 
     // Try the HDR path first. Returns null for SDR / unsupported formats
     // so we can fall through to the canvas path.
     try {
       const { decodeHdr } = await import('@/lib/hdr-decode');
       const decodedRaw = await decodeHdr(buf);
-      // Some HDR decoders (notably libultrahdr on iOS-shot JPEGs) honor the
-      // EXIF Orientation tag internally and return already-rotated pixels.
-      // When that happens, the decoded dims match the *swapped* JPEG SOF dims
-      // (for orientation 5–8). Detect that and skip our manual rotation so
-      // we don't double-rotate.
-      let effectiveOrientation = orientation;
-      if (decodedRaw && storedJpegDims && orientation >= 5 && orientation <= 8) {
-        if (
-          decodedRaw.width === storedJpegDims.height &&
-          decodedRaw.height === storedJpegDims.width
-        ) {
-          effectiveOrientation = 1;
-        }
-      }
-      const decoded = decodedRaw ? orientHdrDecodeResult(decodedRaw, effectiveOrientation) : null;
+      const decoded = decodedRaw
+        ? orientHdrDecodeResult(decodedRaw, pickHdrManualRotation(jpegMeta))
+        : null;
       if (decoded) {
         const src: SourceState = {
           url: imageUrl,
@@ -1220,7 +1216,6 @@ function Editor() {
     // rotation into transcoded JPEG pixels yet still ships the original EXIF
     // tag, causing double-rotation. `'from-image'` is consistent across
     // browsers, so we treat the resulting bitmap as already correctly oriented.
-    void orientation;
     const decodeSource = async (): Promise<ImageBitmap | HTMLImageElement> => {
       if (typeof createImageBitmap === 'function') {
         try {
@@ -1615,6 +1610,11 @@ function Editor() {
 
   const handleNewImage = () => {
     setSource(null);
+    // Clear any prior terminal GPU-lost state so the user sees the upload
+    // drop zone instead of the banner — the banner's own copy tells them
+    // to pick a different image, and this is that path.
+    gpuLostRef.current = false;
+    setGpuLost(false);
     setTargetWDraft(null);
     setTargetHDraft(null);
     sourceRef.current = null;
@@ -1764,6 +1764,11 @@ function Editor() {
             <div className="max-w-md text-center text-sm text-muted-foreground">
               WebGPU is required but unavailable on this device. Pictolab needs a
               browser with WebGPU enabled (recent Chrome, Edge, or Safari on iOS 26).
+            </div>
+          ) : gpuLost ? (
+            <div className="max-w-md text-center text-sm text-muted-foreground">
+              The GPU context was lost and could not be recovered. Reload the page
+              to try again, or pick a different image.
             </div>
           ) : !source ? (
             <div className="w-full max-w-2xl">
