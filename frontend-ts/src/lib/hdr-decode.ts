@@ -563,6 +563,199 @@ function appleHeadroomFromMakerNote(maker33: number, maker48: number): number {
   return Math.pow(2.0, Math.max(stops, 0.0));
 }
 
+// ISO 21496-1 gain map metadata, parsed from the tmap derived item data.
+// Field semantics follow Google libultrahdr's uhdr_gainmap_metadata_ext_t
+// and the ISO 21496-1 composition formula.
+interface GainMapMetadata {
+  hdrCapacityMin: number; // display headroom lower bound (linear)
+  hdrCapacityMax: number; // display headroom upper bound (linear, = headroom)
+  // Per-channel arrays (length 1 for monochrome, 3 for multi-channel).
+  gainMapMin: number[];   // log2 of min content boost
+  gainMapMax: number[];   // log2 of max content boost
+  gamma: number[];        // gamma applied to gain map values
+  offsetSdr: number[];    // additive offset on SDR side
+  offsetHdr: number[];    // additive offset on HDR side
+}
+
+// Parse the raw HEIF bytes to find the tmap item and extract its ISO 21496-1
+// gain map metadata. Returns null if no tmap item is found.
+function parseTmapMetadata(buf: Uint8Array): GainMapMetadata | null {
+  // Minimal HEIF box parser — just enough to locate meta → iinf + iloc + idat
+  // and extract the tmap item's payload.
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+
+  function iterBoxes(start: number, end: number): Array<{type: string; payloadStart: number; payloadEnd: number}> {
+    const boxes: Array<{type: string; payloadStart: number; payloadEnd: number}> = [];
+    let pos = start;
+    while (pos + 8 <= end) {
+      let size = dv.getUint32(pos);
+      const type = String.fromCharCode(buf[pos+4], buf[pos+5], buf[pos+6], buf[pos+7]);
+      let header = 8;
+      if (size === 1) { if (pos + 16 > end) break; size = Number(dv.getBigUint64(pos + 8)); header = 16; }
+      else if (size === 0) size = end - pos;
+      if (size < header || pos + size > end) break;
+      boxes.push({type, payloadStart: pos + header, payloadEnd: pos + size});
+      pos += size;
+    }
+    return boxes;
+  }
+
+  // Find meta box at top level.
+  const topBoxes = iterBoxes(0, buf.length);
+  const metaBox = topBoxes.find(b => b.type === 'meta');
+  if (!metaBox) return null;
+
+  // meta is a full-box (4-byte version+flags before children).
+  const metaChildren = iterBoxes(metaBox.payloadStart + 4, metaBox.payloadEnd);
+
+  // Parse iinf to find the tmap item ID.
+  const iinfBox = metaChildren.find(b => b.type === 'iinf');
+  if (!iinfBox) return null;
+  let tmapItemId = 0;
+  {
+    const off0 = iinfBox.payloadStart;
+    const version = buf[off0];
+    let pos = off0 + 4; // skip version + flags
+    pos += version === 0 ? 2 : 4; // skip entry count
+    const infeBoxes = iterBoxes(pos, iinfBox.payloadEnd);
+    for (const infe of infeBoxes) {
+      if (infe.type !== 'infe') continue;
+      const v = buf[infe.payloadStart];
+      if (v !== 2 && v !== 3) continue;
+      let p = infe.payloadStart + 4;
+      const itemId = dv.getUint16(p); p += 2;
+      p += 2; // protection index
+      const itemType = String.fromCharCode(buf[p], buf[p+1], buf[p+2], buf[p+3]);
+      if (itemType === 'tmap') { tmapItemId = itemId; break; }
+    }
+  }
+  if (!tmapItemId) return null;
+
+  // Parse iloc to find where the tmap item's data lives.
+  const ilocBox = metaChildren.find(b => b.type === 'iloc');
+  if (!ilocBox) return null;
+  let tmapData: Uint8Array | null = null;
+  {
+    const off0 = ilocBox.payloadStart;
+    const version = buf[off0];
+    let pos = off0 + 4;
+    const byte4 = buf[pos];
+    const byte5 = buf[pos + 1];
+    const offsetSize = byte4 >> 4;
+    const lengthSize = byte4 & 0x0f;
+    const baseOffsetSize = byte5 >> 4;
+    const indexSize = (version >= 1) ? (byte5 & 0x0f) : 0;
+    pos += 2;
+    const itemCount = version < 2 ? dv.getUint16(pos) : dv.getUint32(pos);
+    pos += version < 2 ? 2 : 4;
+
+    for (let n = 0; n < itemCount; n++) {
+      const itemId = version < 2 ? dv.getUint16(pos) : dv.getUint32(pos);
+      pos += version < 2 ? 2 : 4;
+      let constructionMethod = 0;
+      if (version >= 1) { constructionMethod = dv.getUint16(pos) & 0x000f; pos += 2; }
+      pos += 2; // data_reference_index
+      let baseOffset = 0;
+      if (baseOffsetSize > 0) {
+        for (let i = 0; i < baseOffsetSize; i++) baseOffset = (baseOffset * 256) + buf[pos + i];
+        pos += baseOffsetSize;
+      }
+      const extentCount = dv.getUint16(pos); pos += 2;
+      const extents: Array<{offset: number; length: number}> = [];
+      for (let e = 0; e < extentCount; e++) {
+        if (indexSize) pos += indexSize;
+        let eOff = 0, eLen = 0;
+        if (offsetSize > 0) { for (let i = 0; i < offsetSize; i++) eOff = (eOff * 256) + buf[pos + i]; pos += offsetSize; }
+        if (lengthSize > 0) { for (let i = 0; i < lengthSize; i++) eLen = (eLen * 256) + buf[pos + i]; pos += lengthSize; }
+        extents.push({offset: eOff, length: eLen});
+      }
+      if (itemId === tmapItemId) {
+        // Gather the data. constructionMethod 1 means idat-relative.
+        const chunks: Uint8Array[] = [];
+        if (constructionMethod === 1) {
+          const idatBox = metaChildren.find(b => b.type === 'idat');
+          if (!idatBox) return null;
+          for (const ext of extents) {
+            const start = idatBox.payloadStart + baseOffset + ext.offset;
+            chunks.push(buf.subarray(start, start + ext.length));
+          }
+        } else {
+          for (const ext of extents) {
+            const start = baseOffset + ext.offset;
+            chunks.push(buf.subarray(start, start + ext.length));
+          }
+        }
+        let totalLen = 0;
+        for (const c of chunks) totalLen += c.length;
+        tmapData = new Uint8Array(totalLen);
+        let off = 0;
+        for (const c of chunks) { tmapData.set(c, off); off += c.length; }
+        break;
+      }
+    }
+  }
+  if (!tmapData || tmapData.length < 10) return null;
+
+  // Decode ISO 21496-1 gain map metadata from tmap item payload.
+  // Format: u8 version, u16 minVersion, u16 writerVersion, u8 flags, then fields.
+  const tdv = new DataView(tmapData.buffer, tmapData.byteOffset, tmapData.byteLength);
+  let tp = 0;
+  const tmapVersion = tmapData[tp++];
+  if (tmapVersion !== 0) return null;
+  tp += 2; // minVersion
+  tp += 2; // writerVersion
+  const flags = tmapData[tp++];
+  const multiChannel = !!(flags & 1);
+  const useCommonDenom = !!(flags & 8);
+  const channelCount = multiChannel ? 3 : 1;
+
+  const ru32 = () => { const v = tdv.getUint32(tp); tp += 4; return v; };
+  const rs32 = () => { const v = tdv.getInt32(tp); tp += 4; return v; };
+  const frac = (n: number, d: number) => d !== 0 ? n / d : 0;
+
+  let baseHrN: number, baseHrD: number, altHrN: number, altHrD: number;
+  const gainMapMin: number[] = [], gainMapMax: number[] = [], gamma: number[] = [];
+  const offsetSdr: number[] = [], offsetHdr: number[] = [];
+
+  if (useCommonDenom) {
+    const d = ru32();
+    baseHrN = ru32(); baseHrD = d;
+    altHrN = ru32(); altHrD = d;
+    for (let c = 0; c < channelCount; c++) {
+      gainMapMin.push(frac(rs32(), d));
+      gainMapMax.push(frac(rs32(), d));
+      gamma.push(frac(ru32(), d));
+      offsetSdr.push(frac(rs32(), d));
+      offsetHdr.push(frac(rs32(), d));
+    }
+  } else {
+    baseHrN = ru32(); baseHrD = ru32();
+    altHrN = ru32(); altHrD = ru32();
+    for (let c = 0; c < channelCount; c++) {
+      const gminN = rs32(), gminD = ru32();
+      const gmaxN = rs32(), gmaxD = ru32();
+      const gamN = ru32(), gamD = ru32();
+      const boffN = rs32(), boffD = ru32();
+      const aoffN = rs32(), aoffD = ru32();
+      gainMapMin.push(frac(gminN, gminD));
+      gainMapMax.push(frac(gmaxN, gmaxD));
+      gamma.push(frac(gamN, gamD));
+      offsetSdr.push(frac(boffN, boffD));
+      offsetHdr.push(frac(aoffN, aoffD));
+    }
+  }
+
+  return {
+    hdrCapacityMin: Math.pow(2, frac(baseHrN, baseHrD)),
+    hdrCapacityMax: Math.pow(2, frac(altHrN, altHrD)),
+    gainMapMin,
+    gainMapMax,
+    gamma,
+    offsetSdr,
+    offsetHdr,
+  };
+}
+
 // Pull the EXIF metadata block out of an HEIF image handle as raw bytes,
 // stripping the leading "Exif offset" and the "Exif\0\0" signature so the
 // returned slice starts at the TIFF header (which is what exifr wants).
@@ -816,16 +1009,34 @@ async function decodeAppleHdrHeic(buf: Uint8Array): Promise<HdrDecodeResult | nu
     const gainLuma = new Uint8Array(gainW * gainH);
     for (let i = 0; i < gainLuma.length; i++) gainLuma[i] = gainSrc[i * 4];
 
-    // Compose: HDR_linear = SDR_linear * (1 + (headroom - 1) * gain_linear)
-    // Bilinear-sample the gain map directly per output pixel so we only
-    // touch each destination pixel once. sRGB → linear via 256-entry LUT
-    // for the SDR side; the gain map is bilerped in encoded space then
-    // pushed through srgbInverse on its post-bilerp value (still cheap
-    // because it's one Math.pow per pixel, not 21M).
-    const headroomMinusOne = headroom - 1;
+    // Try to extract ISO 21496-1 gain map metadata from the tmap derived
+    // item embedded in the HEIF. This provides the correct composition
+    // parameters (gamma, min/max boost, offsets) rather than the simplified
+    // johncf/apple-hdr-heic approximation.
+    const tmapMeta = parseTmapMetadata(buf);
+
+    // Compose: ISO 21496-1 formula (from libultrahdr applyGain):
+    //   gain_adj  = pow(gain_value, 1 / gamma)
+    //   logBoost  = log2(min_boost) * (1 - gain_adj) + log2(max_boost) * gain_adj
+    //   factor    = pow(2, logBoost)
+    //   HDR_lin   = (SDR_lin + offset_sdr) * factor - offset_hdr
+    //
+    // Falls back to the legacy linear formula when tmap metadata is absent.
     const sx = (gainW - 1) / Math.max(width - 1, 1);
     const sy = (gainH - 1) / Math.max(height - 1, 1);
     const f32 = new Float32Array(width * height * 4);
+
+    // Precompute per-channel ISO 21496-1 constants.
+    const useTmap = tmapMeta !== null;
+    const ch = (arr: number[], c: number) => arr[Math.min(c, arr.length - 1)];
+    const invGamma = useTmap ? [1/tmapMeta.gamma[0], 1/ch(tmapMeta.gamma,1), 1/ch(tmapMeta.gamma,2)] : [1,1,1];
+    const logMin = useTmap ? [tmapMeta.gainMapMin[0], ch(tmapMeta.gainMapMin,1), ch(tmapMeta.gainMapMin,2)] : [0,0,0];
+    const logMax = useTmap ? [tmapMeta.gainMapMax[0], ch(tmapMeta.gainMapMax,1), ch(tmapMeta.gainMapMax,2)] : [Math.log2(headroom), Math.log2(headroom), Math.log2(headroom)];
+    const oSdr = useTmap ? [tmapMeta.offsetSdr[0], ch(tmapMeta.offsetSdr,1), ch(tmapMeta.offsetSdr,2)] : [0,0,0];
+    const oHdr = useTmap ? [tmapMeta.offsetHdr[0], ch(tmapMeta.offsetHdr,1), ch(tmapMeta.offsetHdr,2)] : [0,0,0];
+    // Legacy fallback constants.
+    const headroomMinusOne = headroom - 1;
+
     for (let y = 0; y < height; y++) {
       const fy = y * sy;
       const y0 = Math.floor(fy);
@@ -844,18 +1055,31 @@ async function decodeAppleHdrHeic(buf: Uint8Array): Promise<HdrDecodeResult | nu
         const gtop = ga * (1 - wx) + gb * wx;
         const gbot = gc * (1 - wx) + gd * wx;
         const gainEncoded = (gtop * (1 - wy) + gbot * wy) / 255;
-        const gainLin =
-          gainEncoded <= 0.04045
-            ? gainEncoded / 12.92
-            : Math.pow((gainEncoded + 0.055) / 1.055, 2.4);
-        const scale = 1 + headroomMinusOne * gainLin;
+
         const i = rowOff + x;
         const lr = SRGB_U8_TO_LINEAR[sdrData[i * 4]];
         const lg = SRGB_U8_TO_LINEAR[sdrData[i * 4 + 1]];
         const lb = SRGB_U8_TO_LINEAR[sdrData[i * 4 + 2]];
-        f32[i * 4] = lr * scale;
-        f32[i * 4 + 1] = lg * scale;
-        f32[i * 4 + 2] = lb * scale;
+
+        if (useTmap) {
+          // ISO 21496-1: per-channel gamma, interpolate in log2 space.
+          const gaR = Math.pow(gainEncoded, invGamma[0]);
+          const gaG = Math.pow(gainEncoded, invGamma[1]);
+          const gaB = Math.pow(gainEncoded, invGamma[2]);
+          f32[i * 4]     = (lr + oSdr[0]) * Math.pow(2, logMin[0] * (1 - gaR) + logMax[0] * gaR) - oHdr[0];
+          f32[i * 4 + 1] = (lg + oSdr[1]) * Math.pow(2, logMin[1] * (1 - gaG) + logMax[1] * gaG) - oHdr[1];
+          f32[i * 4 + 2] = (lb + oSdr[2]) * Math.pow(2, logMin[2] * (1 - gaB) + logMax[2] * gaB) - oHdr[2];
+        } else {
+          // Legacy: sRGB-decode gain, linear interpolation.
+          const gainLin =
+            gainEncoded <= 0.04045
+              ? gainEncoded / 12.92
+              : Math.pow((gainEncoded + 0.055) / 1.055, 2.4);
+          const factor = 1 + headroomMinusOne * gainLin;
+          f32[i * 4]     = lr * factor;
+          f32[i * 4 + 1] = lg * factor;
+          f32[i * 4 + 2] = lb * factor;
+        }
         f32[i * 4 + 3] = sdrData[i * 4 + 3] / 255;
       }
     }
