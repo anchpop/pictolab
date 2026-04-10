@@ -27,7 +27,7 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
-async function getSavedImages(): Promise<{ id: number; dataUrl: string; thumbnail: string }[]> {
+async function getSavedImages(): Promise<{ id: number; dataUrl: string; thumbnail: string; filename?: string }[]> {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
@@ -38,7 +38,7 @@ async function getSavedImages(): Promise<{ id: number; dataUrl: string; thumbnai
   });
 }
 
-async function saveImage(dataUrl: string, thumbnail: string) {
+async function saveImage(dataUrl: string, thumbnail: string, filename?: string) {
   const db = await openDB();
   const tx = db.transaction(STORE_NAME, 'readwrite');
   const store = tx.objectStore(STORE_NAME);
@@ -55,7 +55,7 @@ async function saveImage(dataUrl: string, thumbnail: string) {
     }
   };
 
-  store.add({ dataUrl, thumbnail });
+  store.add({ dataUrl, thumbnail, filename });
 }
 
 async function removeSavedImage(id: number) {
@@ -120,13 +120,13 @@ async function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
 }
 
 interface ImageDropZoneProps {
-  onImageSelect: (imageUrl: string) => void;
+  onImageSelect: (imageUrl: string, filename?: string) => void;
   disabled?: boolean;
 }
 
 function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
-  const [savedImages, setSavedImages] = useState<{ id: number; dataUrl: string; thumbnail: string }[]>([]);
+  const [savedImages, setSavedImages] = useState<{ id: number; dataUrl: string; thumbnail: string; filename?: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -142,12 +142,12 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
     const reader = new FileReader();
     reader.onload = async (e) => {
       const imageUrl = e.target?.result as string;
-      onImageSelect(imageUrl);
+      onImageSelect(imageUrl, file.name);
 
       // Save to IndexedDB for future use
       try {
         const thumbnail = await makeThumbnail(imageUrl);
-        await saveImage(imageUrl, thumbnail);
+        await saveImage(imageUrl, thumbnail, file.name);
         const updated = await getSavedImages();
         setSavedImages(updated);
       } catch {
@@ -233,9 +233,9 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
       });
   };
 
-  const handleSavedClick = (img: { id: number; dataUrl: string }) => {
+  const handleSavedClick = (img: { id: number; dataUrl: string; filename?: string }) => {
     if (disabled) return;
-    onImageSelect(img.dataUrl);
+    onImageSelect(img.dataUrl, img.filename);
   };
 
   const handleRemoveSaved = async (e: React.MouseEvent, id: number) => {

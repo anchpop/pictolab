@@ -706,6 +706,7 @@ function snapCarve(
 
 function Editor() {
   const [source, setSource] = useState<SourceState | null>(null);
+  const [sourceFilename, setSourceFilename] = useState<string | null>(null);
   const [direction, setDirection] = useState<Direction>('width');
   const [resizeMode, setResizeMode] = useState<ResizeMode>('carve');
   const [aspect, setAspect] = useState<AspectRatio>('free');
@@ -1162,7 +1163,10 @@ function Editor() {
     runPrecompute(src, directionRef.current, onDone);
   };
 
-  const handleImageSelect = async (imageUrl: string) => {
+  const handleImageSelect = async (imageUrl: string, filename?: string) => {
+    // Strip extension from the original filename so we can re-apply the
+    // correct one at export time.
+    setSourceFilename(filename ? filename.replace(/\.[^.]+$/, '') : null);
     const wasm = wasmRef.current;
     if (!wasm) return;
 
@@ -1567,7 +1571,7 @@ function Editor() {
           gainMapQuality: smallerFile ? 80 : 95,
         });
         blob = new Blob([new Uint8Array(jpeg)], { type: 'image/jpeg' });
-        filename = 'pictolab.jpg';
+        filename = `${sourceFilename || 'pictolab'}.jpg`;
       } else {
         // 10-bit BT.2020 PQ readback for HDR AVIF.
         const rgba16 = await wasm.gpu_readback_hdr_pq_u16(10);
@@ -1592,7 +1596,7 @@ function Editor() {
           fullRange: true,
         });
         blob = new Blob([new Uint8Array(avif)], { type: 'image/avif' });
-        filename = 'pictolab.avif';
+        filename = `${sourceFilename || 'pictolab'}.avif`;
       }
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
