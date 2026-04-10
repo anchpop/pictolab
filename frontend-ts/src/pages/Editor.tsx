@@ -1721,7 +1721,7 @@ function Editor() {
     <div className="flex h-full min-h-screen flex-col bg-background text-foreground lg:h-screen lg:overflow-hidden">
       <header className="flex items-center justify-between gap-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
           <div>
-            <h1 className="text-lg font-semibold tracking-tight">Pictolab</h1>
+            <h1 className="text-lg font-semibold tracking-tight">pictolab.io</h1>
           </div>
           <div className="flex items-center gap-2">
             {source && (
