@@ -2236,7 +2236,7 @@ function Editor() {
               >
                 <DualSlider
                   min={-50}
-                  max={150}
+                  max={300}
                   step={1}
                   value={lRange}
                   onValueChange={handleLRangeChange}

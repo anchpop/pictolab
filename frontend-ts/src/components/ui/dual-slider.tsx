@@ -91,11 +91,22 @@ export function DualSlider({
   }
 
   const handleTrackPointerDown = (e: React.PointerEvent) => {
-    // Click-to-jump: move whichever thumb is closer.
+    // Click-to-jump: if the click is beyond both thumbs, grab the nearest
+    // endpoint so dragging the upper end past the top doesn't fight the
+    // lower thumb. Only use closest-distance when clicking between them.
     const v = valueFromClientX(e.clientX)
-    const d0 = Math.abs(v - value[0])
-    const d1 = Math.abs(v - value[1])
-    const idx: 0 | 1 = d0 <= d1 ? 0 : 1
+    const lo0 = Math.min(value[0], value[1])
+    const hi0 = Math.max(value[0], value[1])
+    let idx: 0 | 1
+    if (v >= hi0) {
+      idx = value[0] >= value[1] ? 0 : 1
+    } else if (v <= lo0) {
+      idx = value[0] <= value[1] ? 0 : 1
+    } else {
+      const d0 = Math.abs(v - value[0])
+      const d1 = Math.abs(v - value[1])
+      idx = d0 <= d1 ? 0 : 1
+    }
     const next: [number, number] = [...value] as [number, number]
     next[idx] = v
     onValueChange(next)
