@@ -85,7 +85,11 @@ declare module 'frontend-rs' {
     c_max: number,
     hue_deg: number,
     show_hdr: number,
-    time: number
+    time: number,
+    bg_r: number,
+    bg_g: number,
+    bg_b: number,
+    bg_a: number
   ): void;
 
   export function gpu_dispose(): void;

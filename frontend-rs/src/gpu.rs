@@ -772,6 +772,11 @@ fn apply_edits_and_invert(s: vec4f, params: Params) -> vec4f {
 "#;
 
 // Shared Params struct WGSL (matches the Rust upload at gpu_render).
+// bg_r/g/b/a is the final-step "over" composite color: when bg_a == 0 the
+// composite is a no-op and the source's straight alpha is preserved; when
+// bg_a == 1 transparent regions get filled with the chosen color and the
+// output is opaque. Applied AFTER the L/C/h transform so slider edits
+// don't tint the chosen background.
 const PARAMS_STRUCT_WGSL: &str = r#"
 struct Params {
   l_min: f32,
@@ -782,6 +787,22 @@ struct Params {
   hue_sin: f32,
   show_hdr: f32,
   time: f32,
+  bg_r: f32,
+  bg_g: f32,
+  bg_b: f32,
+  bg_a: f32,
+}
+"#;
+
+// Shared composite helper. Operates in straight alpha (un-premultiplied)
+// to match the rest of the pipeline; the canvas-presentation fragment
+// shader does the final premultiply.
+const COMPOSITE_BG_WGSL: &str = r#"
+fn composite_bg(src: vec4f, bg: vec4f) -> vec4f {
+  let out_a = src.a + bg.a * (1.0 - src.a);
+  if (out_a < 1e-6) { return vec4f(0.0); }
+  let out_rgb = (src.rgb * src.a + bg.rgb * bg.a * (1.0 - src.a)) / out_a;
+  return vec4f(out_rgb, out_a);
 }
 "#;
 
@@ -867,6 +888,7 @@ fn remap_shader() -> String {
 @group(0) @binding(2) var<uniform> params: Params;
 "#);
     s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
+    s.push_str(COMPOSITE_BG_WGSL);
     s.push_str(r#"
 @compute @workgroup_size(256)
 fn main(
@@ -887,7 +909,15 @@ fn main(
   // HDR clipping overlay both happen later, in the render fragment shader,
   // so the resize/rotation passes can filter linear light instead of
   // gamma-encoded values.
-  linp3_out[idx] = apply_edits_and_invert(s, params);
+  //
+  // Bg composite happens here so it sits AFTER the L/C/h transform — that's
+  // why slider edits don't tint the chosen background. Putting it in remap
+  // also means the resample/rotation passes downstream don't need to know
+  // about bg at all: with bg_a == 0 the composite is a no-op (alpha
+  // preserved), and with bg_a == 1 alpha is already 1 throughout, so the
+  // lerps in those passes stay correct either way.
+  let lin = apply_edits_and_invert(s, params);
+  linp3_out[idx] = composite_bg(lin, vec4f(params.bg_r, params.bg_g, params.bg_b, params.bg_a));
 }
 "#);
     s
@@ -908,6 +938,7 @@ fn carve_shader() -> String {
 @group(0) @binding(4) var<uniform> params: Params;
 "#);
     s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
+    s.push_str(COMPOSITE_BG_WGSL);
     s.push_str(r#"
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
@@ -921,7 +952,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let sy = src_idx / sw;
   let s = textureLoad(source_tex, vec2i(i32(sx), i32(sy)), 0);
   let lin = apply_edits_and_invert(s, params);
-  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), lin);
+  let composed = composite_bg(lin, vec4f(params.bg_r, params.bg_g, params.bg_b, params.bg_a));
+  textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), composed);
 }
 "#);
     s
@@ -1091,6 +1123,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
 fn render_shader() -> &'static str {
     r#"
+// Layout must match PARAMS_STRUCT_WGSL — the canvas pass shares the same
+// uniform buffer as the remap/carve shaders. We only read show_hdr and
+// time here, but declaring the full layout keeps WebGPU validation happy
+// about the binding size and lets us add new fields without touching
+// every consumer.
 struct Params {
   l_min: f32,
   l_max: f32,
@@ -1100,6 +1137,10 @@ struct Params {
   hue_sin: f32,
   show_hdr: f32,
   time: f32,
+  bg_r: f32,
+  bg_g: f32,
+  bg_b: f32,
+  bg_a: f32,
 }
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -1634,7 +1675,7 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
     )?;
 
     // 8 f32 params (32 bytes) — uniform alignment
-    let params_buf = create_buffer(&device, 32, BUF_UNIFORM | BUF_COPY_DST)?;
+    let params_buf = create_buffer(&device, 48, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the carve shader
     let carve_dims_buf = create_buffer(&device, 16, BUF_UNIFORM | BUF_COPY_DST)?;
     // 4 u32 dims (16 bytes) for the resample shader
@@ -2273,6 +2314,14 @@ pub fn gpu_render(
     hue_deg: f32,
     show_hdr: f32,
     time: f32,
+    // Final-step "over" composite color in linear extended Display P3,
+    // straight alpha. bg_a == 0 means "leave the source alpha alone"
+    // (no-op composite); bg_a == 1 fills transparent regions with
+    // (bg_r, bg_g, bg_b) and produces an opaque output.
+    bg_r: f32,
+    bg_g: f32,
+    bg_b: f32,
+    bg_a: f32,
 ) -> Result<(), JsValue> {
     GPU_CTX.with(|c| -> Result<(), JsValue> {
         let c = c.borrow();
@@ -2287,7 +2336,7 @@ pub fn gpu_render(
             return Err("squish mode active but no resample bind group".into());
         }
 
-        // Upload params.
+        // Upload params. 12 f32 = 48 bytes; matches PARAMS_STRUCT_WGSL.
         let hue_rad = hue_deg.to_radians();
         let params = [
             l_min,
@@ -2298,9 +2347,13 @@ pub fn gpu_render(
             hue_rad.sin(),
             show_hdr,
             time,
+            bg_r,
+            bg_g,
+            bg_b,
+            bg_a,
         ];
         let params_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 32) };
+            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 48) };
         write_buffer_u8(&ctx.queue, &ctx.params_buf, params_bytes)?;
 
         // Encode all three passes into one command buffer.
