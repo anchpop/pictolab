@@ -2,6 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import './ImageDropZone.css';
 
 const EXAMPLE_IMAGES = [
+  { src: '/examples/portrait_01.webp', label: 'Portrait' },
   { src: '/examples/artwork_01.webp', label: 'Artwork 1' },
   { src: '/examples/artwork_02.webp', label: 'Artwork 2' },
   { src: '/examples/artwork_03.webp', label: 'Artwork 3' },

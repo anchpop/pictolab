@@ -11,6 +11,10 @@ import { DualSlider } from '@/components/ui/dual-slider';
 import { Segmented } from '@/components/ui/segmented';
 import { Collapsible } from '@/components/ui/collapsible';
 import { cn } from '@/lib/utils';
+import { lchToCssColor, lchToLinearP3 } from '@/lib/oklab';
+
+type BgFill = 'transparent' | 'color';
+type BgColor = { L: number; C: number; h: number };
 
 type Direction = 'width' | 'height';
 type ResizeMode = 'squish' | 'carve';
@@ -728,6 +732,25 @@ function Editor() {
   const [exportOpen, setExportOpen] = useState(true);
   const [targetWDraft, setTargetWDraft] = useState<number | null>(null);
   const [targetHDraft, setTargetHDraft] = useState<number | null>(null);
+  const [removeBg, setRemoveBg] = useState(false);
+  const [bgRemovalLoading, setBgRemovalLoading] = useState(false);
+  const [bgRemovalError, setBgRemovalError] = useState<string | null>(null);
+  const [bgFill, setBgFill] = useState<BgFill>('transparent');
+  // Default fill is plain white in OKLab (L=1, achromatic).
+  const [bgColor, setBgColor] = useState<BgColor>({ L: 1, C: 0, h: 0 });
+  const [bgSectionOpen, setBgSectionOpen] = useState(false);
+  // Caches so toggling the checkbox after the first run is instant.
+  const originalSourceRef = useRef<SourceState | null>(null);
+  const bgRemovedSourceRef = useRef<SourceState | null>(null);
+  // Mirror of removeBg for the async bg-removal job to read on completion:
+  // if the user toggled off (or off-then-on) while the job ran, we still
+  // want to cache the result but only swap when the toggle is currently on.
+  const removeBgRef = useRef(false);
+  const bgFillRef = useRef<BgFill>('transparent');
+  const bgColorRef = useRef<BgColor>({ L: 1, C: 0, h: 0 });
+  // Set to true before swapping `source` to keep the user's targetW/targetH
+  // intact (the source-mount effect otherwise resets them to src.w × src.h).
+  const preserveDimsOnSourceChangeRef = useRef(false);
 
   // Straighten + 90° rotation. Composed at the end of the pipeline by a
   // Lanczos rotation pass on the GPU.
@@ -1059,7 +1082,8 @@ function Editor() {
       const [lMin, lMax] = lRangeRef.current;
       const [cMin, cMax] = cRangeRef.current;
       const t = performance.now() / 1000;
-      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t);
+      const [br, bg, bb, ba] = currentBgUniform();
+      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, showHdrRef.current ? 1 : 0, t, br, bg, bb, ba);
     } catch (err) {
       void recoverGpu('render', err);
     }
@@ -1107,9 +1131,11 @@ function Editor() {
     gpuLostRef.current = false;
     setGpuLost(false);
     let cancelled = false;
+    const preserve = preserveDimsOnSourceChangeRef.current;
+    preserveDimsOnSourceChangeRef.current = false;
     (async () => {
       try {
-        await configureGpuForSource(src, false);
+        await configureGpuForSource(src, preserve);
       } catch (err) {
         if (!cancelled) {
           void recoverGpu('init/upload', err);
@@ -1204,6 +1230,12 @@ function Editor() {
         };
         setSource(src);
         sourceRef.current = src;
+        originalSourceRef.current = src;
+        bgRemovedSourceRef.current = null;
+        setRemoveBg(false);
+        removeBgRef.current = false;
+        setBgRemovalError(null);
+        setBgRemovalLoading(false);
         // Histogram + seam worker run on the (tonemapped or actual) SDR proxy.
         lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
         return;
@@ -1265,6 +1297,12 @@ function Editor() {
       };
       setSource(src);
       sourceRef.current = src;
+      originalSourceRef.current = src;
+      bgRemovedSourceRef.current = null;
+      setRemoveBg(false);
+      removeBgRef.current = false;
+      setBgRemovalError(null);
+      setBgRemovalLoading(false);
 
       // Compute the L+chroma histogram once so the clipping readouts are live.
       lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
@@ -1527,7 +1565,8 @@ function Editor() {
       // HDR-view marker pixels for the export).
       const [lMin, lMax] = lRangeRef.current;
       const [cMin, cMax] = cRangeRef.current;
-      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0);
+      const [br, bg, bb, ba] = currentBgUniform();
+      wasm.gpu_render(lMin, lMax, cMin, cMax, hueRef.current, 0, 0, br, bg, bb, ba);
 
       const outW = transform.active ? transform.dstW : targetWRef.current;
       const outH = transform.active ? transform.dstH : targetHRef.current;
@@ -1612,6 +1651,207 @@ function Editor() {
     }
   };
 
+  // Decode an arbitrary SDR blob (e.g. the PNG returned by background
+  // removal) into a fresh SourceState. Mirrors the SDR fallback in
+  // handleImageSelect so the pipeline downstream sees the same shape it
+  // would for any other SDR upload.
+  const decodeSdrBlobToSource = async (blob: Blob): Promise<SourceState | null> => {
+    let objectUrl: string | null = null;
+    try {
+      let image: ImageBitmap | HTMLImageElement | null = null;
+      if (typeof createImageBitmap === 'function') {
+        try {
+          image = await createImageBitmap(blob, { imageOrientation: 'from-image' } as ImageBitmapOptions);
+        } catch {
+          image = null;
+        }
+      }
+      if (!image) {
+        objectUrl = URL.createObjectURL(blob);
+        image = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error('image decode failed'));
+          img.src = objectUrl!;
+        });
+      }
+      const isBitmap = typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap;
+      const outWidth = isBitmap
+        ? (image as ImageBitmap).width
+        : (image as HTMLImageElement).naturalWidth || (image as HTMLImageElement).width;
+      const outHeight = isBitmap
+        ? (image as ImageBitmap).height
+        : (image as HTMLImageElement).naturalHeight || (image as HTMLImageElement).height;
+      const tmp = document.createElement('canvas');
+      tmp.width = outWidth;
+      tmp.height = outHeight;
+      const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
+      ctx.drawImage(image, 0, 0);
+      const data = ctx.getImageData(0, 0, outWidth, outHeight, { colorSpace: 'display-p3' });
+      const sdrData = new Uint8Array(data.data);
+      if (isBitmap) (image as ImageBitmap).close();
+      return {
+        url: '',
+        data: sdrData,
+        sdrData,
+        w: outWidth,
+        h: outHeight,
+        hdr: false,
+        hasAlpha: bufferHasAlpha(sdrData),
+      };
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
+  };
+
+  // Encode the source's SDR proxy as a PNG so @imgly/background-removal
+  // can consume it regardless of the original format (HEIC, HDR JPEG, etc.).
+  // sdrData is Display P3, so both the canvas and the ImageData are tagged
+  // accordingly — putting P3 bytes into a default-sRGB canvas would tell
+  // the browser the bytes are sRGB and produce a color-shifted PNG.
+  const sourceToInputBlob = async (src: SourceState): Promise<Blob> => {
+    const tmp = document.createElement('canvas');
+    tmp.width = src.w;
+    tmp.height = src.h;
+    const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
+    const pixels = new Uint8ClampedArray(src.sdrData.length);
+    pixels.set(src.sdrData);
+    ctx.putImageData(new ImageData(pixels, src.w, src.h, { colorSpace: 'display-p3' }), 0, 0);
+    return await new Promise<Blob>((resolve, reject) => {
+      tmp.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+    });
+  };
+
+  // Swap the active source while preserving the user's resize/crop edits.
+  // `invalidateSeams: false` keeps the carve cache when the swap is just
+  // changing a flat background fill — the subject silhouette doesn't
+  // move, so the previously-computed seam order is still valid.
+  // Otherwise we drop the cache. Whether we then kick a fresh precompute
+  // depends on whether the user has previously committed to carve: if
+  // there was an existing seam order we recompute now (so a bg-removal
+  // toggle doesn't silently downgrade carved output to squish), but on
+  // a fresh image we leave it for the resize-panel useEffect to handle
+  // — no point running a multi-second seam pass for users who never
+  // touch the resize panel.
+  const swapSource = (next: SourceState, options: { invalidateSeams?: boolean } = {}) => {
+    const wasm = wasmRef.current;
+    if (wasm) lcHistRef.current = wasm.compute_lc_histogram(next.sdrData);
+    const invalidateSeams = options.invalidateSeams ?? true;
+    const hadOrder = orderRef.current !== null;
+    if (invalidateSeams) {
+      orderRef.current = null;
+      orderDirectionRef.current = null;
+      // A precompute kicked off for the previous source may still be in
+      // flight; bump the request id so its onmessage callback drops the
+      // result instead of installing seam order computed on stale pixels.
+      requestIdRef.current += 1;
+    }
+    preserveDimsOnSourceChangeRef.current = true;
+    sourceRef.current = next;
+    setSource(next);
+    if (invalidateSeams && hadOrder && resizeModeRef.current === 'carve') {
+      runPrecompute(next, directionRef.current, () => {
+        applyResize();
+        render();
+      });
+    }
+  };
+
+  // The bg fill is composited on the GPU as the final step of the per-frame
+  // pipeline (see frontend-rs/src/gpu.rs PARAMS_STRUCT_WGSL). When the
+  // toggle is off or the user has chosen "transparent", we send a zero
+  // bg_a so the composite is a no-op and the source's straight alpha is
+  // preserved. When "color" is selected we send the chosen OKLCh value
+  // converted to linear extended P3 with bg_a = 1 so transparent regions
+  // get filled in.
+  const currentBgUniform = (): [number, number, number, number] => {
+    if (!removeBgRef.current || bgFillRef.current !== 'color') {
+      return [0, 0, 0, 0];
+    }
+    // lchToLinearP3 returns unclamped linear values (it's a pure math
+    // conversion). Clamp to the same displayable Display-P3 gamut the
+    // swatch helper uses (lchToP3Bytes clamps before gamma-encoding) —
+    // otherwise an out-of-gamut OKLCh choice would show one color in
+    // the swatch and a much brighter HDR-extended-range color in the
+    // actual fill.
+    const [r, g, b] = lchToLinearP3(bgColorRef.current.L, bgColorRef.current.C, bgColorRef.current.h);
+    return [
+      Math.max(0, Math.min(1, r)),
+      Math.max(0, Math.min(1, g)),
+      Math.max(0, Math.min(1, b)),
+      1,
+    ];
+  };
+
+  const handleRemoveBgChange = async (next: boolean) => {
+    setRemoveBg(next);
+    removeBgRef.current = next;
+    setBgRemovalError(null);
+    if (!next) {
+      if (originalSourceRef.current) swapSource(originalSourceRef.current);
+      return;
+    }
+    if (bgRemovedSourceRef.current) {
+      swapSource(bgRemovedSourceRef.current);
+      return;
+    }
+    const original = originalSourceRef.current;
+    if (!original) return;
+    setBgRemovalLoading(true);
+    try {
+      const inputBlob = await sourceToInputBlob(original);
+      const { removeBackground } = await import('@imgly/background-removal');
+      // Self-host the ORT runtime + isnet_fp16 weights from /imgly so
+      // bg removal doesn't depend on staticimgly.com at runtime.
+      // Assets are produced by scripts/fetch-bg-removal-assets.sh, which
+      // prunes the package down to just the model below — pinning it here
+      // (rather than relying on the SDK's default) keeps the script's
+      // pruning and the runtime request in lockstep across SDK upgrades.
+      const removed = await removeBackground(inputBlob, {
+        publicPath: `${window.location.origin}/imgly/`,
+        model: 'isnet_fp16',
+        // Run preprocessing + ONNX inference in a Web Worker — otherwise
+        // the SDK does it on the main thread (default is false) and the
+        // editor jank-locks during a multi-second inference pass on
+        // large images.
+        proxyToWorker: true,
+      });
+      // The user may have loaded a different image while we were running;
+      // discard the result rather than overwriting the new source's state.
+      if (originalSourceRef.current !== original) return;
+      const removedSource = await decodeSdrBlobToSource(removed);
+      if (originalSourceRef.current !== original) return;
+      if (!removedSource) throw new Error('Failed to decode background-removed image');
+      bgRemovedSourceRef.current = removedSource;
+      // Only swap if the toggle is still on — otherwise just seed the cache
+      // so the next re-toggle is instant.
+      if (removeBgRef.current) swapSource(removedSource);
+    } catch (err) {
+      if (originalSourceRef.current !== original) return;
+      console.error('background removal failed:', err);
+      setBgRemovalError(err instanceof Error ? err.message : 'Background removal failed');
+      setRemoveBg(false);
+      removeBgRef.current = false;
+    } finally {
+      if (originalSourceRef.current === original) setBgRemovalLoading(false);
+    }
+  };
+
+  // Fill mode and color changes don't touch source pixels — they just feed
+  // a different bg uniform on the next render, so the seam-carve cache,
+  // GPU upload, and L/C/h transform are all unaffected.
+  const handleBgFillChange = (next: BgFill) => {
+    setBgFill(next);
+    bgFillRef.current = next;
+    if (ready) render();
+  };
+
+  const handleBgColorChange = (next: BgColor) => {
+    setBgColor(next);
+    bgColorRef.current = next;
+    if (ready && bgFillRef.current === 'color') render();
+  };
+
   const handleNewImage = () => {
     setSource(null);
     // Clear any prior terminal GPU-lost state so the user sees the upload
@@ -1622,6 +1862,16 @@ function Editor() {
     setTargetWDraft(null);
     setTargetHDraft(null);
     sourceRef.current = null;
+    originalSourceRef.current = null;
+    bgRemovedSourceRef.current = null;
+    setRemoveBg(false);
+    removeBgRef.current = false;
+    setBgFill('transparent');
+    bgFillRef.current = 'transparent';
+    setBgColor({ L: 1, C: 0, h: 0 });
+    bgColorRef.current = { L: 1, C: 0, h: 0 };
+    setBgRemovalLoading(false);
+    setBgRemovalError(null);
     orderRef.current = null;
     orderDirectionRef.current = null;
     lcHistRef.current = null;
@@ -2073,6 +2323,97 @@ function Editor() {
                 Your browser does not support HDR. The preview will be SDR, but the exported file will still be HDR.
               </div>
             )}
+
+            <section>
+              <Collapsible
+                label={<CardTitle>Background</CardTitle>}
+                open={bgSectionOpen}
+                onOpenChange={setBgSectionOpen}
+                className="space-y-4"
+              >
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="remove-bg" className="flex items-center gap-2 text-xs font-normal text-muted-foreground">
+                    Remove background
+                    {bgRemovalLoading && <Loader2 className="h-3 w-3 animate-spin" />}
+                  </Label>
+                  <Switch
+                    id="remove-bg"
+                    checked={removeBg}
+                    disabled={bgRemovalLoading}
+                    onCheckedChange={handleRemoveBgChange}
+                  />
+                </div>
+                {bgRemovalError && (
+                  <p className="text-[11px] leading-snug text-destructive">{bgRemovalError}</p>
+                )}
+                {removeBg && (
+                  <>
+                    <Segmented<BgFill>
+                      value={bgFill}
+                      onValueChange={handleBgFillChange}
+                      options={[
+                        { value: 'transparent', label: 'Transparent' },
+                        { value: 'color', label: 'Color' },
+                      ]}
+                    />
+                    {bgFill === 'color' && (
+                      <div className="space-y-3">
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs font-normal text-muted-foreground">Lightness</Label>
+                            <span className="font-mono text-[10px] text-muted-foreground">
+                              {Math.round(bgColor.L * 100)}
+                            </span>
+                          </div>
+                          <Slider
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={[bgColor.L]}
+                            onValueChange={(v) => handleBgColorChange({ ...bgColor, L: v[0] })}
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs font-normal text-muted-foreground">Chroma</Label>
+                            <span className="font-mono text-[10px] text-muted-foreground">
+                              {bgColor.C.toFixed(2)}
+                            </span>
+                          </div>
+                          <Slider
+                            min={0}
+                            max={0.4}
+                            step={0.005}
+                            value={[bgColor.C]}
+                            onValueChange={(v) => handleBgColorChange({ ...bgColor, C: v[0] })}
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs font-normal text-muted-foreground">Hue</Label>
+                            <span className="font-mono text-[10px] text-muted-foreground">
+                              {Math.round(bgColor.h)}°
+                            </span>
+                          </div>
+                          <Slider
+                            min={0}
+                            max={360}
+                            step={1}
+                            value={[bgColor.h]}
+                            onValueChange={(v) => handleBgColorChange({ ...bgColor, h: v[0] })}
+                          />
+                        </div>
+                        <div
+                          className="h-8 w-full rounded border border-border"
+                          style={{ background: lchToCssColor(bgColor.L, bgColor.C, bgColor.h) }}
+                          title="Background color preview (Display P3)"
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </Collapsible>
+            </section>
 
             <section>
               <Collapsible

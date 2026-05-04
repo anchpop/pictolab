@@ -4,12 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "fetch-bg-removal-assets": "bash scripts/fetch-bg-removal-assets.sh",
+    "predev": "pnpm run fetch-bg-removal-assets",
     "dev": "vite",
+    "prebuild": "pnpm run fetch-bg-removal-assets",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@imgly/background-removal": "^1.7.0",
     "@radix-ui/react-label": "^2.1.8",
     "@radix-ui/react-slider": "^1.3.6",
     "@radix-ui/react-slot": "^1.2.4",
