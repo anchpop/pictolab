@@ -7,8 +7,7 @@
     "fetch-bg-removal-assets": "bash scripts/fetch-bg-removal-assets.sh",
     "predev": "pnpm run fetch-bg-removal-assets",
     "dev": "vite",
-    "prebuild": "pnpm run fetch-bg-removal-assets",
-    "build": "tsc -b && vite build",
+    "build": "pnpm run fetch-bg-removal-assets && tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },
