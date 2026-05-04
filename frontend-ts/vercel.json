@@ -3,5 +3,6 @@
   "git": {
     "deploymentEnabled": false
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }] 
+  "buildCommand": "pnpm run build",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
