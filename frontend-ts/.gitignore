@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# @imgly/background-removal model + ORT runtime, fetched by
+# scripts/fetch-bg-removal-assets.sh (runs as part of dev/build).
+public/imgly
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

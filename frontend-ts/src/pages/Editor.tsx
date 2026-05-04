@@ -728,6 +728,19 @@ function Editor() {
   const [exportOpen, setExportOpen] = useState(true);
   const [targetWDraft, setTargetWDraft] = useState<number | null>(null);
   const [targetHDraft, setTargetHDraft] = useState<number | null>(null);
+  const [removeBg, setRemoveBg] = useState(false);
+  const [bgRemovalLoading, setBgRemovalLoading] = useState(false);
+  const [bgRemovalError, setBgRemovalError] = useState<string | null>(null);
+  // Caches so toggling the checkbox after the first run is instant.
+  const originalSourceRef = useRef<SourceState | null>(null);
+  const bgRemovedSourceRef = useRef<SourceState | null>(null);
+  // Mirror of removeBg for the async bg-removal job to read on completion:
+  // if the user toggled off (or off-then-on) while the job ran, we still
+  // want to cache the result but only swap when the toggle is currently on.
+  const removeBgRef = useRef(false);
+  // Set to true before swapping `source` to keep the user's targetW/targetH
+  // intact (the source-mount effect otherwise resets them to src.w × src.h).
+  const preserveDimsOnSourceChangeRef = useRef(false);
 
   // Straighten + 90° rotation. Composed at the end of the pipeline by a
   // Lanczos rotation pass on the GPU.
@@ -1107,9 +1120,11 @@ function Editor() {
     gpuLostRef.current = false;
     setGpuLost(false);
     let cancelled = false;
+    const preserve = preserveDimsOnSourceChangeRef.current;
+    preserveDimsOnSourceChangeRef.current = false;
     (async () => {
       try {
-        await configureGpuForSource(src, false);
+        await configureGpuForSource(src, preserve);
       } catch (err) {
         if (!cancelled) {
           void recoverGpu('init/upload', err);
@@ -1204,6 +1219,12 @@ function Editor() {
         };
         setSource(src);
         sourceRef.current = src;
+        originalSourceRef.current = src;
+        bgRemovedSourceRef.current = null;
+        setRemoveBg(false);
+        removeBgRef.current = false;
+        setBgRemovalError(null);
+        setBgRemovalLoading(false);
         // Histogram + seam worker run on the (tonemapped or actual) SDR proxy.
         lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
         return;
@@ -1265,6 +1286,12 @@ function Editor() {
       };
       setSource(src);
       sourceRef.current = src;
+      originalSourceRef.current = src;
+      bgRemovedSourceRef.current = null;
+      setRemoveBg(false);
+      removeBgRef.current = false;
+      setBgRemovalError(null);
+      setBgRemovalLoading(false);
 
       // Compute the L+chroma histogram once so the clipping readouts are live.
       lcHistRef.current = wasm.compute_lc_histogram(src.sdrData);
@@ -1612,6 +1639,155 @@ function Editor() {
     }
   };
 
+  // Decode an arbitrary SDR blob (e.g. the PNG returned by background
+  // removal) into a fresh SourceState. Mirrors the SDR fallback in
+  // handleImageSelect so the pipeline downstream sees the same shape it
+  // would for any other SDR upload.
+  const decodeSdrBlobToSource = async (blob: Blob): Promise<SourceState | null> => {
+    let objectUrl: string | null = null;
+    try {
+      let image: ImageBitmap | HTMLImageElement | null = null;
+      if (typeof createImageBitmap === 'function') {
+        try {
+          image = await createImageBitmap(blob, { imageOrientation: 'from-image' } as ImageBitmapOptions);
+        } catch {
+          image = null;
+        }
+      }
+      if (!image) {
+        objectUrl = URL.createObjectURL(blob);
+        image = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => reject(new Error('image decode failed'));
+          img.src = objectUrl!;
+        });
+      }
+      const isBitmap = typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap;
+      const outWidth = isBitmap
+        ? (image as ImageBitmap).width
+        : (image as HTMLImageElement).naturalWidth || (image as HTMLImageElement).width;
+      const outHeight = isBitmap
+        ? (image as ImageBitmap).height
+        : (image as HTMLImageElement).naturalHeight || (image as HTMLImageElement).height;
+      const tmp = document.createElement('canvas');
+      tmp.width = outWidth;
+      tmp.height = outHeight;
+      const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
+      ctx.drawImage(image, 0, 0);
+      const data = ctx.getImageData(0, 0, outWidth, outHeight, { colorSpace: 'display-p3' });
+      const sdrData = new Uint8Array(data.data);
+      if (isBitmap) (image as ImageBitmap).close();
+      return {
+        url: '',
+        data: sdrData,
+        sdrData,
+        w: outWidth,
+        h: outHeight,
+        hdr: false,
+        hasAlpha: bufferHasAlpha(sdrData),
+      };
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    }
+  };
+
+  // Encode the source's SDR proxy as a PNG so @imgly/background-removal
+  // can consume it regardless of the original format (HEIC, HDR JPEG, etc.).
+  // sdrData is Display P3, so both the canvas and the ImageData are tagged
+  // accordingly — putting P3 bytes into a default-sRGB canvas would tell
+  // the browser the bytes are sRGB and produce a color-shifted PNG.
+  const sourceToInputBlob = async (src: SourceState): Promise<Blob> => {
+    const tmp = document.createElement('canvas');
+    tmp.width = src.w;
+    tmp.height = src.h;
+    const ctx = tmp.getContext('2d', { colorSpace: 'display-p3' })!;
+    const pixels = new Uint8ClampedArray(src.sdrData.length);
+    pixels.set(src.sdrData);
+    ctx.putImageData(new ImageData(pixels, src.w, src.h, { colorSpace: 'display-p3' }), 0, 0);
+    return await new Promise<Blob>((resolve, reject) => {
+      tmp.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+    });
+  };
+
+  // Swap the active source while preserving the user's resize/crop edits.
+  const swapSource = (next: SourceState) => {
+    const wasm = wasmRef.current;
+    if (wasm) lcHistRef.current = wasm.compute_lc_histogram(next.sdrData);
+    // Source pixels changed → seam order computed for the prior pixels is
+    // stale, so carve mode would build the LUT against the wrong content.
+    // Drop the cache; we kick a fresh precompute below so carve doesn't
+    // silently downgrade to squish until the Resize panel is reopened.
+    orderRef.current = null;
+    orderDirectionRef.current = null;
+    preserveDimsOnSourceChangeRef.current = true;
+    sourceRef.current = next;
+    setSource(next);
+    // configureGpuForSource (via the source useEffect) falls back to squish
+    // when there's no seam order yet — kick the recompute now so carve
+    // resumes once the worker returns, regardless of resizeOpen.
+    if (resizeModeRef.current === 'carve') {
+      runPrecompute(next, directionRef.current, () => {
+        applyResize();
+        render();
+      });
+    }
+  };
+
+  const handleRemoveBgChange = async (next: boolean) => {
+    setRemoveBg(next);
+    removeBgRef.current = next;
+    setBgRemovalError(null);
+    if (!next) {
+      if (originalSourceRef.current) swapSource(originalSourceRef.current);
+      return;
+    }
+    if (bgRemovedSourceRef.current) {
+      swapSource(bgRemovedSourceRef.current);
+      return;
+    }
+    const original = originalSourceRef.current;
+    if (!original) return;
+    setBgRemovalLoading(true);
+    try {
+      const inputBlob = await sourceToInputBlob(original);
+      const { removeBackground } = await import('@imgly/background-removal');
+      // Self-host the ORT runtime + isnet_fp16 weights from /imgly so
+      // bg removal doesn't depend on staticimgly.com at runtime.
+      // Assets are produced by scripts/fetch-bg-removal-assets.sh, which
+      // prunes the package down to just the model below — pinning it here
+      // (rather than relying on the SDK's default) keeps the script's
+      // pruning and the runtime request in lockstep across SDK upgrades.
+      const removed = await removeBackground(inputBlob, {
+        publicPath: `${window.location.origin}/imgly/`,
+        model: 'isnet_fp16',
+        // Run preprocessing + ONNX inference in a Web Worker — otherwise
+        // the SDK does it on the main thread (default is false) and the
+        // editor jank-locks during a multi-second inference pass on
+        // large images.
+        proxyToWorker: true,
+      });
+      // The user may have loaded a different image while we were running;
+      // discard the result rather than overwriting the new source's state.
+      if (originalSourceRef.current !== original) return;
+      const removedSource = await decodeSdrBlobToSource(removed);
+      if (originalSourceRef.current !== original) return;
+      if (!removedSource) throw new Error('Failed to decode background-removed image');
+      bgRemovedSourceRef.current = removedSource;
+      // Only swap if the toggle is still on — otherwise just seed the cache
+      // so the next re-toggle is instant.
+      if (removeBgRef.current) swapSource(removedSource);
+    } catch (err) {
+      if (originalSourceRef.current !== original) return;
+      console.error('background removal failed:', err);
+      setBgRemovalError(err instanceof Error ? err.message : 'Background removal failed');
+      setRemoveBg(false);
+      removeBgRef.current = false;
+    } finally {
+      if (originalSourceRef.current === original) setBgRemovalLoading(false);
+    }
+  };
+
   const handleNewImage = () => {
     setSource(null);
     // Clear any prior terminal GPU-lost state so the user sees the upload
@@ -1622,6 +1798,12 @@ function Editor() {
     setTargetWDraft(null);
     setTargetHDraft(null);
     sourceRef.current = null;
+    originalSourceRef.current = null;
+    bgRemovedSourceRef.current = null;
+    setRemoveBg(false);
+    removeBgRef.current = false;
+    setBgRemovalLoading(false);
+    setBgRemovalError(null);
     orderRef.current = null;
     orderDirectionRef.current = null;
     lcHistRef.current = null;
@@ -2073,6 +2255,30 @@ function Editor() {
                 Your browser does not support HDR. The preview will be SDR, but the exported file will still be HDR.
               </div>
             )}
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="remove-bg" className="flex items-center gap-2 text-xs font-normal text-muted-foreground">
+                  Remove background
+                  {bgRemovalLoading && <Loader2 className="h-3 w-3 animate-spin" />}
+                </Label>
+                <Switch
+                  id="remove-bg"
+                  checked={removeBg}
+                  disabled={bgRemovalLoading}
+                  onCheckedChange={handleRemoveBgChange}
+                />
+              </div>
+              {bgRemovalError && (
+                <p className="text-[11px] leading-snug text-destructive">{bgRemovalError}</p>
+              )}
+              {removeBg && source.hdr && (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Background removal is SDR-only, so HDR pixels are flattened
+                  while it's on. Toggle off to recover the original HDR.
+                </p>
+              )}
+            </div>
 
             <section>
               <Collapsible
