@@ -2302,6 +2302,15 @@ function Editor() {
                 </div>
 
                 <div>
+                  <p className="font-medium">One-click background removal</p>
+                  <p className="text-muted-foreground">
+                    Cut out the subject and drop the background to transparent or a
+                    color of your choice. Runs entirely in your browser, so your
+                    images never leave your machine.
+                  </p>
+                </div>
+
+                <div>
                   <p className="font-medium">Fast, local, GPU-accelerated</p>
                   <p className="text-muted-foreground">
                     Built on WebGPU. Everything runs on your machine. Your images never
