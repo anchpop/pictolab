@@ -1,12 +1,6 @@
 declare module 'frontend-rs' {
   export function compute_lc_histogram(image_data: Uint8Array): Uint32Array;
 
-  export function encode_png(
-    image_data: Uint8Array,
-    width: number,
-    height: number
-  ): Uint8Array;
-
   export function remap_lab(
     image_data: Uint8Array,
     width: number,

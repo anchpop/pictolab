@@ -359,57 +359,6 @@ fn lab_dist(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
     (dl * dl + da * da + db * db).sqrt()
 }
 
-/// Encode an RGBA byte buffer as a PNG with the Display P3 ICC profile
-/// embedded via an iCCP chunk so that color-managed viewers render the
-/// pixels in the wide gamut they were authored in. Pixels are written
-/// as-is — no color conversion happens here, since the buffer is already
-/// in the target working space.
-#[wasm_bindgen]
-pub fn encode_png(image_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsValue> {
-    #[cfg(feature = "console_error_panic_hook")]
-    console_error_panic_hook::set_once();
-
-    // Display P3 ICC profile shipped with macOS. Copied verbatim from
-    // /System/Library/ColorSync/Profiles/Display P3.icc.
-    const P3_ICC: &[u8] = include_bytes!("display_p3.icc");
-
-    // Build the iCCP chunk content per PNG spec:
-    //   profile name (Latin-1, 1..=79 bytes) + 0x00 + compression method (0)
-    //   + zlib-compressed profile.
-    let mut iccp = Vec::with_capacity(P3_ICC.len() + 16);
-    iccp.extend_from_slice(b"Display P3");
-    iccp.push(0); // null terminator after the profile name
-    iccp.push(0); // compression method: zlib
-    {
-        use flate2::{write::ZlibEncoder, Compression};
-        use std::io::Write;
-        let mut z = ZlibEncoder::new(&mut iccp, Compression::default());
-        z.write_all(P3_ICC)
-            .map_err(|e| JsValue::from_str(&format!("zlib: {e}")))?;
-        z.finish()
-            .map_err(|e| JsValue::from_str(&format!("zlib finish: {e}")))?;
-    }
-
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut buf, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| JsValue::from_str(&format!("png header: {e}")))?;
-        // iCCP must come before IDAT — write_chunk inserts at the current
-        // position, which after write_header is right before the first IDAT.
-        writer
-            .write_chunk(png::chunk::iCCP, &iccp)
-            .map_err(|e| JsValue::from_str(&format!("png iccp chunk: {e}")))?;
-        writer
-            .write_image_data(image_data)
-            .map_err(|e| JsValue::from_str(&format!("png data: {e}")))?;
-    }
-    Ok(buf)
-}
-
 /// Linearly remap LAB lightness and chroma in a single pass.
 ///
 /// - Lightness: input L in [0, 100] is mapped linearly to [l_min, l_max].
