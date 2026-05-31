@@ -771,6 +771,7 @@ function Editor() {
   // Tracks whether the persistent GPU context has been initialized against
   // the current canvas element.
   const gpuInitedRef = useRef(false);
+  const gpuCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const gpuRecoveryRef = useRef<Promise<boolean> | null>(null);
   const [gpuLost, setGpuLost] = useState(false);
   // Ref mirror of gpuLost so recoverGpu (which is not a useCallback and
@@ -918,12 +919,23 @@ function Editor() {
     const c = canvasRef.current;
     if (!wasm || !c) return;
 
+    if (gpuInitedRef.current && gpuCanvasRef.current !== c) {
+      try {
+        wasm.gpu_dispose();
+      } catch {
+        /* ignore */
+      }
+      gpuInitedRef.current = false;
+      gpuCanvasRef.current = null;
+    }
+
     c.width = src.w;
     c.height = src.h;
 
     if (!gpuInitedRef.current) {
       await wasm.gpu_init(c);
       gpuInitedRef.current = true;
+      gpuCanvasRef.current = c;
     }
     setHdrPresentationActive(wasm.gpu_is_hdr_presentation_active());
     uploadSourceToGpu(wasm, src);
@@ -983,6 +995,7 @@ function Editor() {
         /* ignore */
       }
       gpuInitedRef.current = false;
+      gpuCanvasRef.current = null;
 
       try {
         await configureGpuForSource(src, true);
@@ -1853,6 +1866,16 @@ function Editor() {
   };
 
   const handleNewImage = () => {
+    try {
+      wasmRef.current?.gpu_dispose();
+    } catch {
+      /* ignore */
+    }
+    gpuInitedRef.current = false;
+    gpuCanvasRef.current = null;
+    stopHdrLoop();
+    showHdrRef.current = false;
+    setShowHdr(false);
     setSource(null);
     // Clear any prior terminal GPU-lost state so the user sees the upload
     // drop zone instead of the banner — the banner's own copy tells them
