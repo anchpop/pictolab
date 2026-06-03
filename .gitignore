@@ -1,4 +1,5 @@
 target/
 .vercel
+.claude/worktrees/
 
 art/
