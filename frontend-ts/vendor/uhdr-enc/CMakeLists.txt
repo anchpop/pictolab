@@ -266,7 +266,7 @@ if(MSVC)
   add_compile_options(/wd4838) # conversion from 'type1' to 'type2' requires a narrowing conversion
   add_compile_options(/wd26812) # Prefer enum class over enum
 elseif(EMSCRIPTEN)
-  if(NOT UHDR_BUILD_DEPS)
+  if(NOT UHDR_BUILD_DEPS AND NOT UHDR_JPEG_LIBRARIES)
     include(CheckCSourceCompiles)
     set(CMAKE_REQUIRED_FLAGS "--use-port=libjpeg")
     set(CMAKE_REQUIRED_LINK_OPTIONS "--use-port=libjpeg")
@@ -449,14 +449,21 @@ endif()
 # libjpeg-turbo
 if(NOT UHDR_BUILD_DEPS)
   if(EMSCRIPTEN)
-    # Pictolab fork: emscripten provides JPEG via --use-port=libjpeg, which
-    # the HAVE_JPEG check above already validated. Pretend find_package
-    # found it so the rest of the file uses the port instead of building
-    # libjpeg-turbo from source.
-    set(JPEG_FOUND TRUE)
-    set(JPEG_LIBRARIES "")
-    set(JPEG_INCLUDE_DIRS "")
-    message(STATUS "Using emscripten libjpeg port")
+    if(UHDR_JPEG_LIBRARIES)
+      set(JPEG_FOUND TRUE)
+      set(JPEG_LIBRARIES ${UHDR_JPEG_LIBRARIES})
+      set(JPEG_INCLUDE_DIRS ${UHDR_JPEG_INCLUDE_DIRS})
+      message(STATUS "Using custom JPEG libraries: ${JPEG_LIBRARIES}")
+    else()
+      # Pictolab fork: emscripten provides JPEG via --use-port=libjpeg, which
+      # the HAVE_JPEG check above already validated. Pretend find_package
+      # found it so the rest of the file uses the port instead of building
+      # libjpeg-turbo from source.
+      set(JPEG_FOUND TRUE)
+      set(JPEG_LIBRARIES "")
+      set(JPEG_INCLUDE_DIRS "")
+      message(STATUS "Using emscripten libjpeg port")
+    endif()
   else()
     find_package(JPEG QUIET)
     if(NOT JPEG_FOUND)
