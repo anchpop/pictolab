@@ -353,18 +353,18 @@ function Wiggle() {
 
             <section className="space-y-4">
               <CardTitle>Export</CardTitle>
-              <Button className="w-full" disabled={!frames || !!busy} onClick={handleDownloadGif}>
-                <Download className="mr-1 h-4 w-4" />
-                Download GIF
+              <Button className="w-full" disabled={!frames || !!busy} onClick={handleDownloadVideo}>
+                <Clapperboard className="mr-1 h-4 w-4" />
+                Download video
               </Button>
               <Button
                 variant="outline"
                 className="w-full"
                 disabled={!frames || !!busy}
-                onClick={handleDownloadVideo}
+                onClick={handleDownloadGif}
               >
-                <Clapperboard className="mr-1 h-4 w-4" />
-                Download video
+                <Download className="mr-1 h-4 w-4" />
+                Download GIF
               </Button>
               {status && <p className="text-xs text-muted-foreground">{status}</p>}
             </section>
