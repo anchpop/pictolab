@@ -423,7 +423,10 @@ async fn gpu_seam_carve(image_data: &[u8], w: u32, h: u32) -> Result<Vec<u32>, J
         .unwrap_or(max_storage);
 
     let required_limits = js_obj(&[
-        ("maxStorageBufferBindingSize", JsValue::from_f64(max_storage)),
+        (
+            "maxStorageBufferBindingSize",
+            JsValue::from_f64(max_storage),
+        ),
         ("maxBufferSize", JsValue::from_f64(max_buffer)),
     ]);
     let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
@@ -810,7 +813,8 @@ fn composite_bg(src: vec4f, bg: vec4f) -> vec4f {
 // in source_tex. Runs once per source upload, never on the per-frame path.
 fn normalize_sdr_shader() -> String {
     let mut s = String::new();
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @group(0) @binding(0) var<storage, read> rgba_in: array<u32>;
 @group(0) @binding(1) var source_tex: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> dims: vec4u; // src_w, src_h, _, _
@@ -819,9 +823,11 @@ fn srgb_to_linear(c: f32) -> f32 {
   if (c <= 0.04045) { return c / 12.92; }
   return pow((c + 0.055) / 1.055, 2.4);
 }
-"#);
+"#,
+    );
     s.push_str(OKLAB_HELPERS_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let w = dims.x;
@@ -839,7 +845,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let lab = linear_p3_to_oklab(lr, lg, lb);
   textureStore(source_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(lab.x, lab.y, lab.z, a8));
 }
-"#);
+"#,
+    );
     s
 }
 
@@ -848,13 +855,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // each into a pair of f16 channels via the WGSL builtin unpack2x16float.
 fn normalize_hdr_shader() -> String {
     let mut s = String::new();
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @group(0) @binding(0) var<storage, read> f16_in: array<u32>;
 @group(0) @binding(1) var source_tex: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> dims: vec4u; // src_w, src_h, _, _
-"#);
+"#,
+    );
     s.push_str(OKLAB_HELPERS_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let w = dims.x;
@@ -871,14 +881,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let lab = linear_p3_to_oklab(lr, lg, lb);
   textureStore(source_tex, vec2i(i32(gid.x), i32(gid.y)), vec4f(lab.x, lab.y, lab.z, a));
 }
-"#);
+"#,
+    );
     s
 }
 
 fn remap_shader() -> String {
     let mut s = String::new();
     s.push_str(PARAMS_STRUCT_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 // source_tex holds canonical OKLab (L, a, b) plus alpha. Both SDR and HDR
 // uploads were normalized into this single perceptual-space format by a
 // one-shot compute pass at upload time, so this hot-path shader is just
@@ -886,10 +898,12 @@ fn remap_shader() -> String {
 @group(0) @binding(0) var source_tex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> linp3_out: array<vec4f>;
 @group(0) @binding(2) var<uniform> params: Params;
-"#);
+"#,
+    );
     s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
     s.push_str(COMPOSITE_BG_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @compute @workgroup_size(256)
 fn main(
   @builtin(global_invocation_id) gid: vec3u,
@@ -919,14 +933,16 @@ fn main(
   let lin = apply_edits_and_invert(s, params);
   linp3_out[idx] = composite_bg(lin, vec4f(params.bg_r, params.bg_g, params.bg_b, params.bg_a));
 }
-"#);
+"#,
+    );
     s
 }
 
 fn carve_shader() -> String {
     let mut s = String::new();
     s.push_str(PARAMS_STRUCT_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 // Carve is a one-tap gather: each output pixel reads exactly one source
 // pixel through the seam-order LUT. Because there's no redundancy, we
 // fuse the per-frame OKLab inverse + slider edits directly here, skipping
@@ -936,10 +952,12 @@ fn carve_shader() -> String {
 @group(0) @binding(2) var output_tex: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> dims: vec4u; // target_w, target_h, src_w, src_h
 @group(0) @binding(4) var<uniform> params: Params;
-"#);
+"#,
+    );
     s.push_str(OKLAB_EDIT_AND_INVERT_WGSL);
     s.push_str(COMPOSITE_BG_WGSL);
-    s.push_str(r#"
+    s.push_str(
+        r#"
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let tw = dims.x;
@@ -955,7 +973,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let composed = composite_bg(lin, vec4f(params.bg_r, params.bg_g, params.bg_b, params.bg_a));
   textureStore(output_tex, vec2i(i32(gid.x), i32(gid.y)), composed);
 }
-"#);
+"#,
+    );
     s
 }
 
@@ -1497,7 +1516,10 @@ async fn create_gpu_ctx(canvas: &JsValue) -> Result<GpuCtx, JsValue> {
         .as_f64()
         .unwrap_or(max_storage);
     let required_limits = js_obj(&[
-        ("maxStorageBufferBindingSize", JsValue::from_f64(max_storage)),
+        (
+            "maxStorageBufferBindingSize",
+            JsValue::from_f64(max_storage),
+        ),
         ("maxBufferSize", JsValue::from_f64(max_buffer)),
     ]);
     let device_desc = js_obj(&[("requiredLimits", required_limits.into())]);
@@ -1820,10 +1842,7 @@ fn ensure_source_resources(
         let entries = Array::new();
         entries.push(&js_obj(&[
             ("binding", 0u32.into()),
-            (
-                "resource",
-                ctx.source_tex_view.as_ref().unwrap().clone(),
-            ),
+            ("resource", ctx.source_tex_view.as_ref().unwrap().clone()),
         ]));
         entries.push(&js_obj(&[
             ("binding", 1u32.into()),
@@ -1863,11 +1882,7 @@ fn ensure_source_resources(
 
 // Run a one-shot compute dispatch that reads `source_upload_buf` and
 // writes canonical OKLab into `source_tex`. Used by both upload paths.
-fn run_normalize_pass(
-    ctx: &GpuCtx,
-    pipeline: &JsValue,
-    bgl: &JsValue,
-) -> Result<(), JsValue> {
+fn run_normalize_pass(ctx: &GpuCtx, pipeline: &JsValue, bgl: &JsValue) -> Result<(), JsValue> {
     // Built inline because binding 1 is a storage texture view, not a
     // buffer, and the create_bind_group helper wraps every entry as
     // {buffer:x}.
@@ -1881,10 +1896,7 @@ fn run_normalize_pass(
     ]));
     entries.push(&js_obj(&[
         ("binding", 1u32.into()),
-        (
-            "resource",
-            ctx.source_tex_view.as_ref().unwrap().clone(),
-        ),
+        ("resource", ctx.source_tex_view.as_ref().unwrap().clone()),
     ]));
     entries.push(&js_obj(&[
         ("binding", 2u32.into()),
@@ -1899,8 +1911,7 @@ fn run_normalize_pass(
         &js_obj(&[("layout", bgl.clone()), ("entries", entries.into())]),
     )?;
     let dims = [ctx.src_w, ctx.src_h, 0u32, 0u32];
-    let dims_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
+    let dims_bytes: &[u8] = unsafe { std::slice::from_raw_parts(dims.as_ptr() as *const u8, 16) };
     write_buffer_u8(&ctx.queue, &ctx.normalize_dims_buf, dims_bytes)?;
 
     let enc = js_call1(&ctx.device, "createCommandEncoder", &Object::new())?;
@@ -2144,9 +2155,8 @@ pub fn gpu_set_rotation(
         }
 
         // (Re)allocate rotated_tex if dims changed.
-        let need_new_tex = ctx.rotated_tex.is_none()
-            || ctx.rotated_w != dst_w
-            || ctx.rotated_h != dst_h;
+        let need_new_tex =
+            ctx.rotated_tex.is_none() || ctx.rotated_w != dst_w || ctx.rotated_h != dst_h;
         if need_new_tex {
             if let Some(old) = ctx.rotated_tex.take() {
                 let _ = js_call0(&old, "destroy");
@@ -2293,10 +2303,7 @@ fn make_render_bind_group(
     entries.push(&js_obj(&[("binding", 1u32.into()), ("resource", sampler)]));
     entries.push(&js_obj(&[
         ("binding", 2u32.into()),
-        (
-            "resource",
-            js_obj(&[("buffer", params_buf.clone())]).into(),
-        ),
+        ("resource", js_obj(&[("buffer", params_buf.clone())]).into()),
     ]));
     js_call1(
         device,
