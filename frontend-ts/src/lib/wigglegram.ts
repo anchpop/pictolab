@@ -163,31 +163,29 @@ export function commonCrop(rects: Rect[], shifts: Shift[]) {
   return { left, top, right, bottom, cw: right - left, ch: bottom - top };
 }
 
-/** Render the three aligned frames, cropped to their common area. */
+/** Render the three aligned frames, cropped to their common area, at full resolution. */
 export function renderFrames(
   img: ImageBitmap,
   rects: Rect[],
   shifts: Shift[],
-  maxWidth: number,
   matchTone: boolean
 ): OffscreenCanvas[] {
   const { left, top, cw, ch } = commonCrop(rects, shifts);
-  const outW = Math.min(maxWidth, cw);
-  let ow = outW;
-  let oh = Math.round(ch * (outW / cw));
-  ow -= ow % 2; // even dimensions for video codecs
-  oh -= oh % 2;
+  const ow = cw - (cw % 2); // even dimensions for video codecs
+  const oh = ch - (ch % 2);
 
   const frames = rects.map((rect, i) => {
     const c = new OffscreenCanvas(ow, oh);
     const ctx = c.getContext('2d', { willReadFrequently: true })!;
     ctx.imageSmoothingQuality = 'high';
+    // Source dims = dest dims: drop the odd row/column outright rather than
+    // resampling the whole frame down by one pixel.
     ctx.drawImage(
       img,
       rect.x + left - shifts[i].dx,
       rect.y + top - shifts[i].dy,
-      cw,
-      ch,
+      ow,
+      oh,
       0,
       0,
       ow,

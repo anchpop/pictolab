@@ -7,7 +7,6 @@ import { CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Slider } from '@/components/ui/slider';
-import { Segmented } from '@/components/ui/segmented';
 import {
   alignShifts,
   commonCrop,
@@ -19,17 +18,14 @@ import {
 
 const SEQ = [0, 1, 2, 1]; // bounce loop
 
-type OutputWidth = '720' | '1080' | '1440';
-
 function Wiggle() {
   const [source, setSource] = useState<ImageBitmap | null>(null);
   const [frames, setFrames] = useState<OffscreenCanvas[] | null>(null);
   const [shifts, setShifts] = useState<Shift[] | null>(null);
   const [pivot, setPivot] = useState<Pivot>({ x: 0.5, y: 0.45 });
   const [fps, setFps] = useState(11);
-  const [inset, setInset] = useState(2);
+  const [inset, setInset] = useState(0);
   const [tone, setTone] = useState(true);
-  const [outW, setOutW] = useState<OutputWidth>('1080');
   const [busy, setBusy] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
@@ -38,14 +34,19 @@ function Wiggle() {
   // Recompute alignment (expensive-ish, ~0.5s) and re-render the frames.
   // Deferred through setTimeout so the busy indicator paints first.
   const reprocess = useCallback(
-    (img: ImageBitmap, piv: Pivot, insetPct: number, toneOn: boolean, width: OutputWidth, realign: boolean, prevShifts: Shift[] | null) => {
+    (img: ImageBitmap, piv: Pivot, insetPct: number, toneOn: boolean, realign: boolean, prevShifts: Shift[] | null) => {
       setBusy(realign ? 'Aligning frames…' : 'Rendering…');
       setTimeout(() => {
         try {
           const rects = frameRects(img, insetPct / 100);
           const s = realign || !prevShifts ? alignShifts(img, rects, piv) : prevShifts;
           setShifts(s);
-          setFrames(renderFrames(img, rects, s, parseInt(width, 10), toneOn));
+          setFrames(renderFrames(img, rects, s, toneOn));
+          setStatus(null);
+        } catch {
+          setFrames(null);
+          setShifts(null);
+          setStatus("Couldn't process that photo — is it a 3-frame wigglegram shot?");
         } finally {
           setBusy(null);
         }
@@ -63,7 +64,7 @@ function Wiggle() {
       setSource(img);
       setPivot(piv);
       setStatus(null);
-      reprocess(img, piv, inset, tone, outW, true, null);
+      reprocess(img, piv, inset, tone, true, null);
     } catch {
       setBusy(null);
       setStatus("Couldn't read that image.");
@@ -97,7 +98,7 @@ function Wiggle() {
       y: (top + cy * ch) / rects[0].h,
     };
     setPivot(piv);
-    reprocess(source, piv, inset, tone, outW, true, null);
+    reprocess(source, piv, inset, tone, true, null);
   };
 
   // Pivot dot position within the cropped preview, as fractions.
@@ -140,6 +141,8 @@ function Wiggle() {
         gif.finish();
         download(new Blob([gif.bytes().slice().buffer], { type: 'image/gif' }), 'wigglegram.gif');
         setStatus('GIF saved.');
+      } catch {
+        setStatus('GIF encoding failed — try trimming the seams or a smaller photo.');
       } finally {
         setBusy(null);
       }
@@ -148,9 +151,16 @@ function Wiggle() {
 
   const handleDownloadVideo = () => {
     if (!frames || busy) return;
-    const mime = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm'].find(
-      (m) => 'MediaRecorder' in window && MediaRecorder.isTypeSupported(m)
-    );
+    // Ask for H.264 explicitly: Chrome's bare 'video/mp4' picks its default
+    // codec (VP9/AV1 in an MP4 container), which QuickTime can't play.
+    // avc1.640033 = High profile level 5.1, needed for full-res frames.
+    const mime = [
+      'video/mp4;codecs=avc1.640033',
+      'video/mp4;codecs=avc1',
+      'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm',
+    ].find((m) => 'MediaRecorder' in window && MediaRecorder.isTypeSupported(m));
     if (!mime) {
       setStatus("Video recording isn't supported in this browser — use the GIF.");
       return;
@@ -161,13 +171,37 @@ function Wiggle() {
     c.width = frames[0].width;
     c.height = frames[0].height;
     const ctx = c.getContext('2d')!;
-    const rec = new MediaRecorder(c.captureStream(), {
-      mimeType: mime,
-      videoBitsPerSecond: 12_000_000,
-    });
+
+    const timerRef = { id: undefined as ReturnType<typeof setInterval> | undefined };
+    let failed = false;
+    const fail = () => {
+      failed = true;
+      if (timerRef.id) clearInterval(timerRef.id);
+      setStatus('Video encoding failed at this resolution — use the GIF.');
+      setBusy(null);
+    };
+
+    let rec: MediaRecorder;
+    try {
+      rec = new MediaRecorder(c.captureStream(), {
+        mimeType: mime,
+        // ~0.2 bits/px/frame, capped — full-res frames need far more than a
+        // fixed 12 Mbps to avoid smearing.
+        videoBitsPerSecond: Math.min(40_000_000, Math.round(c.width * c.height * fps * 0.2)),
+      });
+    } catch {
+      fail();
+      return;
+    }
     const chunks: Blob[] = [];
     rec.ondataavailable = (e) => chunks.push(e.data);
+    rec.onerror = fail;
     rec.onstop = () => {
+      if (failed) return;
+      if (chunks.length === 0) {
+        fail();
+        return;
+      }
       const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
       download(new Blob(chunks, { type: mime }), `wigglegram.${ext}`);
       setStatus('Video saved.');
@@ -176,12 +210,17 @@ function Wiggle() {
 
     let i = 0;
     ctx.drawImage(frames[SEQ[0]], 0, 0);
-    rec.start();
-    const timer = setInterval(() => {
+    try {
+      rec.start();
+    } catch {
+      fail();
+      return;
+    }
+    timerRef.id = setInterval(() => {
       ctx.drawImage(frames[SEQ[++i % SEQ.length]], 0, 0);
       if (i >= fps * 4) {
-        clearInterval(timer);
-        rec.stop();
+        clearInterval(timerRef.id);
+        if (rec.state !== 'inactive') rec.stop();
       }
     }, 1000 / fps);
   };
@@ -293,7 +332,7 @@ function Wiggle() {
                   step={1}
                   onValueChange={([v]) => setInset(v)}
                   onValueCommit={([v]) => {
-                    if (source) reprocess(source, pivot, v, tone, outW, true, null);
+                    if (source) reprocess(source, pivot, v, tone, true, null);
                   }}
                 />
               </div>
@@ -306,7 +345,7 @@ function Wiggle() {
                   checked={tone}
                   onCheckedChange={(v) => {
                     setTone(v);
-                    if (source) reprocess(source, pivot, inset, v, outW, false, shifts);
+                    if (source) reprocess(source, pivot, inset, v, false, shifts);
                   }}
                 />
               </div>
@@ -314,21 +353,6 @@ function Wiggle() {
 
             <section className="space-y-4">
               <CardTitle>Export</CardTitle>
-              <div className="space-y-2">
-                <Label className="text-xs font-normal text-muted-foreground">Size</Label>
-                <Segmented
-                  value={outW}
-                  onValueChange={(v: OutputWidth) => {
-                    setOutW(v);
-                    if (source) reprocess(source, pivot, inset, tone, v, false, shifts);
-                  }}
-                  options={[
-                    { value: '720', label: '720' },
-                    { value: '1080', label: '1080' },
-                    { value: '1440', label: '1440' },
-                  ]}
-                />
-              </div>
               <Button className="w-full" disabled={!frames || !!busy} onClick={handleDownloadGif}>
                 <Download className="mr-1 h-4 w-4" />
                 Download GIF
