@@ -2004,6 +2004,11 @@ function Editor() {
               </Button>
             )}
             <Button variant="outline" size="sm" asChild>
+              <a href="/wiggle" title="Turn 3-frame wigglegram photos into looping GIFs">
+                Wiggle
+              </a>
+            </Button>
+            <Button variant="outline" size="sm" asChild>
               <a
                 href="https://github.com/anchpop/pictolab"
                 target="_blank"

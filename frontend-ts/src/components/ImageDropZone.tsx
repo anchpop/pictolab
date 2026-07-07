@@ -123,9 +123,11 @@ async function makeThumbnail(dataUrl: string, maxSize = 150): Promise<string> {
 interface ImageDropZoneProps {
   onImageSelect: (imageUrl: string, filename?: string) => void;
   disabled?: boolean;
+  /** Hide the example-images gallery (they only make sense for the editor). */
+  showExamples?: boolean;
 }
 
-function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) {
+function ImageDropZone({ onImageSelect, disabled = false, showExamples = true }: ImageDropZoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [savedImages, setSavedImages] = useState<{ id: number; dataUrl: string; thumbnail: string; filename?: string }[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -271,28 +273,30 @@ function ImageDropZone({ onImageSelect, disabled = false }: ImageDropZoneProps) 
       </div>
 
       <div className="image-gallery">
-        <div className="gallery-section">
-          <p className="gallery-label">
-            Examples — art by{' '}
-            <a href="https://x.com/aletiune" target="_blank" rel="noopener noreferrer" className="gallery-attribution">
-              aletiune
-            </a>
-            , used with permission
-          </p>
-          <div className="gallery-thumbs">
-            {EXAMPLE_IMAGES.map((img) => (
-              <button
-                key={img.src}
-                className="gallery-thumb"
-                onClick={() => handleExampleClick(img.src)}
-                disabled={disabled}
-                title={img.label}
-              >
-                <img src={img.src} alt={img.label} loading="lazy" />
-              </button>
-            ))}
+        {showExamples && (
+          <div className="gallery-section">
+            <p className="gallery-label">
+              Examples — art by{' '}
+              <a href="https://x.com/aletiune" target="_blank" rel="noopener noreferrer" className="gallery-attribution">
+                aletiune
+              </a>
+              , used with permission
+            </p>
+            <div className="gallery-thumbs">
+              {EXAMPLE_IMAGES.map((img) => (
+                <button
+                  key={img.src}
+                  className="gallery-thumb"
+                  onClick={() => handleExampleClick(img.src)}
+                  disabled={disabled}
+                  title={img.label}
+                >
+                  <img src={img.src} alt={img.label} loading="lazy" />
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
 
         {savedImages.length > 0 && (
           <div className="gallery-section">
